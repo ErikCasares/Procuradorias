@@ -1,0 +1,11 @@
+# Segredos — nunca commitar
+.env
+
+__pycache__/
+*.pyc
+.DS_Store
+
+# Dados de entrada e saídas geradas
+processos pra analiser/*.pdf
+JSON/
+resultados/

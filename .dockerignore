@@ -1,0 +1,14 @@
+.git
+.gitignore
+.DS_Store
+.env
+__pycache__/
+*.pyc
+Dockerfile
+docker-compose.yml
+README.md
+
+# Dados e saídas — vêm por volume, nunca embutidos na imagem
+processos pra analiser/
+JSON/
+resultados/

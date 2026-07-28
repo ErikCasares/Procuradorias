@@ -1,0 +1,29 @@
+services:
+  # ── Agente 2 — watcher contínuo da pasta JSON/ ──────────────────
+  agente2:
+    build: .
+    image: procuradorias:latest
+    container_name: procuradorias-agente2
+    restart: unless-stopped
+    environment:
+      TZ: ${TZ:-America/Campo_Grande}
+    volumes:
+      - "./JSON:/app/JSON"
+      - "./resultados:/app/resultados"
+    command: ["python", "agente2.py", "--watch"]
+
+  # ── Agente 1 — lote pontual (OCR + OpenAI), roda e encerra ──────
+  # Sob o profile "batch" para não subir junto com `docker compose up`.
+  # Uso: docker compose run --rm agente1
+  agente1:
+    build: .
+    image: procuradorias:latest
+    profiles: ["batch"]
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY:?defina OPENAI_API_KEY no arquivo .env}
+      TZ: ${TZ:-America/Campo_Grande}
+    volumes:
+      - "./processos pra analiser:/app/processos pra analiser"
+      - "./JSON:/app/JSON"
+      - "./resultados:/app/resultados"
+    command: ["python", "promptV7.1.py"]
