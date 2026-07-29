@@ -9,3 +9,4 @@ __pycache__/
 processos pra analiser/*.pdf
 JSON/
 resultados/
+dados/

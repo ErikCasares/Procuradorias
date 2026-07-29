@@ -23,7 +23,7 @@ COPY promptV7.1.py agente2.py webapp.py ./
 
 # Pastas de trabalho — montadas como volumes pelo docker-compose.
 # Criadas aqui para o Agente 1 não quebrar no os.listdir() se o volume faltar.
-RUN mkdir -p "/app/processos pra analiser" /app/JSON /app/resultados
+RUN mkdir -p "/app/processos pra analiser" /app/JSON /app/resultados /app/dados/lotes
 
 EXPOSE 3000
 

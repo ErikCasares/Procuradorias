@@ -52,11 +52,16 @@ logging.basicConfig(level=logging.INFO)
 from datetime import datetime  # asegurate de tener este import arriba
 
 CURRENT_DIR      = os.path.dirname(os.path.abspath(__file__))
-input_directory  = os.path.join(CURRENT_DIR, "processos pra analiser")
+
+# Las tres carpetas son sobreescribibles por variable de entorno para que la API
+# pueda dar a cada lote su propio espacio aislado — sin eso, dos lotes en paralelo
+# se pisarían el JSON de traspaso, que tiene nombre fijo. Sin las variables el
+# comportamiento es el de siempre: subcarpetas junto al script.
+input_directory  = os.environ.get("PASTA_ENTRADA")    or os.path.join(CURRENT_DIR, "processos pra analiser")
 
 # Carpetas de salida
-PASTA_JSON       = os.path.join(CURRENT_DIR, "JSON")         # JSON + prompts que escribe el Agente 1
-PASTA_RESULTADOS = os.path.join(CURRENT_DIR, "resultados")   # Excel de resultados
+PASTA_JSON       = os.environ.get("PASTA_JSON")       or os.path.join(CURRENT_DIR, "JSON")         # JSON + prompts que escribe el Agente 1
+PASTA_RESULTADOS = os.environ.get("PASTA_RESULTADOS") or os.path.join(CURRENT_DIR, "resultados")   # Excel de resultados
 
 os.makedirs(PASTA_JSON, exist_ok=True)
 os.makedirs(PASTA_RESULTADOS, exist_ok=True)

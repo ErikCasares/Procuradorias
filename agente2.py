@@ -50,8 +50,13 @@ log = logging.getLogger("agente2")
 
 # ── Configuración ─────────────────────────────────────────────────
 CURRENT_DIR       = os.path.dirname(os.path.abspath(__file__))
-PASTA_JSON       = os.path.join(CURRENT_DIR, "JSON")         # carpeta donde el Agente 1 escribe los JSON
-PASTA_RESULTADOS  = os.path.join(CURRENT_DIR, "resultados")   # carpeta de salida del Agente 2
+
+# Sobreescribibles por variable de entorno — ver la nota equivalente en promptV7.1.py.
+# El historial acumulativo vive en PASTA_JSON, así que la API deja esta apuntando
+# siempre a la carpeta compartida: es lo que mantiene el Excel del procurador
+# acumulando entre lotes en vez de reiniciarse en cada uno.
+PASTA_JSON       = os.environ.get("PASTA_JSON")       or os.path.join(CURRENT_DIR, "JSON")         # carpeta donde el Agente 1 escribe los JSON
+PASTA_RESULTADOS  = os.environ.get("PASTA_RESULTADOS") or os.path.join(CURRENT_DIR, "resultados")   # carpeta de salida del Agente 2
 SUFIJO_INPUT      = "_agente2.json"       # archivos que genera el Agente 1
 SUFIJO_OUTPUT     = "_agente2_resultado.json"   # resultado por lote
 HISTORIAL_JSONL   = "historial_agente2.jsonl"   # registro acumulativo — una línea por processo

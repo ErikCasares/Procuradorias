@@ -11,11 +11,17 @@ services:
       - "${PORT:-3000}:3000"
     environment:
       OPENAI_API_KEY: ${OPENAI_API_KEY:?defina OPENAI_API_KEY no arquivo .env}
+      API_TOKENS: ${API_TOKENS:?defina API_TOKENS no .env — sem isso a API recusa tudo}
+      SENHA_PAINEL: ${SENHA_PAINEL:?defina SENHA_PAINEL no .env — sem isso o painel não abre}
+      COOKIE_SEGURO: ${COOKIE_SEGURO:-0}
+      HORAS_SESSAO: ${HORAS_SESSAO:-12}
+      MAX_MB_LOTE: ${MAX_MB_LOTE:-200}
       TZ: ${TZ:-America/Campo_Grande}
     volumes:
       - "./processos pra analiser:/app/processos pra analiser"
       - "./JSON:/app/JSON"
       - "./resultados:/app/resultados"
+      - "./dados:/app/dados"
 
   # ── Agente 2 — watcher contínuo da pasta JSON/ ──────────────────
   # Opcional: a web já chama o Agente 2 ao fim de cada lote. Só é útil
