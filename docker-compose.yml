@@ -11,8 +11,8 @@ services:
       - "${PORT:-3000}:3000"
     environment:
       OPENAI_API_KEY: ${OPENAI_API_KEY:?defina OPENAI_API_KEY no arquivo .env}
-      API_TOKENS: ${API_TOKENS:?defina API_TOKENS no .env — sem isso a API recusa tudo}
-      SENHA_PAINEL: ${SENHA_PAINEL:?defina SENHA_PAINEL no .env — sem isso o painel não abre}
+      API_TOKENS: ${API_TOKENS:?rode 'python gerar_credencial.py api siap' e cole o hash no .env}
+      SENHA_PAINEL_HASH: ${SENHA_PAINEL_HASH:?rode 'python gerar_credencial.py painel' e cole o hash no .env}
       COOKIE_SEGURO: ${COOKIE_SEGURO:-0}
       HORAS_SESSAO: ${HORAS_SESSAO:-12}
       MAX_MB_LOTE: ${MAX_MB_LOTE:-200}

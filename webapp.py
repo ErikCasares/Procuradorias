@@ -33,6 +33,7 @@ import re
 import sys
 import json
 import shutil
+import hashlib
 import secrets
 import asyncio
 import logging
@@ -79,11 +80,32 @@ HORAS_SESSAO   = int(os.getenv("HORAS_SESSAO", "12"))
 COOKIE_SEGURO  = os.getenv("COOKIE_SEGURO", "0") == "1"
 
 
+# ── Credenciais ──────────────────────────────────────────────────
+#
+# O ambiente guarda HASHES, não segredos. Variável de ambiente não é cofre:
+# o valor aparece na UI do Easypanel, em `docker inspect`, em /proc/<pid>/environ
+# e em dump de erro. Com hash, quem ler qualquer um desses caminhos não autentica.
+#
+# Os segredos são emitidos por gerar_credencial.py, que mostra o valor uma única
+# vez e nunca o grava.
+#
+# SHA-256 direto basta para os tokens da API — são 256 bits aleatórios, sem
+# força bruta viável. A senha do painel é escolhida por gente, entropia baixa,
+# atacável por dicionário: essa usa scrypt, lento de propósito.
+
+SCRYPT_MAXMEM = 64 * 1024 * 1024
+
+_tokens_legado = []   # rótulos ainda configurados em texto puro
+
+
 def _carregar_tokens() -> dict:
     """
-    API_TOKENS no formato "rotulo:token,outro:token".
-    O rótulo entra no log de auditoria e no registro do lote — é como se
-    identifica depois quem enviou o quê.
+    API_TOKENS no formato "rotulo:sha256:<hash>", separado por vírgula.
+    Devolve {hash: rotulo}.
+
+    Aceita ainda "rotulo:<token>" em texto puro — formato antigo, mantido para
+    não trancar um serviço já configurado. Nesse caso o hash é calculado aqui e
+    o rótulo entra em _tokens_legado, que vira aviso no startup.
     """
     bruto = os.getenv("API_TOKENS", "").strip()
     tokens = {}
@@ -91,15 +113,48 @@ def _carregar_tokens() -> dict:
         parte = parte.strip()
         if not parte or ":" not in parte:
             continue
-        rotulo, _, valor = parte.partition(":")
-        rotulo, valor = rotulo.strip(), valor.strip()
-        if rotulo and valor:
-            tokens[valor] = rotulo
+        rotulo, _, resto = parte.partition(":")
+        rotulo, resto = rotulo.strip(), resto.strip()
+        if not rotulo or not resto:
+            continue
+
+        if resto.lower().startswith("sha256:"):
+            digest = resto[7:].strip().lower()
+        else:
+            digest = hashlib.sha256(resto.encode()).hexdigest()
+            _tokens_legado.append(rotulo)
+
+        tokens[digest] = rotulo
     return tokens
 
 
-TOKENS       = _carregar_tokens()
-SENHA_PAINEL = os.getenv("SENHA_PAINEL", "").strip()
+def _conferir_scrypt(senha: str, guardado: str) -> bool:
+    """Valida contra 'scrypt$n$r$p$salt_hex$hash_hex'."""
+    try:
+        alg, n, r, p, salt_hex, hash_hex = guardado.split("$")
+        if alg != "scrypt":
+            return False
+        calc = hashlib.scrypt(
+            senha.encode(), salt=bytes.fromhex(salt_hex),
+            n=int(n), r=int(r), p=int(p), maxmem=SCRYPT_MAXMEM, dklen=32,
+        )
+        return secrets.compare_digest(calc.hex(), hash_hex)
+    except Exception:
+        return False
+
+
+TOKENS            = _carregar_tokens()
+SENHA_PAINEL_HASH = os.getenv("SENHA_PAINEL_HASH", "").strip()
+SENHA_PAINEL      = os.getenv("SENHA_PAINEL", "").strip()   # legado, em texto puro
+PAINEL_ATIVO      = bool(SENHA_PAINEL_HASH or SENHA_PAINEL)
+
+
+def _senha_confere(enviada: str) -> bool:
+    if SENHA_PAINEL_HASH:
+        return _conferir_scrypt(enviada, SENHA_PAINEL_HASH)
+    if SENHA_PAINEL:
+        return secrets.compare_digest(enviada, SENHA_PAINEL)
+    return False
 
 
 # ════════════════════════════════════════════════════════════════
@@ -127,10 +182,11 @@ def autenticar_api(authorization: str = Header(None)) -> str:
         )
 
     enviado = authorization[7:].strip()
-    # compare_digest em todos os tokens — comparação de tempo constante,
-    # para o tempo de resposta não vazar quanto do token está certo
-    for valido, rotulo in TOKENS.items():
-        if secrets.compare_digest(enviado, valido):
+    # Hash do que chegou, comparado com os hashes guardados. compare_digest é
+    # de tempo constante — o tempo de resposta não vaza quanto do token acertou.
+    digest = hashlib.sha256(enviado.encode()).hexdigest()
+    for guardado, rotulo in TOKENS.items():
+        if secrets.compare_digest(digest, guardado):
             return rotulo
 
     raise HTTPException(401, "Token inválido", headers={"WWW-Authenticate": "Bearer"})
@@ -149,10 +205,11 @@ def _sessao_valida(cookie: str) -> bool:
 
 
 def exigir_painel(sessao: str = Cookie(None)):
-    if not SENHA_PAINEL:
+    if not PAINEL_ATIVO:
         raise HTTPException(
             503,
-            "Painel sem senha configurada. Defina SENHA_PAINEL no ambiente do serviço.",
+            "Painel sem senha configurada. Gere o hash com "
+            "'python gerar_credencial.py painel' e defina SENHA_PAINEL_HASH.",
         )
     if not _sessao_valida(sessao):
         raise HTTPException(401, "Sessão expirada ou ausente")
@@ -403,9 +460,19 @@ async def lifespan(app: FastAPI):
     if not TOKENS:
         log.warning("API_TOKENS não configurado — a API responderá 503 a tudo")
     else:
-        log.info(f"API habilitada para: {', '.join(sorted(TOKENS.values()))}")
-    if not SENHA_PAINEL:
-        log.warning("SENHA_PAINEL não configurada — o painel não abrirá")
+        log.info(f"API habilitada para: {', '.join(sorted(set(TOKENS.values())))}")
+    if _tokens_legado:
+        log.warning(
+            f"Token em TEXTO PURO no ambiente para: {', '.join(sorted(set(_tokens_legado)))}. "
+            "Troque pelo hash — 'python gerar_credencial.py api <rotulo>'."
+        )
+    if not PAINEL_ATIVO:
+        log.warning("Senha do painel não configurada — o painel não abrirá")
+    elif not SENHA_PAINEL_HASH:
+        log.warning(
+            "SENHA_PAINEL está em TEXTO PURO no ambiente. Gere o hash com "
+            "'python gerar_credencial.py painel' e use SENHA_PAINEL_HASH."
+        )
 
     yield
     tarefa.cancel()
@@ -563,7 +630,7 @@ async def planilha_lote(lote_id: str, consumidor: str = Depends(autenticar_api))
 
 @app.post("/painel/login")
 async def login(senha: str = Form(...)):
-    if not SENHA_PAINEL:
+    if not PAINEL_ATIVO:
         raise HTTPException(503, "Painel sem senha configurada")
 
     # Freia tentativa em massa sem travar o uso legítimo
@@ -571,7 +638,7 @@ async def login(senha: str = Form(...)):
     if len(recentes) >= 10:
         raise HTTPException(429, "Tentativas demais. Aguarde alguns minutos.")
 
-    if not secrets.compare_digest(senha, SENHA_PAINEL):
+    if not _senha_confere(senha):
         _falhas_login.append(datetime.now())
         await asyncio.sleep(1)
         raise HTTPException(401, "Senha incorreta")
@@ -639,10 +706,11 @@ async def painel_baixar(nome: str, _=Depends(exigir_painel)):
 
 @app.get("/", response_class=HTMLResponse)
 async def index(sessao: str = Cookie(None)):
-    if not SENHA_PAINEL:
+    if not PAINEL_ATIVO:
         return HTMLResponse(
-            "<h1>Painel indisponível</h1><p>Defina <code>SENHA_PAINEL</code> "
-            "no ambiente do serviço e reinicie.</p>",
+            "<h1>Painel indisponível</h1><p>Gere o hash com "
+            "<code>python gerar_credencial.py painel</code> e defina "
+            "<code>SENHA_PAINEL_HASH</code> no ambiente do serviço.</p>",
             status_code=503,
         )
     return HTMLResponse(PAINEL if _sessao_valida(sessao) else LOGIN)

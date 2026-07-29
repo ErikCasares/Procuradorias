@@ -13,23 +13,50 @@ Pipeline de dois agentes para triagem de execuções fiscais (HERA Tecnologia / 
 
 ## Autenticação
 
-**O serviço falha fechado.** Sem `API_TOKENS` a API recusa tudo com `503`; sem
-`SENHA_PAINEL` o painel não abre. Uma configuração incompleta deixa o serviço
-inacessível, nunca aberto — os relatórios carregam nome, CPF/CNPJ e valor de dívida.
+**O serviço falha fechado.** Sem `API_TOKENS` a API recusa tudo com `503`; sem senha
+o painel não abre. Uma configuração incompleta deixa o serviço inacessível, nunca
+aberto — os relatórios carregam nome, CPF/CNPJ e valor de dívida.
+
+**O ambiente guarda hashes, nunca segredos.** Variável de ambiente não é cofre: o
+valor aparece na UI do Easypanel, em `docker inspect`, em `/proc/<pid>/environ` e em
+dump de erro. Guardando só o hash, quem ler qualquer um desses caminhos não autentica.
+
+### Gerando credenciais
+
+```bash
+python gerar_credencial.py api siap      # token de um consumidor da API
+python gerar_credencial.py painel        # senha do painel do procurador
+```
+
+O gerador mostra duas coisas: o **segredo**, que aparece uma única vez e não fica
+gravado em lugar nenhum, e o **hash**, que você cola no ambiente do serviço. Se o
+consumidor perder o token, você emite outro — não há como recuperar o original.
 
 | Variável | Para quê |
-| --------------- | ----------------------------------------------------------- |
-| `API_TOKENS` | Tokens da API: `rotulo:token,outro:token`. O rótulo identifica o consumidor no log e isola os lotes dele. |
-| `SENHA_PAINEL` | Senha do painel do procurador |
+| ------------------- | --------------------------------------------------------- |
+| `API_TOKENS` | `rotulo:sha256:<hash>`, separado por vírgula. O rótulo identifica o consumidor no log e isola os lotes dele. |
+| `SENHA_PAINEL_HASH` | Hash scrypt da senha do painel |
 | `COOKIE_SEGURO` | `1` em produção — marca a sessão como Secure (só HTTPS) |
 | `HORAS_SESSAO` | Validade da sessão do painel (padrão 12) |
 | `MAX_MB_LOTE` | Tamanho máximo de um lote (padrão 200) |
 
-Gere cada token com:
+Por que dois algoritmos: os tokens da API são 256 bits aleatórios, sem força bruta
+viável, então SHA-256 direto basta. A senha do painel é escolhida por gente, com
+entropia baixa e atacável por dicionário — essa usa scrypt, lento de propósito.
 
-```bash
-python -c "import secrets; print(secrets.token_urlsafe(32))"
+### Rotação sem parar a integração
+
+Dois hashes com o mesmo rótulo funcionam ao mesmo tempo:
+
+```ini
+API_TOKENS=siap:sha256:<novo>,siap:sha256:<antigo>
 ```
+
+Adicione o novo, avise o consumidor, espere a troca, remova o antigo.
+
+Os formatos antigos em texto puro (`API_TOKENS=siap:<token>` e `SENHA_PAINEL`) ainda
+funcionam, para não trancar um serviço já configurado, mas o startup avisa em log.
+Troque pelos hashes assim que puder.
 
 ## API v1 — para sistemas externos (SIAP)
 
