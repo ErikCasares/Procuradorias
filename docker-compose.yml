@@ -1,9 +1,30 @@
 services:
+  # ── Interface web — o que o domínio publica ─────────────────────
+  # Orquestra os dois agentes: upload dos PDFs, dispara o lote,
+  # acompanha o log e entrega os relatórios Excel.
+  web:
+    build: .
+    image: procuradorias:latest
+    container_name: procuradorias-web
+    restart: unless-stopped
+    ports:
+      - "${PORT:-3000}:3000"
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY:?defina OPENAI_API_KEY no arquivo .env}
+      TZ: ${TZ:-America/Campo_Grande}
+    volumes:
+      - "./processos pra analiser:/app/processos pra analiser"
+      - "./JSON:/app/JSON"
+      - "./resultados:/app/resultados"
+
   # ── Agente 2 — watcher contínuo da pasta JSON/ ──────────────────
+  # Opcional: a web já chama o Agente 2 ao fim de cada lote. Só é útil
+  # se algum outro processo despejar JSON em JSON/ por fora da web.
+  # Uso: docker compose --profile watcher up -d
   agente2:
     build: .
     image: procuradorias:latest
-    container_name: procuradorias-agente2
+    profiles: ["watcher"]
     restart: unless-stopped
     environment:
       TZ: ${TZ:-America/Campo_Grande}
@@ -12,8 +33,7 @@ services:
       - "./resultados:/app/resultados"
     command: ["python", "agente2.py", "--watch"]
 
-  # ── Agente 1 — lote pontual (OCR + OpenAI), roda e encerra ──────
-  # Sob o profile "batch" para não subir junto com `docker compose up`.
+  # ── Agente 1 — lote pontual pela linha de comando ───────────────
   # Uso: docker compose run --rm agente1
   agente1:
     build: .

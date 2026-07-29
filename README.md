@@ -8,6 +8,34 @@ Pipeline de dois agentes para triagem de execuções fiscais (HERA Tecnologia / 
 - **Agente 2** — `agente2.py`: monitora `JSON/`, analisa os processos APTO
   (prioridade, ação recomendada, alerta de prescrição) e gera o histórico acumulativo
   e o relatório Excel do procurador em `resultados/`.
+- **Web** — `webapp.py`: interface para o procurador. Faz upload dos PDFs, dispara o
+  pipeline (Agente 1 → Agente 2), mostra o log em tempo real e entrega os relatórios.
+  É o que fica publicado no domínio.
+
+## Interface web
+
+Publicada na porta `3000`. Fluxo em três passos: enviar os PDFs, processar o lote,
+baixar os relatórios.
+
+Ao final de cada lote a tela informa **quantos processos foram classificados como APTO**
+e destaca avisos quando algo falhou silenciosamente — OCR sem Poppler, chave da OpenAI
+recusada, PDF sem texto extraível, memória insuficiente. Isso importa porque o Agente 1
+trata esses erros internamente e encerra com código de sucesso: sem os avisos, um lote
+que classificou zero processos pareceria ter dado tudo certo.
+
+Rotas de API, caso queira automatizar:
+
+| Rota | Uso |
+| ------------------------- | ---------------------------------------- |
+| `GET /health` | Healthcheck (Easypanel) |
+| `POST /api/upload` | Envia PDFs (multipart, campo `arquivos`) |
+| `GET /api/arquivos` | Lista a fila de entrada |
+| `DELETE /api/arquivos/{nome}` | Remove um PDF da fila |
+| `POST /api/processar` | Dispara o lote (409 se já houver um) |
+| `GET /api/status` | Estado, log, resumo e avisos |
+| `GET /api/resultados` | Lista os relatórios gerados |
+| `GET /api/resultados/{nome}` | Baixa um relatório |
+| `GET /api/docs` | Swagger |
 
 ## Rodando com Docker
 
@@ -20,7 +48,8 @@ cp .env.example .env      # PowerShell: Copy-Item .env.example .env
 ```
 
 Edite o `.env` e coloque sua `OPENAI_API_KEY`. Ela só é usada pelo Agente 1, mas é
-obrigatória — o cliente OpenAI é instanciado já no import do script.
+obrigatória — o cliente OpenAI é instanciado já no import do script. No Easypanel,
+defina-a em **Ambiente** nas configurações do serviço.
 
 ### 2. Construir a imagem
 
@@ -30,31 +59,30 @@ docker compose build
 
 A imagem já traz Tesseract (idioma `por`) e Poppler, que o OCR e o `pdf2image` exigem.
 
-### 3. Rodar o Agente 2 (watcher contínuo)
+### 3. Subir a interface web
 
 ```bash
-docker compose up -d agente2
-docker compose logs -f agente2
+docker compose up -d web
+docker compose logs -f web
 ```
 
-Fica de pé processando qualquer `*_agente2.json` novo que aparecer em `JSON/`.
+Acesse `http://localhost:3000` (ou o domínio configurado). É por aqui que o procurador
+envia os processos e baixa a priorização — a web chama os dois agentes internamente.
 
-### 4. Rodar o Agente 1 (lote pontual)
+### Rodando os agentes pela linha de comando
 
-Coloque os PDFs em `processos pra analiser/` e execute:
+Alternativa à web, para lotes manuais ou depuração:
 
 ```bash
+# Agente 1 — processa os PDFs já presentes em "processos pra analiser/"
 docker compose run --rm agente1
-```
 
-Ele processa o lote, escreve o JSON em `JSON/` e encerra. O Agente 2, se estiver de pé,
-detecta o arquivo no próximo ciclo (10s) e gera a priorização.
+# Agente 2 — num arquivo específico
+docker compose run --rm agente1 python agente2.py --arquivo JSON/resultados_procesosV7_1_agente2.json
 
-### Comandos úteis
-
-```bash
-# Agente 2 em modo pontual, num arquivo específico
-docker compose run --rm agente2 python agente2.py --arquivo JSON/resultados_procesosV7_1_agente2.json
+# Agente 2 como watcher contínuo (opcional — a web já o chama a cada lote;
+# só é útil se algo depositar JSON em JSON/ por fora da web)
+docker compose --profile watcher up -d agente2
 
 # Parar tudo
 docker compose down
