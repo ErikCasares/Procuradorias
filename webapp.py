@@ -966,11 +966,36 @@ async def criar_lote(
     consumidor: str = Depends(autenticar_api),
 ):
     """
-    Envio `multipart/form-data`, campo `arquivos` repetido — um por PDF.
+    Envio `multipart/form-data`, campo `arquivos` repetido — um por PDF. **Todos os
+    PDFs de uma requisição formam UM lote**, processado de uma vez.
 
     Responde **202 na hora**: o processamento é assíncrono e leva minutos. Guarde o
     `lote_id` e acompanhe em `GET /api/v1/lotes/{lote_id}` até o status virar
     `concluido` ou `erro`.
+
+    ### Mandando muitos PDFs de uma vez
+
+    O formulário aqui embaixo é do Swagger UI, que desenha **uma linha por arquivo** e
+    não abre seleção múltipla — é limitação da página, não da API. Com poucos arquivos,
+    clique em *Add string item* e escolha um por linha; todos entram no mesmo lote.
+
+    Para uma pasta inteira, use uma destas:
+
+    ```bash
+    # Linux/Mac — a pasta toda numa requisição
+    curl -X POST https://SEU-DOMINIO/api/v1/lotes \\
+         -H "Authorization: Bearer $TOKEN" \\
+         $(printf -- '-F arquivos=@%s ' *.pdf)
+    ```
+
+    ```powershell
+    # Windows PowerShell — $campos, não $args: $args é variável reservada
+    $campos = Get-ChildItem *.pdf | ForEach-Object { '-F'; "arquivos=@$($_.Name)" }
+    curl.exe -X POST https://SEU-DOMINIO/api/v1/lotes `
+             -H "Authorization: Bearer $TOKEN" @campos
+    ```
+
+    Ou abra o **painel** em `/` e arraste os arquivos — mesma fila, mesmo pipeline.
     """
     lote = await _gravar_lote(arquivos, origem=consumidor)
     return _publico(lote)
