@@ -94,6 +94,7 @@ COOKIE_SEGURO  = os.getenv("COOKIE_SEGURO", "0") == "1"
 # atacável por dicionário: essa usa scrypt, lento de propósito.
 
 SCRYPT_MAXMEM = 64 * 1024 * 1024
+PREFIXO_TOKEN = "pgms_live_"   # marca dos segredos emitidos por gerar_credencial.py
 
 _tokens_legado = []    # rótulos ainda configurados em texto puro
 _erros_config  = []    # credenciais malformadas — nunca autenticariam ninguém
@@ -121,11 +122,31 @@ def _carregar_tokens() -> dict:
     tokens = {}
     for parte in bruto.split(","):
         parte = parte.strip()
-        if not parte or ":" not in parte:
+        if not parte:
             continue
+
+        # O segredo emitido pelo gerador começa com o prefixo. Se ele aparece
+        # aqui, o par foi invertido: colaram o token no lugar do hash.
+        if parte.startswith(PREFIXO_TOKEN) or f":{PREFIXO_TOKEN}" in parte:
+            _erros_config.append(
+                "API_TOKENS contém o TOKEN em vez do hash — o valor que começa "
+                f"com '{PREFIXO_TOKEN}' é o segredo que vai para o consumidor, não "
+                "para o ambiente. Use a linha 'API_TOKENS=...' que o gerador "
+                "imprime no passo 2."
+            )
+            continue
+
+        if ":" not in parte:
+            _erros_config.append(
+                f"API_TOKENS: a entrada {parte[:20]!r}... não tem ':' separando "
+                "o rótulo do hash. O formato é 'rotulo:sha256:<hash>'."
+            )
+            continue
+
         rotulo, _, resto = parte.partition(":")
         rotulo, resto = rotulo.strip(), resto.strip()
         if not rotulo or not resto:
+            _erros_config.append(f"API_TOKENS: entrada incompleta em {parte[:30]!r}")
             continue
 
         if resto.lower().startswith("sha256:"):
