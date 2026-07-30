@@ -95,7 +95,13 @@ COOKIE_SEGURO  = os.getenv("COOKIE_SEGURO", "0") == "1"
 
 SCRYPT_MAXMEM = 64 * 1024 * 1024
 
-_tokens_legado = []   # rótulos ainda configurados em texto puro
+_tokens_legado = []    # rótulos ainda configurados em texto puro
+_erros_config  = []    # credenciais malformadas — nunca autenticariam ninguém
+
+
+def _hash_valido(valor: str) -> bool:
+    """SHA-256 em hexadecimal: 64 caracteres de 0-9a-f."""
+    return len(valor) == 64 and all(c in "0123456789abcdef" for c in valor)
 
 
 def _carregar_tokens() -> dict:
@@ -106,6 +112,10 @@ def _carregar_tokens() -> dict:
     Aceita ainda "rotulo:<token>" em texto puro — formato antigo, mantido para
     não trancar um serviço já configurado. Nesse caso o hash é calculado aqui e
     o rótulo entra em _tokens_legado, que vira aviso no startup.
+
+    Um hash malformado é DESCARTADO com erro em _erros_config, não aceito
+    silenciosamente. Guardar um hash que nenhum token gera faria a API recusar
+    todo mundo com 401 sem explicar por quê — o erro mais caro de diagnosticar.
     """
     bruto = os.getenv("API_TOKENS", "").strip()
     tokens = {}
@@ -120,6 +130,13 @@ def _carregar_tokens() -> dict:
 
         if resto.lower().startswith("sha256:"):
             digest = resto[7:].strip().lower()
+            if not _hash_valido(digest):
+                _erros_config.append(
+                    f"API_TOKENS['{rotulo}']: o hash tem {len(digest)} caractere(s) e "
+                    f"deveria ter 64 em hexadecimal. Parece estar em base64 ou truncado. "
+                    f"Gere de novo com 'python gerar_credencial.py api {rotulo}'."
+                )
+                continue
         else:
             digest = hashlib.sha256(resto.encode()).hexdigest()
             _tokens_legado.append(rotulo)
@@ -143,8 +160,33 @@ def _conferir_scrypt(senha: str, guardado: str) -> bool:
         return False
 
 
+def _validar_hash_senha(valor: str) -> bool:
+    """Confere o formato scrypt$n$r$p$salt_hex$hash_hex antes de aceitar."""
+    if not valor:
+        return False
+    partes = valor.split("$")
+    if len(partes) != 6 or partes[0] != "scrypt":
+        _erros_config.append(
+            "SENHA_PAINEL_HASH não está no formato esperado "
+            "'scrypt$n$r$p$salt$hash'. Gere de novo com "
+            "'python gerar_credencial.py painel'."
+        )
+        return False
+    try:
+        int(partes[1]), int(partes[2]), int(partes[3])
+        bytes.fromhex(partes[4]), bytes.fromhex(partes[5])
+    except ValueError:
+        _erros_config.append(
+            "SENHA_PAINEL_HASH tem o formato certo mas conteúdo inválido. "
+            "Gere de novo com 'python gerar_credencial.py painel'."
+        )
+        return False
+    return True
+
+
 TOKENS            = _carregar_tokens()
-SENHA_PAINEL_HASH = os.getenv("SENHA_PAINEL_HASH", "").strip()
+_hash_senha_bruto = os.getenv("SENHA_PAINEL_HASH", "").strip()
+SENHA_PAINEL_HASH = _hash_senha_bruto if _validar_hash_senha(_hash_senha_bruto) else ""
 SENHA_PAINEL      = os.getenv("SENHA_PAINEL", "").strip()   # legado, em texto puro
 PAINEL_ATIVO      = bool(SENHA_PAINEL_HASH or SENHA_PAINEL)
 
@@ -456,6 +498,13 @@ async def lifespan(app: FastAPI):
     _carregar_registro()
     _fila = asyncio.Queue()
     tarefa = asyncio.create_task(_worker())
+
+    # Credencial malformada nunca autentica ninguém, mas falha como se o token
+    # estivesse errado. Gritar aqui evita horas de caça a um 401 sem causa.
+    for problema in _erros_config:
+        log.error("=" * 70)
+        log.error(f"CREDENCIAL INVÁLIDA — {problema}")
+        log.error("=" * 70)
 
     if not TOKENS:
         log.warning("API_TOKENS não configurado — a API responderá 503 a tudo")
