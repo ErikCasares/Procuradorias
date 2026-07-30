@@ -81,7 +81,7 @@ ARQ_REGISTRO  = PASTA_DADOS / "registro.json"
 # Pasta de entrada do uso manual por linha de comando (compatibilidade)
 PASTA_ENTRADA_PADRAO = BASE_DIR / "processos pra analiser"
 
-MAX_MB_LOTE    = int(os.getenv("MAX_MB_LOTE", "200"))
+MAX_MB_LOTE    = int(os.getenv("MAX_MB_LOTE", "500"))
 MAX_LINHAS_LOG = 500
 HORAS_SESSAO   = int(os.getenv("HORAS_SESSAO", "12"))
 COOKIE_SEGURO  = os.getenv("COOKIE_SEGURO", "0") == "1"

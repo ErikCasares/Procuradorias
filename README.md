@@ -38,7 +38,7 @@ consumidor perder o token, você emite outro — não há como recuperar o origi
 | `SENHA_PAINEL_HASH` | Hash scrypt da senha do painel |
 | `COOKIE_SEGURO` | `1` em produção — marca a sessão como Secure (só HTTPS) |
 | `HORAS_SESSAO` | Validade da sessão do painel (padrão 12) |
-| `MAX_MB_LOTE` | Tamanho máximo de um lote (padrão 200) |
+| `MAX_MB_LOTE` | Tamanho máximo de um lote, em MB (padrão 500) |
 
 Por que dois algoritmos: os tokens da API são 256 bits aleatórios, sem força bruta
 viável, então SHA-256 direto basta. A senha do painel é escolhida por gente, com
