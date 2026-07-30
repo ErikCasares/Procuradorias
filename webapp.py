@@ -382,6 +382,53 @@ def _lotes_na_frente(lote: dict) -> int:
     )
 
 
+_XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+# Nome fixo do relatório do Agente 2 (REPORTE_XLSX em agente2.py). É ACUMULATIVO:
+# regerado do histórico inteiro a cada lote, então traz também os lotes anteriores.
+_XLSX_AGENTE2 = "historial_agente2.xlsx"
+
+
+def _arquivos_do_lote(lote: dict) -> dict:
+    """
+    Artefatos deste lote que existem em disco: tipo → (caminho, nome, media_type).
+
+    Chave fixa em vez de nome de arquivo na URL — o consumidor nunca escolhe o
+    caminho, então não há como escapar da pasta.
+    """
+    lid  = lote["id"]
+    d    = _dir_lote(lid)
+    mapa = {}
+
+    if lote.get("planilha"):
+        p = d / "resultados" / lote["planilha"]
+        if p.exists():
+            mapa["agente1_planilha"] = (p, f"lote_{lid}_agente1.xlsx", _XLSX)
+
+    p = d / "json" / "resultados_procesosV7_1_agente2.json"
+    if p.exists():
+        mapa["agente1_json"] = (p, f"lote_{lid}_agente1.json", "application/json")
+
+    p = PASTA_JSON / f"lote_{lid}_agente2_resultado.json"
+    if p.exists():
+        mapa["agente2_json"] = (p, f"lote_{lid}_agente2.json", "application/json")
+
+    p = PASTA_RESULT / _XLSX_AGENTE2
+    if p.exists():
+        mapa["agente2_planilha"] = (p, "priorizacao_acumulada.xlsx", _XLSX)
+
+    return mapa
+
+
+DESCRICAO_ARQUIVO = {
+    "agente1_planilha": "Planilha de revisão do Agente 1 (Excel) — só deste lote",
+    "agente1_json"    : "Extração e classificação do Agente 1 (JSON) — só deste lote",
+    "agente2_json"    : "Priorização do Agente 2 (JSON) — só deste lote",
+    "agente2_planilha": "Relatório de priorização do Agente 2 (Excel) — ACUMULADO: "
+                        "regerado do histórico inteiro, inclui os lotes anteriores",
+}
+
+
 def _publico(lote: dict, incluir_log=False, incluir_analises=False) -> dict:
     """Projeção do lote para resposta — esconde caminhos internos."""
     status = lote["status"]
@@ -402,6 +449,9 @@ def _publico(lote: dict, incluir_log=False, incluir_analises=False) -> dict:
             lote.get("concluido_em"),
         ),
         "lotes_na_frente" : _lotes_na_frente(lote) if status == "na_fila" else None,
+        # O que dá para baixar deste lote, para o consumidor não ter que
+        # tentar cada rota e colecionar 404.
+        "downloads"       : sorted(_arquivos_do_lote(lote)) if status == "concluido" else [],
         "resumo"       : lote.get("resumo"),
         "avisos"       : lote.get("avisos", []),
         "erro"         : lote.get("erro"),
@@ -588,6 +638,26 @@ class StatusLote(str, Enum):
     erro        = "erro"
 
 
+class TipoArquivo(str, Enum):
+    """O que cada agente deixa para trás — ver DESCRICAO_ARQUIVO."""
+    agente1_planilha = "agente1_planilha"
+    agente1_json     = "agente1_json"
+    agente2_json     = "agente2_json"
+    agente2_planilha = "agente2_planilha"
+
+
+class ArquivoLote(BaseModel):
+    tipo      : TipoArquivo
+    descricao : str
+    formato   : str = Field(description="xlsx ou json")
+    tamanho_kb: float
+    url       : str = Field(description="Rota de download, com o mesmo token Bearer")
+
+
+class ListaArquivos(BaseModel):
+    arquivos: list[ArquivoLote]
+
+
 class Erro(BaseModel):
     detail: str = Field(description="O que impediu a chamada, em texto legível")
 
@@ -673,6 +743,11 @@ class Lote(BaseModel):
         None,
         description="Quantos lotes precisam terminar antes deste começar. "
                     "Só vem preenchido com status 'na_fila'.",
+    )
+    downloads: list[TipoArquivo] = Field(
+        default_factory=list,
+        description="Artefatos disponíveis para este lote. Baixe em "
+                    "`GET /api/v1/lotes/{lote_id}/arquivos/{tipo}`.",
     )
     resumo      : str | None = Field(
         None, examples=["9 de 12 processo(s) classificados como APTO"]
@@ -1052,10 +1127,7 @@ async def consultar_lote(lote_id: str, consumidor: str = Depends(autenticar_api)
     Rota do polling. Enquanto o status for `na_fila` ou `processando`, repita —
     a cada ~30 s basta. Traz o log dos agentes, útil para diagnosticar um lote travado.
     """
-    lote = _lotes.get(lote_id)
-    if not lote or lote.get("origem") != consumidor:
-        raise HTTPException(404, "Lote não encontrado")
-    return _publico(lote, incluir_log=True)
+    return _publico(_lote_do_consumidor(lote_id, consumidor), incluir_log=True)
 
 
 @app.get(
@@ -1077,15 +1149,79 @@ async def resultado_lote(lote_id: str, consumidor: str = Depends(autenticar_api)
     Só responde com status `concluido`; antes disso devolve `409`. Confira `avisos`
     antes de consumir — lote concluído com avisos rodou até o fim mas deu errado.
     """
-    lote = _lotes.get(lote_id)
-    if not lote or lote.get("origem") != consumidor:
-        raise HTTPException(404, "Lote não encontrado")
+    lote = _lote_do_consumidor(lote_id, consumidor)
     if lote["status"] != "concluido":
         raise HTTPException(409, f"Lote ainda em '{lote['status']}' — aguarde 'concluido'")
     return _publico(lote, incluir_analises=True)
 
 
-_XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+def _lote_do_consumidor(lote_id: str, consumidor: str) -> dict:
+    lote = _lotes.get(lote_id)
+    if not lote or lote.get("origem") != consumidor:
+        raise HTTPException(404, "Lote não encontrado")
+    return lote
+
+
+def _resposta_arquivo(lote: dict, tipo: str) -> FileResponse:
+    achado = _arquivos_do_lote(lote).get(tipo)
+    if not achado:
+        raise HTTPException(
+            404,
+            f"Este lote não tem '{tipo}'. Veja em 'downloads' o que existe — "
+            "um lote que terminou em erro pode não ter gerado nada.",
+        )
+    caminho, nome, media = achado
+    return FileResponse(caminho, filename=nome, media_type=media)
+
+
+@app.get(
+    "/api/v1/lotes/{lote_id}/arquivos",
+    tags=["Lotes"],
+    summary="Listar o que dá para baixar deste lote",
+    response_model=ListaArquivos,
+    responses={**_ERROS_AUTH, **_ERRO_LOTE},
+)
+async def arquivos_lote(lote_id: str, consumidor: str = Depends(autenticar_api)):
+    """
+    Os artefatos dos dois agentes, com tamanho e rota de download.
+
+    Atenção ao `agente2_planilha`: o Excel de priorização é **acumulativo** — o
+    Agente 2 o regera do histórico inteiro a cada lote, então ele traz também os
+    processos dos lotes anteriores. Para o recorte deste lote use `agente2_json`.
+    """
+    lote = _lote_do_consumidor(lote_id, consumidor)
+    return {
+        "arquivos": [
+            {
+                "tipo"      : tipo,
+                "descricao" : DESCRICAO_ARQUIVO[tipo],
+                "formato"   : caminho.suffix.lstrip("."),
+                "tamanho_kb": round(caminho.stat().st_size / 1024, 1),
+                "url"       : f"/api/v1/lotes/{lote_id}/arquivos/{tipo}",
+            }
+            for tipo, (caminho, _, _) in sorted(_arquivos_do_lote(lote).items())
+        ]
+    }
+
+
+@app.get(
+    "/api/v1/lotes/{lote_id}/arquivos/{tipo}",
+    tags=["Lotes"],
+    summary="Baixar um artefato do lote",
+    response_class=FileResponse,
+    responses={
+        200: {"content": {_XLSX: {}, "application/json": {}}, "description": "O arquivo"},
+        404: {"model": Erro, "description": "Lote ou artefato inexistente"},
+        **_ERROS_AUTH,
+    },
+)
+async def baixar_arquivo_lote(
+    lote_id: str,
+    tipo: TipoArquivo,
+    consumidor: str = Depends(autenticar_api),
+):
+    """Download direto. O mesmo token Bearer das demais rotas."""
+    return _resposta_arquivo(_lote_do_consumidor(lote_id, consumidor), tipo.value)
 
 
 @app.get(
@@ -1100,17 +1236,11 @@ _XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     },
 )
 async def planilha_lote(lote_id: str, consumidor: str = Depends(autenticar_api)):
-    """Excel de revisão gerado pela extração — a mesma triagem, em planilha."""
-    lote = _lotes.get(lote_id)
-    if not lote or lote.get("origem") != consumidor:
-        raise HTTPException(404, "Lote não encontrado")
-    if not lote.get("planilha"):
-        raise HTTPException(404, "Este lote não gerou planilha")
-
-    caminho = _dir_lote(lote_id) / "resultados" / lote["planilha"]
-    if not caminho.exists():
-        raise HTTPException(404, "Planilha não encontrada em disco")
-    return FileResponse(caminho, filename=f"lote_{lote_id}.xlsx", media_type=_XLSX)
+    """
+    Excel de revisão do Agente 1 — atalho para
+    `/arquivos/agente1_planilha`, mantido porque já está integrado.
+    """
+    return _resposta_arquivo(_lote_do_consumidor(lote_id, consumidor), "agente1_planilha")
 
 
 # ════════════════════════════════════════════════════════════════
@@ -1174,6 +1304,27 @@ async def painel_listar(
     """Ao contrário da API, o painel enxerga os lotes de todas as origens."""
     todos = sorted(_lotes.values(), key=lambda l: l.get("criado_em") or "", reverse=True)
     return {"lotes": [_publico(l, incluir_log=True) for l in todos[:limite]]}
+
+
+@app.get(
+    "/painel/lotes/{lote_id}/arquivos/{tipo}",
+    tags=["Painel"],
+    summary="Baixar um artefato do lote pelo painel",
+    response_class=FileResponse,
+    responses={404: {"model": Erro, "description": "Lote ou artefato inexistente"}},
+)
+async def painel_baixar_arquivo(lote_id: str, tipo: TipoArquivo, _=Depends(exigir_painel)):
+    """
+    Mesmos arquivos da API, com a sessão do painel em vez do token — o
+    procurador não tem token, e sem isto a planilha do Agente 1, que fica na
+    pasta isolada do lote, ficava inalcançável para ele.
+
+    O painel enxerga lotes de qualquer origem, inclusive os do SIAP.
+    """
+    lote = _lotes.get(lote_id)
+    if not lote:
+        raise HTTPException(404, "Lote não encontrado")
+    return _resposta_arquivo(lote, tipo.value)
 
 
 @app.get(
@@ -1295,6 +1446,10 @@ _ESTILO = """
     font-size:1.05rem; line-height:1; padding:.1rem .35rem; border-radius:5px; flex:none; }
   .arq .tira:hover { background:#fde5e3; }
   .excedeu { color:#9b2c22; font-weight:600; }
+  .baixe { display:flex; flex-wrap:wrap; gap:.5rem; margin-top:.65rem; }
+  .baixe a { font-size:.83rem; padding:.32rem .7rem; border-radius:6px;
+    background:#eef2f6; text-decoration:none; }
+  .baixe a:hover { background:#e2eaf2; text-decoration:none; }
   .andando { margin-top:.55rem; font-size:.88rem; color:#3d4a57; }
   .andando b { font-weight:600; }
   .ao-vivo { margin-top:.3rem; font:12px/1.5 ui-monospace,Consolas,monospace;
@@ -1382,6 +1537,15 @@ const tamanho = b => b >= 1048576
 
 const escapar = s => String(s).replace(/[&<>"]/g,
   c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+// Rótulos dos artefatos. O Excel do Agente 2 é acumulativo — dizer isso no
+// botão evita que alguém o mande para o cartório achando que é só deste lote.
+const ROTULO_ARQUIVO = {
+  agente1_planilha: 'Planilha do Agente 1',
+  agente1_json    : 'JSON do Agente 1',
+  agente2_json    : 'JSON do Agente 2',
+  agente2_planilha: 'Planilha do Agente 2 (acumulada)',
+};
 """
 
 
@@ -1533,18 +1697,21 @@ const MAX_MB = __MAX_MB__;
     if (l.resumo) html += `<div style="margin-top:.4rem">${escapar(l.resumo)}</div>`;
     if (l.erro)   html += `<div class="ruim">${escapar(l.erro)}</div>`;
     (l.avisos || []).forEach(a => html += `<div class="av">&#9888; ${escapar(a)}</div>`);
-    if (l.status === 'concluido')
-      html += `<div style="margin-top:.7rem;display:flex;gap:.6rem;flex-wrap:wrap">
-        <button class="g" id="hera-dl-json">Baixar resultado (JSON)</button>
-        <button class="g" id="hera-dl-xls">Baixar planilha</button></div>`;
+
+    const baixaveis = l.downloads || [];
+    if (baixaveis.length)
+      html += '<div style="margin-top:.7rem;display:flex;gap:.6rem;flex-wrap:wrap">'
+            + baixaveis.map(t => `<button class="g" data-baixar="${t}">&#8681; `
+                + `${escapar(ROTULO_ARQUIVO[t] || t)}</button>`).join('')
+            + '</div>';
     estado.innerHTML = html;
 
-    if (l.status === 'concluido') {
-      q('#hera-dl-json').onclick = () =>
-        baixar(`/api/v1/lotes/${l.lote_id}/resultado`, `lote_${l.lote_id}.json`);
-      q('#hera-dl-xls').onclick = () =>
-        baixar(`/api/v1/lotes/${l.lote_id}/planilha`, `lote_${l.lote_id}.xlsx`);
-    }
+    estado.querySelectorAll('[data-baixar]').forEach(b => {
+      const t = b.dataset.baixar;
+      const ext = t.endsWith('planilha') ? 'xlsx' : 'json';
+      b.onclick = () => baixar(`/api/v1/lotes/${l.lote_id}/arquivos/${t}`,
+                               `${t}_${l.lote_id}.${ext}`);
+    });
   }
 
   async function acompanhar(id) {
@@ -1837,6 +2004,9 @@ function cartaoLote(l) {
       <span class="badge ${cls}">${emCurso ? '<span class="pulso"></span>' : ''}${esc(rotulo)}</span>
     </div>
     ${andamento(l)}
+    ${(l.downloads || []).length ? `<div class="baixe">${l.downloads.map(t =>
+        `<a class="dl" href="/painel/lotes/${encodeURIComponent(l.lote_id)}/arquivos/${t}"
+            download>&#8681; ${esc(ROTULO_ARQUIVO[t] || t)}</a>`).join('')}</div>` : ''}
     ${l.resumo ? `<div style="margin-top:.5rem;font-size:.9rem">${esc(l.resumo)}</div>` : ''}
     ${l.erro ? `<div class="erro-msg">${esc(l.erro)}</div>` : ''}
     ${l.avisos.map(a => `<div class="av-item">&#9888; ${esc(a)}</div>`).join('')}
