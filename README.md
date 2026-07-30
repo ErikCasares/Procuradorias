@@ -79,10 +79,22 @@ o OCR já satura a CPU.
 | `GET /api/v1/lotes/{id}/resultado` | Priorização completa (`409` enquanto não concluir) |
 | `GET /api/v1/lotes/{id}/planilha` | Excel de revisão do lote |
 | `GET /health` | Healthcheck, sem autenticação |
-| `GET /api/docs` | Swagger |
 
 Cada consumidor só enxerga os próprios lotes — o token de um recebe `404` no lote de
 outro.
+
+### Documentação interativa
+
+| Rota | Uso |
+| ---------------------- | ------------------------------------------------------ |
+| `GET /api/docs` | Swagger. Clique em **Authorize**, cole o token e teste as rotas pelo navegador |
+| `GET /api/redoc` | A mesma documentação em página de leitura corrida — é o que se manda para quem vai integrar |
+| `GET /api/openapi.json` | OpenAPI cru, para gerar cliente com `openapi-generator` |
+
+Sai do próprio código: os campos de resposta, os códigos de erro e o fluxo do polling
+estão descritos nas rotas de `webapp.py`, então a documentação não envelhece à parte da
+implementação. As três páginas são públicas — mostram o formato da API, nunca dados de
+processo, que continuam exigindo token.
 
 ### Ciclo de vida
 
@@ -160,7 +172,8 @@ docker compose up -d web
 docker compose logs -f web
 ```
 
-Acesse `http://localhost:3000` (ou o domínio configurado). O log do startup diz quais
+Acesse `http://localhost:3000` para o painel e `http://localhost:3000/api/docs` para o
+Swagger (ou o domínio configurado). O log do startup diz quais
 consumidores da API foram habilitados — se aparecer `API_TOKENS não configurado`, a
 API está recusando tudo.
 

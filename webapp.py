@@ -11,6 +11,9 @@ Duas superfícies sobre o mesmo pipeline (Agente 1 → Agente 2):
     /painel     Interface do procurador. Autenticação por senha, sessão em
                 cookie. Mesmo pipeline, uso manual.
 
+    /api/docs   Swagger — o contrato que o integrador lê e testa. ReDoc em
+                /api/redoc, OpenAPI cru em /api/openapi.json.
+
 AUTENTICAÇÃO FALHA FECHADA — sem API_TOKENS configurado a API recusa tudo com
 503, e sem SENHA_PAINEL o painel não abre. É deliberado: uma configuração
 incompleta deixa o serviço inacessível, nunca aberto. Os relatórios carregam
@@ -40,13 +43,16 @@ import logging
 from collections import deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
+from enum import Enum
 from pathlib import Path
 
 from fastapi import (
-    Cookie, Depends, FastAPI, File, Form, Header, HTTPException,
-    Request, UploadFile,
+    Cookie, Depends, FastAPI, File, Form, HTTPException,
+    Query, Security, UploadFile,
 )
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from pydantic import BaseModel, ConfigDict, Field
 
 logging.basicConfig(
     level=logging.INFO,
@@ -227,8 +233,22 @@ def _senha_confere(enviada: str) -> bool:
 _sessoes = {}   # token de sessão → validade (datetime)
 _falhas_login = deque(maxlen=50)   # timestamps, para frear tentativa em massa
 
+# Declarado como esquema de segurança para o Swagger mostrar o botão Authorize —
+# o integrador cola o token uma vez e testa todas as rotas. auto_error=False
+# porque as mensagens de erro daqui explicam o que fazer; as do FastAPI não.
+_bearer = HTTPBearer(
+    scheme_name="Token do consumidor",
+    description=(
+        "Token emitido por `python gerar_credencial.py api <rotulo>`. "
+        "Cole só o token — o Swagger acrescenta o prefixo `Bearer`."
+    ),
+    auto_error=False,
+)
 
-def autenticar_api(authorization: str = Header(None)) -> str:
+
+def autenticar_api(
+    credencial: HTTPAuthorizationCredentials = Security(_bearer),
+) -> str:
     """Valida o Bearer token e devolve o rótulo do consumidor."""
     if not TOKENS:
         raise HTTPException(
@@ -237,14 +257,14 @@ def autenticar_api(authorization: str = Header(None)) -> str:
             "do serviço no formato 'rotulo:token'.",
         )
 
-    if not authorization or not authorization.lower().startswith("bearer "):
+    if not credencial or credencial.scheme.lower() != "bearer":
         raise HTTPException(
             401,
             "Envie o token no cabeçalho: Authorization: Bearer <token>",
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    enviado = authorization[7:].strip()
+    enviado = credencial.credentials.strip()
     # Hash do que chegou, comparado com os hashes guardados. compare_digest é
     # de tempo constante — o tempo de resposta não vaza quanto do token acertou.
     digest = hashlib.sha256(enviado.encode()).hexdigest()
@@ -509,6 +529,158 @@ async def _worker():
 
 
 # ════════════════════════════════════════════════════════════════
+# CONTRATO DA API — modelos de resposta
+# ════════════════════════════════════════════════════════════════
+#
+# Existem pelo Swagger: sem eles o /api/docs mostra "Successful Response" sem
+# corpo nenhum e quem for integrar precisa adivinhar os campos por tentativa.
+#
+# extra="allow" nos modelos que vêm do Agente 2 é deliberado: o response_model
+# DESCARTA campo não declarado. Quando o Agente 2 ganhar a análise por Gemini,
+# os campos novos passariam a sumir da resposta em silêncio — o modelo
+# documenta o mínimo garantido, não um teto.
+
+class StatusLote(str, Enum):
+    na_fila     = "na_fila"
+    processando = "processando"
+    concluido   = "concluido"
+    erro        = "erro"
+
+
+class Erro(BaseModel):
+    detail: str = Field(description="O que impediu a chamada, em texto legível")
+
+
+class Totais(BaseModel):
+    """Quantos processos caíram em cada prioridade."""
+    ALTA : int
+    MEDIA: int
+    BAIXA: int
+
+
+class Analise(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    prioridade: str | None = Field(
+        None,
+        description="ALTA (dívida ≥ R$ 10.000 ou parado ≥ 5 anos), "
+                    "MEDIA (R$ 1.000 a R$ 10.000) ou BAIXA",
+        examples=["ALTA"],
+    )
+    acao_recomendada : str | None = None
+    justificativa    : str | None = None
+    alerta_prescricao: bool | None = Field(
+        None, description="Risco de prescrição quinquenal — CTN art. 174"
+    )
+    observacoes: list[str] = Field(
+        default_factory=list,
+        description="Pontos de atenção para o procurador: dado faltante, OCR ruim, prescrição",
+    )
+
+
+class ProcessoAnalisado(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    id_lote        : str | None = None
+    numero_processo: str | None = None
+    nome_executado : str | None = None
+    analise        : Analise | None = None
+    erro           : str | None = Field(
+        None,
+        description="Preenchido quando ESTE processo falhou na análise. "
+                    "Os demais do lote seguem normalmente.",
+    )
+    processado_em: str | None = None
+
+
+class Lote(BaseModel):
+    model_config = ConfigDict(json_schema_extra={"example": {
+        "lote_id"     : "20260729-143000-a1b2c3",
+        "status"      : "concluido",
+        "origem"      : "siap",
+        "criado_em"   : "2026-07-29 14:30:00",
+        "iniciado_em" : "2026-07-29 14:30:01",
+        "concluido_em": "2026-07-29 14:38:12",
+        "arquivos"    : ["processo1.pdf", "processo2.pdf"],
+        "etapa"       : "concluído",
+        "resumo"      : "9 de 12 processo(s) classificados como APTO",
+        "avisos"      : [],
+        "erro"        : None,
+        "totais"      : {"ALTA": 4, "MEDIA": 3, "BAIXA": 2},
+    }})
+
+    lote_id: str = Field(description="Identificador do lote — use nas demais rotas")
+    status : StatusLote
+    origem : str | None = Field(
+        None, description="Rótulo do consumidor que enviou o lote, ou 'painel'"
+    )
+    criado_em   : str | None = None
+    iniciado_em : str | None = Field(None, description="Nulo enquanto o lote está na fila")
+    concluido_em: str | None = None
+    arquivos    : list[str] = Field(default_factory=list, description="PDFs recebidos neste lote")
+    etapa       : str | None = Field(None, description="Passo corrente, para exibir a quem espera")
+    resumo      : str | None = Field(
+        None, examples=["9 de 12 processo(s) classificados como APTO"]
+    )
+    avisos: list[str] = Field(
+        default_factory=list,
+        description="NÃO NULO com status 'concluido' significa que o lote rodou até o "
+                    "fim mas algo deu errado no caminho. Trate como falha.",
+    )
+    erro  : str | None = Field(None, description="Preenchido quando status é 'erro'")
+    totais: Totais | None = Field(None, description="Só depois de concluído")
+
+
+class LoteComLog(Lote):
+    log: list[str] = Field(
+        default_factory=list,
+        description=f"Saída dos agentes, últimas {MAX_LINHAS_LOG} linhas",
+    )
+
+
+class LoteComAnalises(Lote):
+    analises: list[ProcessoAnalisado] = Field(
+        default_factory=list, description="Um item por processo APTO"
+    )
+
+
+class ListaLotes(BaseModel):
+    lotes: list[Lote]
+
+
+class ListaLotesComLog(BaseModel):
+    lotes: list[LoteComLog]
+
+
+class Saude(BaseModel):
+    status     : str = Field(examples=["ok"])
+    api_ativa  : bool = Field(description="False quando falta API_TOKENS — a API recusa tudo com 503")
+    na_fila    : int
+    processando: int
+
+
+class Relatorio(BaseModel):
+    nome         : str
+    tamanho_kb   : float
+    modificado_em: str
+
+
+class ListaRelatorios(BaseModel):
+    arquivos: list[Relatorio]
+
+
+# Respostas de erro comuns a toda a API v1 — repetidas em cada rota só para o
+# Swagger mostrar o corpo que o consumidor vai receber.
+_ERROS_AUTH = {
+    401: {"model": Erro, "description": "Token ausente ou inválido"},
+    503: {"model": Erro, "description": "Serviço sem API_TOKENS configurado — falha fechada"},
+}
+_ERRO_LOTE = {
+    404: {"model": Erro, "description": "Lote inexistente ou de outro consumidor"},
+}
+
+
+# ════════════════════════════════════════════════════════════════
 # APLICAÇÃO
 # ════════════════════════════════════════════════════════════════
 
@@ -548,10 +720,84 @@ async def lifespan(app: FastAPI):
     tarefa.cancel()
 
 
+_DESCRICAO = """
+Triagem automatizada de execuções fiscais — **HERA Tecnologia / PGMS**, contrato nº 01/2026.
+
+Envie os PDFs dos processos; o serviço extrai os dados (com OCR quando a página é
+digitalizada), classifica cada processo em APTO / NÃO APTO e devolve a priorização
+jurídico-fiscal: prioridade, ação recomendada e alerta de prescrição.
+
+## Autenticação
+
+Todas as rotas `/api/v1/*` exigem o token do consumidor:
+
+```http
+Authorization: Bearer <token>
+```
+
+Clique em **Authorize**, no alto da página, para testar por aqui — o token passa a valer
+para todas as rotas. Ele é emitido por `python gerar_credencial.py api <rotulo>` e
+aparece uma única vez; perdido, emite-se outro.
+
+Cada consumidor só enxerga os próprios lotes. O lote de outro token responde `404`, nunca
+`403` — a existência do lote alheio também não vaza.
+
+Se **tudo** responder `503`, o serviço está sem `API_TOKENS`. É deliberado: configuração
+incompleta deixa o serviço fechado, nunca aberto.
+
+## O processamento é assíncrono
+
+OCR e GPT levam minutos por lote e nenhum proxy segura a conexão tanto tempo. O envio
+responde `202` na hora com um `lote_id`; acompanhe por polling. Os lotes rodam em fila
+serial — um por vez, porque o OCR já satura a CPU.
+
+1. `POST /api/v1/lotes` → `202` com o `lote_id`
+2. `GET /api/v1/lotes/{lote_id}` a cada ~30 s, até o status sair de `na_fila`/`processando`
+3. `GET /api/v1/lotes/{lote_id}/resultado` quando o status for `concluido`
+
+Ciclo de vida: `na_fila` → `processando` → `concluido` | `erro`
+
+## Sempre confira `avisos`
+
+A extração trata OCR quebrado, erro de API e PDF ilegível internamente e **encerra com
+sucesso**. Um lote pode chegar a `concluido` tendo classificado zero processos. Por isso
+toda resposta traz `resumo` e `avisos`:
+
+```json
+{
+  "status": "concluido",
+  "resumo": "0 de 12 processo(s) classificados como APTO",
+  "avisos": ["Nenhum processo foi classificado como APTO — o resultado sairá vazio"]
+}
+```
+
+`status: "concluido"` com `avisos` não vazio significa que o lote rodou até o fim mas algo
+deu errado no caminho. **Trate como falha.**
+"""
+
 app = FastAPI(
     title="Triagem de Execuções Fiscais — PGMS",
     version="1.0",
+    description=_DESCRICAO,
     docs_url="/api/docs",
+    redoc_url="/api/redoc",
+    openapi_url="/api/openapi.json",
+    openapi_tags=[
+        {
+            "name": "Lotes",
+            "description": "Envio e acompanhamento dos lotes. É o contrato da integração.",
+        },
+        {
+            "name": "Serviço",
+            "description": "Estado do serviço. Sem autenticação, sem dado sensível.",
+        },
+        {
+            "name": "Painel",
+            "description": "Rotas internas do painel do procurador — sessão por cookie, "
+                           "não fazem parte da integração. Documentadas para quem mantém "
+                           "o serviço.",
+        },
+    ],
     lifespan=lifespan,
 )
 
@@ -621,7 +867,12 @@ async def _gravar_lote(arquivos: list, origem: str) -> dict:
 # API v1 — consumo externo (SIAP)
 # ════════════════════════════════════════════════════════════════
 
-@app.get("/health")
+@app.get(
+    "/health",
+    tags=["Serviço"],
+    summary="Healthcheck",
+    response_model=Saude,
+)
 async def health():
     """Healthcheck do Easypanel — sem autenticação, sem dado sensível."""
     return {
@@ -632,41 +883,88 @@ async def health():
     }
 
 
-@app.post("/api/v1/lotes", status_code=202)
+@app.post(
+    "/api/v1/lotes",
+    tags=["Lotes"],
+    summary="Enviar processos para triagem",
+    status_code=202,
+    response_model=Lote,
+    responses={
+        202: {"model": Lote, "description": "Lote aceito e enfileirado"},
+        400: {"model": Erro, "description": "Nenhum PDF enviado, ou arquivo que não é .pdf"},
+        413: {"model": Erro, "description": f"Lote acima de {MAX_MB_LOTE} MB"},
+        **_ERROS_AUTH,
+    },
+)
 async def criar_lote(
     arquivos: list[UploadFile] = File(..., description="Um ou mais PDFs de processos"),
     consumidor: str = Depends(autenticar_api),
 ):
     """
-    Envia um lote de processos para triagem.
+    Envio `multipart/form-data`, campo `arquivos` repetido — um por PDF.
 
-    Responde 202 na hora — o processamento é assíncrono. Acompanhe em
-    GET /api/v1/lotes/{lote_id} até status virar 'concluido' ou 'erro'.
+    Responde **202 na hora**: o processamento é assíncrono e leva minutos. Guarde o
+    `lote_id` e acompanhe em `GET /api/v1/lotes/{lote_id}` até o status virar
+    `concluido` ou `erro`.
     """
     lote = await _gravar_lote(arquivos, origem=consumidor)
     return _publico(lote)
 
 
-@app.get("/api/v1/lotes")
-async def listar_lotes(consumidor: str = Depends(autenticar_api), limite: int = 50):
-    """Lista os lotes enviados por este consumidor, mais recentes primeiro."""
+@app.get(
+    "/api/v1/lotes",
+    tags=["Lotes"],
+    summary="Listar meus lotes",
+    response_model=ListaLotes,
+    responses=_ERROS_AUTH,
+)
+async def listar_lotes(
+    consumidor: str = Depends(autenticar_api),
+    limite: int = Query(50, ge=1, le=500, description="Quantos lotes trazer"),
+):
+    """Lotes enviados por este consumidor, mais recentes primeiro. Sem log nem análises."""
     meus = [l for l in _lotes.values() if l.get("origem") == consumidor]
     meus.sort(key=lambda l: l.get("criado_em") or "", reverse=True)
     return {"lotes": [_publico(l) for l in meus[:limite]]}
 
 
-@app.get("/api/v1/lotes/{lote_id}")
+@app.get(
+    "/api/v1/lotes/{lote_id}",
+    tags=["Lotes"],
+    summary="Consultar o estado de um lote",
+    response_model=LoteComLog,
+    responses={**_ERROS_AUTH, **_ERRO_LOTE},
+)
 async def consultar_lote(lote_id: str, consumidor: str = Depends(autenticar_api)):
-    """Estado do lote. Enquanto status for 'na_fila' ou 'processando', repita."""
+    """
+    Rota do polling. Enquanto o status for `na_fila` ou `processando`, repita —
+    a cada ~30 s basta. Traz o log dos agentes, útil para diagnosticar um lote travado.
+    """
     lote = _lotes.get(lote_id)
     if not lote or lote.get("origem") != consumidor:
         raise HTTPException(404, "Lote não encontrado")
     return _publico(lote, incluir_log=True)
 
 
-@app.get("/api/v1/lotes/{lote_id}/resultado")
+@app.get(
+    "/api/v1/lotes/{lote_id}/resultado",
+    tags=["Lotes"],
+    summary="Baixar a priorização do lote",
+    response_model=LoteComAnalises,
+    responses={
+        409: {"model": Erro, "description": "Lote ainda não concluído — continue o polling"},
+        **_ERROS_AUTH,
+        **_ERRO_LOTE,
+    },
+)
 async def resultado_lote(lote_id: str, consumidor: str = Depends(autenticar_api)):
-    """Priorização completa do lote — só depois de status 'concluido'."""
+    """
+    Priorização completa: um item em `analises` por processo APTO, com prioridade,
+    ação recomendada e alerta de prescrição.
+
+    Só responde com status `concluido`; antes disso devolve `409`. Confira `avisos`
+    antes de consumir — lote concluído com avisos rodou até o fim mas deu errado.
+    """
     lote = _lotes.get(lote_id)
     if not lote or lote.get("origem") != consumidor:
         raise HTTPException(404, "Lote não encontrado")
@@ -675,9 +973,22 @@ async def resultado_lote(lote_id: str, consumidor: str = Depends(autenticar_api)
     return _publico(lote, incluir_analises=True)
 
 
-@app.get("/api/v1/lotes/{lote_id}/planilha")
+_XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+
+@app.get(
+    "/api/v1/lotes/{lote_id}/planilha",
+    tags=["Lotes"],
+    summary="Baixar a planilha de revisão do lote",
+    response_class=FileResponse,
+    responses={
+        200: {"content": {_XLSX: {}}, "description": "Arquivo .xlsx"},
+        404: {"model": Erro, "description": "Lote inexistente, de outro consumidor, ou sem planilha"},
+        **_ERROS_AUTH,
+    },
+)
 async def planilha_lote(lote_id: str, consumidor: str = Depends(autenticar_api)):
-    """Excel de revisão gerado pelo Agente 1 para este lote."""
+    """Excel de revisão gerado pela extração — a mesma triagem, em planilha."""
     lote = _lotes.get(lote_id)
     if not lote or lote.get("origem") != consumidor:
         raise HTTPException(404, "Lote não encontrado")
@@ -687,18 +998,14 @@ async def planilha_lote(lote_id: str, consumidor: str = Depends(autenticar_api))
     caminho = _dir_lote(lote_id) / "resultados" / lote["planilha"]
     if not caminho.exists():
         raise HTTPException(404, "Planilha não encontrada em disco")
-    return FileResponse(
-        caminho,
-        filename=f"lote_{lote_id}.xlsx",
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
+    return FileResponse(caminho, filename=f"lote_{lote_id}.xlsx", media_type=_XLSX)
 
 
 # ════════════════════════════════════════════════════════════════
 # PAINEL — uso manual do procurador
 # ════════════════════════════════════════════════════════════════
 
-@app.post("/painel/login")
+@app.post("/painel/login", tags=["Painel"], summary="Abrir sessão no painel")
 async def login(senha: str = Form(...)):
     if not PAINEL_ATIVO:
         raise HTTPException(503, "Painel sem senha configurada")
@@ -725,7 +1032,7 @@ async def login(senha: str = Form(...)):
     return resp
 
 
-@app.post("/painel/logout")
+@app.post("/painel/logout", tags=["Painel"], summary="Encerrar a sessão")
 async def logout(sessao: str = Cookie(None)):
     _sessoes.pop(sessao or "", None)
     resp = JSONResponse({"ok": True})
@@ -733,7 +1040,7 @@ async def logout(sessao: str = Cookie(None)):
     return resp
 
 
-@app.post("/painel/lotes")
+@app.post("/painel/lotes", tags=["Painel"], summary="Enviar lote pelo painel", response_model=Lote)
 async def painel_criar(
     arquivos: list[UploadFile] = File(...),
     _=Depends(exigir_painel),
@@ -742,13 +1049,27 @@ async def painel_criar(
     return _publico(lote)
 
 
-@app.get("/painel/lotes")
-async def painel_listar(_=Depends(exigir_painel), limite: int = 30):
+@app.get(
+    "/painel/lotes",
+    tags=["Painel"],
+    summary="Listar todos os lotes",
+    response_model=ListaLotesComLog,
+)
+async def painel_listar(
+    _=Depends(exigir_painel),
+    limite: int = Query(30, ge=1, le=500),
+):
+    """Ao contrário da API, o painel enxerga os lotes de todas as origens."""
     todos = sorted(_lotes.values(), key=lambda l: l.get("criado_em") or "", reverse=True)
     return {"lotes": [_publico(l, incluir_log=True) for l in todos[:limite]]}
 
 
-@app.get("/painel/relatorios")
+@app.get(
+    "/painel/relatorios",
+    tags=["Painel"],
+    summary="Listar os relatórios acumulados",
+    response_model=ListaRelatorios,
+)
 async def painel_relatorios(_=Depends(exigir_painel)):
     _garantir_pastas()
     arqs = [p for p in PASTA_RESULT.iterdir() if p.is_file() and not p.name.startswith(".")]
@@ -765,7 +1086,16 @@ async def painel_relatorios(_=Depends(exigir_painel)):
     }
 
 
-@app.get("/painel/relatorios/{nome}")
+@app.get(
+    "/painel/relatorios/{nome}",
+    tags=["Painel"],
+    summary="Baixar um relatório",
+    response_class=FileResponse,
+    responses={
+        200: {"content": {"application/octet-stream": {}}, "description": "O arquivo"},
+        404: {"model": Erro, "description": "Arquivo não encontrado"},
+    },
+)
 async def painel_baixar(nome: str, _=Depends(exigir_painel)):
     limpo = Path(nome).name
     alvo = (PASTA_RESULT / limpo).resolve()
@@ -774,7 +1104,7 @@ async def painel_baixar(nome: str, _=Depends(exigir_painel)):
     return FileResponse(alvo, filename=alvo.name, media_type="application/octet-stream")
 
 
-@app.get("/", response_class=HTMLResponse)
+@app.get("/", response_class=HTMLResponse, include_in_schema=False)
 async def index(sessao: str = Cookie(None)):
     if not PAINEL_ATIVO:
         return HTMLResponse(
