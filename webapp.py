@@ -50,6 +50,7 @@ from fastapi import (
     Cookie, Depends, FastAPI, File, Form, HTTPException,
     Query, Security, UploadFile,
 )
+from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, Field
@@ -829,13 +830,15 @@ toda resposta traz `resumo` e `avisos`:
 deu errado no caminho. **Trate como falha.**
 """
 
+URL_OPENAPI = "/api/openapi.json"
+
 app = FastAPI(
     title="Triagem de Execuções Fiscais — PGMS",
     version="1.0",
     description=_DESCRICAO,
-    docs_url="/api/docs",
+    docs_url=None,          # servido à mão logo abaixo, com o enviador de lotes
     redoc_url="/api/redoc",
-    openapi_url="/api/openapi.json",
+    openapi_url=URL_OPENAPI,
     openapi_tags=[
         {
             "name": "Lotes",
@@ -931,6 +934,25 @@ async def _gravar_lote(arquivos: list, origem: str) -> dict:
 # ════════════════════════════════════════════════════════════════
 # API v1 — consumo externo (SIAP)
 # ════════════════════════════════════════════════════════════════
+
+@app.get("/api/docs", include_in_schema=False)
+async def documentacao():
+    """
+    Swagger com um enviador de lotes por cima.
+
+    O formulário que o Swagger UI gera para um campo do tipo lista aceita um
+    arquivo por linha e não abre seleção múltipla — para mandar uma pasta de
+    processos é inviável. Como a página é servida por nós, um enviador próprio
+    entra antes dela: mesma rota, mesmo token, mas com arrastar-e-soltar,
+    escolha de pasta inteira e acompanhamento do lote até o resultado.
+    """
+    pagina = bytes(get_swagger_ui_html(
+        openapi_url=URL_OPENAPI,
+        title=f"{app.title} — API",
+    ).body).decode()
+    return HTMLResponse(pagina.replace('<div id="swagger-ui">',
+                                       _ENVIO_DOCS + '<div id="swagger-ui">'))
+
 
 @app.get(
     "/health",
@@ -1289,6 +1311,283 @@ _ESTILO = """
   .erro-msg { color:#9b2c22; font-size:.9rem; margin-top:.5rem; }
 """
 
+_JS_ARQUIVOS = """
+// ── Coletor de PDFs ──────────────────────────────────────────────
+//
+// Usado pelo painel e pela página do Swagger. Um <input type=file> descarta a
+// escolha anterior a cada nova, e o formulário do Swagger só aceita um arquivo
+// por linha. Aqui os arquivos SE SOMAM, venham de escolhas sucessivas, de uma
+// pasta inteira ou de arrastar e soltar — inclusive arrastando a pasta, que o
+// dataTransfer.files sozinho ignora.
+
+const Arquivos = {
+  itens: [],
+  aviso: '',
+
+  chave(f) { return f.name + '::' + f.size + '::' + f.lastModified; },
+  total()  { return Arquivos.itens.reduce((s, f) => s + f.size, 0); },
+  excedeu(){ return Arquivos.total() > MAX_MB * 1048576; },
+  limpar() { Arquivos.itens = []; Arquivos.aviso = ''; },
+  remover(i) { Arquivos.itens.splice(i, 1); },
+
+  add(lista) {
+    const naoPdf = [];
+    let repetidos = 0;
+    for (const f of lista) {
+      if (!/\\.pdf$/i.test(f.name)) { naoPdf.push(f.name); continue; }
+      if (Arquivos.itens.some(e => Arquivos.chave(e) === Arquivos.chave(f))) { repetidos++; continue; }
+      Arquivos.itens.push(f);
+    }
+    const partes = [];
+    if (naoPdf.length) partes.push(
+      naoPdf.length > 3
+        ? `${naoPdf.length} arquivo(s) ignorado(s) por não serem PDF`
+        : `Ignorado(s) por não ser PDF: ${naoPdf.join(', ')}`);
+    if (repetidos) partes.push(`${repetidos} já estavam na lista`);
+    Arquivos.aviso = partes.join('. ');
+    return Arquivos.itens.length;
+  },
+
+  // Arrastar uma PASTA entrega um diretório, não arquivos — é preciso percorrer.
+  async doDrop(dt) {
+    const entradas = dt.items
+      ? [...dt.items].map(i => i.webkitGetAsEntry && i.webkitGetAsEntry()).filter(Boolean)
+      : [];
+    if (!entradas.length) return Arquivos.add(dt.files);
+
+    const achados = [];
+    for (const e of entradas) await Arquivos._percorrer(e, achados);
+    return Arquivos.add(achados);
+  },
+
+  async _percorrer(entrada, acc) {
+    if (entrada.isFile) {
+      acc.push(await new Promise((ok, erro) => entrada.file(ok, erro)));
+      return;
+    }
+    if (!entrada.isDirectory) return;
+    const leitor = entrada.createReader();
+    // readEntries devolve no máximo 100 por chamada — repetir até vir vazio.
+    let bloco;
+    do {
+      bloco = await new Promise((ok, erro) => leitor.readEntries(ok, erro));
+      for (const e of bloco) await Arquivos._percorrer(e, acc);
+    } while (bloco.length);
+  },
+};
+
+const tamanho = b => b >= 1048576
+  ? (b / 1048576).toFixed(1) + ' MB'
+  : Math.max(1, Math.round(b / 1024)) + ' KB';
+
+const escapar = s => String(s).replace(/[&<>"]/g,
+  c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+"""
+
+
+_ENVIO_DOCS = ("""
+<style>
+  .hera { max-width:1400px; margin:1.4rem auto 0; padding:0 20px;
+    font:15px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; color:#1a2027; }
+  .hera .cx { background:#fff; border:1px solid #d6e0ea; border-left:4px solid #1F4E79;
+    border-radius:9px; padding:1.1rem 1.3rem; }
+  .hera h2 { margin:0 0 .3rem; font-size:1.08rem; color:#1F4E79; }
+  .hera p { margin:.25rem 0 0; font-size:.88rem; color:#5c6b7a; }
+  .hera label { display:block; font-size:.8rem; color:#5c6b7a; margin:.9rem 0 .3rem; }
+  .hera input[type=password] { font:inherit; padding:.5rem .7rem; border:1px solid #ccd6e0;
+    border-radius:7px; width:100%; max-width:520px; }
+  .hera .zona { margin-top:.9rem; border:2px dashed #ccd6e0; border-radius:9px;
+    padding:1.1rem; text-align:center; background:#fbfcfd; transition:.15s; }
+  .hera .zona.sobre { border-color:#1F4E79; background:#eef4fa; }
+  .hera button { font:inherit; font-weight:600; cursor:pointer; border:0; border-radius:7px;
+    padding:.55rem 1.05rem; background:#1F4E79; color:#fff; }
+  .hera button.g { background:#eef2f6; color:#1F4E79; }
+  .hera button:disabled { background:#b6c2cf; cursor:not-allowed; }
+  .hera .fila { max-height:190px; overflow:auto; margin-top:.7rem; }
+  .hera .it { display:flex; gap:.6rem; align-items:center; font-size:.86rem;
+    padding:.32rem .1rem; border-bottom:1px solid #f1f4f7; }
+  .hera .it span:first-child { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .hera .it small { color:#8b98a5; }
+  .hera .it button { background:none; color:#9b2c22; padding:.1rem .3rem; }
+  .hera .barra { height:4px; border-radius:3px; background:#eef2f6; overflow:hidden; margin-top:.7rem; }
+  .hera .barra i { display:block; height:100%; width:32%; border-radius:3px; background:#1F4E79;
+    animation:heracorre 1.7s ease-in-out infinite; }
+  @keyframes heracorre { 0% { margin-left:-32% } 100% { margin-left:100% } }
+  .hera .estado { margin-top:.8rem; font-size:.9rem; }
+  .hera .ruim { color:#9b2c22; font-weight:600; }
+  .hera .av { font-size:.85rem; padding:.4rem .6rem; border-radius:6px; background:#fff5e6;
+    border:1px solid #f2dcb3; color:#7a4b00; margin-top:.3rem; }
+  @media (prefers-reduced-motion:reduce) { .hera .barra i { animation:none } }
+</style>
+
+<div class="hera"><div class="cx">
+  <h2>Enviar um lote de teste</h2>
+  <p>O formulário do Swagger, mais abaixo, aceita <b>um arquivo por linha</b> — é limitação
+     daquela página. Aqui você solta a pasta inteira de uma vez. Mesma rota
+     <code>POST /api/v1/lotes</code>, mesmo token.</p>
+
+  <label for="hera-tk">Token do consumidor</label>
+  <input type="password" id="hera-tk" placeholder="pgms_live_..." autocomplete="off">
+
+  <input type="file" id="hera-arq" multiple accept="application/pdf,.pdf" hidden>
+  <input type="file" id="hera-pasta" webkitdirectory directory multiple hidden>
+
+  <div class="zona" id="hera-zona">
+    <strong>Arraste os PDFs — ou a pasta inteira — aqui</strong>
+    <div style="margin-top:.6rem;display:flex;gap:.6rem;justify-content:center;flex-wrap:wrap">
+      <button type="button" class="g" id="hera-b-arq">Escolher arquivos</button>
+      <button type="button" class="g" id="hera-b-pasta">Escolher uma pasta</button>
+    </div>
+    <p>Só os PDFs entram. Todos formam <b>um único lote</b>. Até __MAX_MB__ MB.</p>
+  </div>
+
+  <div class="fila" id="hera-fila"></div>
+
+  <div style="display:flex;gap:.6rem;align-items:center;flex-wrap:wrap;margin-top:.9rem">
+    <button id="hera-enviar" disabled>Enviar e processar</button>
+    <button class="g" id="hera-limpar" hidden>Limpar</button>
+    <span style="font-size:.85rem;color:#8b98a5" id="hera-total"></span>
+  </div>
+
+  <div class="estado" id="hera-estado"></div>
+</div></div>
+
+<script>
+const MAX_MB = __MAX_MB__;
+</script>
+<script>""" + _JS_ARQUIVOS + """</script>
+<script>
+(function () {
+  const q = s => document.querySelector(s);
+  const estado = q('#hera-estado');
+  let acompanhando = null;
+
+  function autorizacao() {
+    const t = q('#hera-tk').value.trim();
+    return t ? {'Authorization': 'Bearer ' + t} : null;
+  }
+
+  function desenhar() {
+    const itens = Arquivos.itens, excedeu = Arquivos.excedeu();
+    q('#hera-fila').innerHTML = itens.map((f, i) => `
+      <div class="it"><span>${escapar(f.webkitRelativePath || f.name)}</span>
+        <small>${tamanho(f.size)}</small>
+        <button data-i="${i}" title="Tirar da lista">&times;</button></div>`).join('');
+    q('#hera-enviar').disabled = !itens.length || excedeu;
+    q('#hera-enviar').textContent = itens.length
+      ? `Enviar ${itens.length} PDF(s) e processar` : 'Enviar e processar';
+    q('#hera-limpar').hidden = !itens.length;
+    q('#hera-total').innerHTML = itens.length
+      ? (excedeu
+          ? `<span class="ruim">${tamanho(Arquivos.total())} — acima do limite de ${MAX_MB} MB</span>`
+          : `${tamanho(Arquivos.total())} no total`)
+      : '';
+    if (Arquivos.aviso) { estado.textContent = Arquivos.aviso; Arquivos.aviso = ''; }
+  }
+
+  q('#hera-fila').onclick = e => {
+    const i = e.target.dataset && e.target.dataset.i;
+    if (i === undefined) return;
+    Arquivos.remover(Number(i)); desenhar();
+  };
+  q('#hera-b-arq').onclick   = () => q('#hera-arq').click();
+  q('#hera-b-pasta').onclick = () => q('#hera-pasta').click();
+  q('#hera-limpar').onclick  = () => { Arquivos.limpar(); desenhar(); };
+  for (const id of ['#hera-arq', '#hera-pasta']) {
+    q(id).onchange = e => { Arquivos.add(e.target.files); e.target.value = ''; desenhar(); };
+  }
+
+  const zona = q('#hera-zona');
+  ['dragenter','dragover'].forEach(ev => zona.addEventListener(ev, e => {
+    e.preventDefault(); zona.classList.add('sobre');
+  }));
+  ['dragleave','drop'].forEach(ev => zona.addEventListener(ev, e => {
+    e.preventDefault(); zona.classList.remove('sobre');
+  }));
+  zona.addEventListener('drop', async e => {
+    estado.textContent = 'Lendo os arquivos...';
+    await Arquivos.doDrop(e.dataTransfer);
+    desenhar();
+  });
+
+  // Baixar exige o cabeçalho de autenticação, então não dá para usar <a href>.
+  async function baixar(url, nome) {
+    const r = await fetch(url, {headers: autorizacao()});
+    if (!r.ok) { estado.innerHTML += `<div class="ruim">Falha ao baixar (${r.status})</div>`; return; }
+    const blob = await r.blob();
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob); a.download = nome;
+    a.click(); URL.revokeObjectURL(a.href);
+  }
+
+  function pintar(l) {
+    const dur = s => s == null ? '' : (s < 60 ? s + ' s' : Math.floor(s/60) + ' min');
+    let html = `<b>${escapar(l.lote_id)}</b> — ${escapar(l.status)}`;
+    if (l.status === 'na_fila')
+      html += ` · ${l.lotes_na_frente || 0} lote(s) na frente · esperando há ${dur(l.decorrido_s)}`
+            + '<div class="barra"><i></i></div>';
+    if (l.status === 'processando')
+      html += ` · ${escapar(l.etapa || '')} · há ${dur(l.decorrido_s)}`
+            + '<div class="barra"><i></i></div>';
+    if (l.status === 'concluido') html += ` · processado em ${dur(l.decorrido_s)}`;
+    if (l.resumo) html += `<div style="margin-top:.4rem">${escapar(l.resumo)}</div>`;
+    if (l.erro)   html += `<div class="ruim">${escapar(l.erro)}</div>`;
+    (l.avisos || []).forEach(a => html += `<div class="av">&#9888; ${escapar(a)}</div>`);
+    if (l.status === 'concluido')
+      html += `<div style="margin-top:.7rem;display:flex;gap:.6rem;flex-wrap:wrap">
+        <button class="g" id="hera-dl-json">Baixar resultado (JSON)</button>
+        <button class="g" id="hera-dl-xls">Baixar planilha</button></div>`;
+    estado.innerHTML = html;
+
+    if (l.status === 'concluido') {
+      q('#hera-dl-json').onclick = () =>
+        baixar(`/api/v1/lotes/${l.lote_id}/resultado`, `lote_${l.lote_id}.json`);
+      q('#hera-dl-xls').onclick = () =>
+        baixar(`/api/v1/lotes/${l.lote_id}/planilha`, `lote_${l.lote_id}.xlsx`);
+    }
+  }
+
+  async function acompanhar(id) {
+    clearInterval(acompanhando);
+    const passo = async () => {
+      const r = await fetch('/api/v1/lotes/' + id, {headers: autorizacao()});
+      if (!r.ok) { clearInterval(acompanhando); return; }
+      const l = await r.json();
+      pintar(l);
+      if (l.status === 'concluido' || l.status === 'erro') clearInterval(acompanhando);
+    };
+    await passo();
+    acompanhando = setInterval(passo, 3000);
+  }
+
+  q('#hera-enviar').onclick = async () => {
+    const cab = autorizacao();
+    if (!cab) { estado.innerHTML = '<span class="ruim">Informe o token do consumidor.</span>'; return; }
+    const fd = new FormData();
+    for (const f of Arquivos.itens) fd.append('arquivos', f);
+    const quantos = Arquivos.itens.length;
+    q('#hera-enviar').disabled = true;
+    estado.textContent = `Enviando ${quantos} PDF(s)...`;
+    try {
+      const r = await fetch('/api/v1/lotes', {method:'POST', headers: cab, body: fd});
+      const j = await r.json();
+      if (!r.ok) {
+        estado.innerHTML = `<span class="ruim">${r.status} — ${escapar(j.detail || 'falha no envio')}</span>`;
+        return;
+      }
+      Arquivos.limpar(); desenhar();
+      acompanhar(j.lote_id);
+    } catch (e) {
+      estado.innerHTML = `<span class="ruim">Falha de rede: ${escapar(e.message)}</span>`;
+    } finally { q('#hera-enviar').disabled = !Arquivos.itens.length; }
+  };
+
+  desenhar();
+})();
+</script>
+""").replace("__MAX_MB__", str(MAX_MB_LOTE))
+
+
 LOGIN = """<!doctype html>
 <html lang="pt-BR"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -1322,7 +1621,7 @@ document.getElementById('f').onsubmit = async e => {
 </script></body></html>
 """
 
-PAINEL = """<!doctype html>
+PAINEL = ("""<!doctype html>
 <html lang="pt-BR"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Triagem de Execuções Fiscais — PGMS</title>
@@ -1340,11 +1639,15 @@ PAINEL = """<!doctype html>
     <h2><span class="num">1</span> Enviar processos</h2>
 
     <input type="file" id="files" multiple accept="application/pdf,.pdf" hidden>
+    <input type="file" id="pasta" webkitdirectory directory multiple hidden>
     <div id="solta" class="solta">
-      <strong>Arraste os PDFs aqui</strong>
-      <button type="button" class="ghost" id="btn-escolher">ou escolha os arquivos</button>
-      <p class="vazio" style="padding:0">Pode escolher várias vezes, inclusive de pastas
-        diferentes — os arquivos se somam. Até __MAX_MB__ MB por lote.</p>
+      <strong>Arraste os PDFs — ou a pasta inteira — aqui</strong>
+      <div class="linha" style="justify-content:center">
+        <button type="button" class="ghost" id="btn-escolher">Escolher arquivos</button>
+        <button type="button" class="ghost" id="btn-pasta">Escolher uma pasta</button>
+      </div>
+      <p class="vazio" style="padding:.6rem 0 0">Pode escolher várias vezes, de pastas
+        diferentes — os arquivos se somam. Só os PDFs entram. Até __MAX_MB__ MB por lote.</p>
     </div>
 
     <div id="lista"></div>
@@ -1376,8 +1679,12 @@ PAINEL = """<!doctype html>
 
 </div>
 <script>
+const MAX_MB = __MAX_MB__;
+</script>
+<script>""" + _JS_ARQUIVOS + """</script>
+<script>
 const $ = s => document.querySelector(s);
-const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const esc = escapar;
 
 const CLASSE = {na_fila:'b-fila', processando:'b-proc', concluido:'b-ok', erro:'b-erro'};
 
@@ -1394,70 +1701,50 @@ document.addEventListener('toggle', e => {
 $('#sair').onclick = async () => { await fetch('/painel/logout',{method:'POST'}); location.reload(); };
 
 // ── Seleção de arquivos ──────────────────────────────────────────
-//
-// A escolha ACUMULA. Um <input type=file> descarta a seleção anterior a cada
-// nova escolha, então quem tem os PDFs em pastas diferentes seria obrigado a
-// mandar um lote por pasta. Guardamos os File aqui e montamos o FormData na
-// hora do envio — o input serve só de porta de entrada.
-
-const MAX_MB = __MAX_MB__;
-let escolhidos = [];
-
-const tamanho = b => b >= 1048576 ? (b/1048576).toFixed(1) + ' MB' : Math.max(1, Math.round(b/1024)) + ' KB';
-const chave = f => `${f.name}::${f.size}::${f.lastModified}`;
-
-function juntar(lista) {
-  const recusados = [];
-  let repetidos = 0;
-  for (const f of lista) {
-    if (!/\\.pdf$/i.test(f.name)) { recusados.push(f.name); continue; }
-    if (escolhidos.some(e => chave(e) === chave(f))) { repetidos++; continue; }
-    escolhidos.push(f);
-  }
-  let msg = '';
-  if (recusados.length) msg += `Ignorado(s) por não ser PDF: ${recusados.join(', ')}. `;
-  if (repetidos) msg += `${repetidos} arquivo(s) já estavam na lista. `;
-  if (msg) $('#up-msg').textContent = msg;
-  desenharSelecao();
-}
+// A lógica de acumular vive em Arquivos (coletor compartilhado); aqui fica só
+// o desenho da tela do painel.
 
 function desenharSelecao() {
-  const total = escolhidos.reduce((s, f) => s + f.size, 0);
-  const excedeu = total > MAX_MB * 1048576;
+  const itens = Arquivos.itens, excedeu = Arquivos.excedeu();
 
-  $('#lista').innerHTML = escolhidos.map((f, i) => `
+  $('#lista').innerHTML = itens.map((f, i) => `
     <div class="arq">
-      <span class="nome">${esc(f.name)}</span>
+      <span class="nome">${esc(f.webkitRelativePath || f.name)}</span>
       <span class="kb">${tamanho(f.size)}</span>
       <button class="tira" data-i="${i}" title="Tirar da lista">&times;</button>
     </div>`).join('');
 
-  $('#btn-up').disabled = !escolhidos.length || excedeu;
-  $('#btn-up').textContent = escolhidos.length
-    ? `Enviar ${escolhidos.length} PDF(s) e processar`
+  $('#btn-up').disabled = !itens.length || excedeu;
+  $('#btn-up').textContent = itens.length
+    ? `Enviar ${itens.length} PDF(s) e processar`
     : 'Enviar e processar';
-  $('#btn-limpar').hidden = !escolhidos.length;
-  $('#total').innerHTML = escolhidos.length
+  $('#btn-limpar').hidden = !itens.length;
+  $('#total').innerHTML = itens.length
     ? (excedeu
-        ? `<span class="excedeu">${tamanho(total)} — acima do limite de ${MAX_MB} MB. Tire alguns arquivos.</span>`
-        : `${tamanho(total)} no total`)
+        ? `<span class="excedeu">${tamanho(Arquivos.total())} — acima do limite de ${MAX_MB} MB. Tire alguns arquivos.</span>`
+        : `${tamanho(Arquivos.total())} no total`)
     : '';
+  if (Arquivos.aviso) { $('#up-msg').textContent = Arquivos.aviso; Arquivos.aviso = ''; }
 }
 
 $('#lista').onclick = e => {
   const i = e.target.dataset && e.target.dataset.i;
   if (i === undefined) return;
-  escolhidos.splice(Number(i), 1);
+  Arquivos.remover(Number(i));
   desenharSelecao();
 };
 
 $('#btn-escolher').onclick = () => $('#files').click();
-$('#btn-limpar').onclick = () => { escolhidos = []; desenharSelecao(); };
+$('#btn-pasta').onclick    = () => $('#pasta').click();
+$('#btn-limpar').onclick   = () => { Arquivos.limpar(); desenharSelecao(); };
 
-$('#files').onchange = e => {
-  juntar(e.target.files);
-  e.target.value = '';   // libera reescolher o MESMO arquivo depois de removê-lo
-};
+for (const id of ['#files', '#pasta']) {
+  $(id).onchange = e => {
+    Arquivos.add(e.target.files);
+    e.target.value = '';   // libera reescolher o MESMO arquivo depois de removê-lo
+    desenharSelecao();
+  };
+}
 
 const solta = $('#solta');
 ['dragenter','dragover'].forEach(ev => solta.addEventListener(ev, e => {
@@ -1466,27 +1753,32 @@ const solta = $('#solta');
 ['dragleave','drop'].forEach(ev => solta.addEventListener(ev, e => {
   e.preventDefault(); solta.classList.remove('sobre');
 }));
-solta.addEventListener('drop', e => juntar(e.dataTransfer.files));
+solta.addEventListener('drop', async e => {
+  $('#up-msg').textContent = 'Lendo os arquivos...';
+  await Arquivos.doDrop(e.dataTransfer);
+  desenharSelecao();
+});
 
 $('#btn-up').onclick = async () => {
-  if (!escolhidos.length) { $('#up-msg').textContent = 'Selecione ao menos um PDF.'; return; }
+  if (!Arquivos.itens.length) { $('#up-msg').textContent = 'Selecione ao menos um PDF.'; return; }
   const fd = new FormData();
-  for (const f of escolhidos) fd.append('arquivos', f);
+  for (const f of Arquivos.itens) fd.append('arquivos', f);
+  const quantos = Arquivos.itens.length;
   $('#btn-up').disabled = true;
-  $('#up-msg').textContent = `Enviando ${escolhidos.length} PDF(s)...`;
+  $('#up-msg').textContent = `Enviando ${quantos} PDF(s)...`;
   try {
     const r = await fetch('/painel/lotes', {method:'POST', body:fd});
     const j = await r.json();
     if (r.ok) {
       $('#up-msg').textContent =
         `Lote ${j.lote_id} criado com ${j.arquivos.length} PDF(s) — acompanhe abaixo.`;
-      escolhidos = [];
+      Arquivos.limpar();
     } else {
       $('#up-msg').textContent = 'Falha: ' + (j.detail || 'erro desconhecido');
     }
     desenharSelecao();
     carregar();
-  } finally { $('#btn-up').disabled = !escolhidos.length; }
+  } finally { $('#btn-up').disabled = !Arquivos.itens.length; }
 };
 
 // "há 3 min" diz mais do que "iniciado 14:31:02" para quem está esperando.
@@ -1583,4 +1875,4 @@ desenharSelecao();
 carregar();
 setInterval(carregar, 3000);
 </script></body></html>
-""".replace("__MAX_MB__", str(MAX_MB_LOTE))
+""").replace("__MAX_MB__", str(MAX_MB_LOTE))
