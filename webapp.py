@@ -350,17 +350,57 @@ def _dir_lote(lote_id: str) -> Path:
     return PASTA_LOTES / lote_id
 
 
+def _decorrido(inicio: str | None, fim: str | None = None) -> int | None:
+    """Segundos entre dois timestamps do registro. Sem 'fim', conta até agora."""
+    if not inicio:
+        return None
+    try:
+        i = datetime.strptime(inicio, "%Y-%m-%d %H:%M:%S")
+        f = datetime.strptime(fim, "%Y-%m-%d %H:%M:%S") if fim else datetime.now()
+    except (ValueError, TypeError):
+        return None
+    return max(0, int((f - i).total_seconds()))
+
+
+def _lotes_na_frente(lote: dict) -> int:
+    """
+    Quantos lotes precisam terminar antes deste começar.
+
+    A fila é serial, então o que está processando também conta — quem espera
+    quer saber quantas rodadas faltam, não a posição numa lista.
+    """
+    criado = lote.get("criado_em") or ""
+    return sum(
+        1
+        for outro in _lotes.values()
+        if outro.get("id") != lote.get("id")
+        and (
+            outro.get("status") == "processando"
+            or (outro.get("status") == "na_fila" and (outro.get("criado_em") or "") < criado)
+        )
+    )
+
+
 def _publico(lote: dict, incluir_log=False, incluir_analises=False) -> dict:
     """Projeção do lote para resposta — esconde caminhos internos."""
+    status = lote["status"]
     saida = {
         "lote_id"      : lote["id"],
-        "status"       : lote["status"],
+        "status"       : status,
         "origem"       : lote.get("origem"),
         "criado_em"    : lote.get("criado_em"),
         "iniciado_em"  : lote.get("iniciado_em"),
         "concluido_em" : lote.get("concluido_em"),
         "arquivos"     : lote.get("arquivos", []),
         "etapa"        : lote.get("etapa"),
+        # Quem espera precisa de sinal de vida: um lote silencioso por oito
+        # minutos é indistinguível de um lote travado. O tempo é calculado
+        # aqui, no relógio do serviço — o do navegador pode estar noutro fuso.
+        "decorrido_s"     : _decorrido(
+            lote.get("iniciado_em") or lote.get("criado_em"),
+            lote.get("concluido_em"),
+        ),
+        "lotes_na_frente" : _lotes_na_frente(lote) if status == "na_fila" else None,
         "resumo"       : lote.get("resumo"),
         "avisos"       : lote.get("avisos", []),
         "erro"         : lote.get("erro"),
@@ -603,6 +643,8 @@ class Lote(BaseModel):
         "concluido_em": "2026-07-29 14:38:12",
         "arquivos"    : ["processo1.pdf", "processo2.pdf"],
         "etapa"       : "concluído",
+        "decorrido_s"    : 491,
+        "lotes_na_frente": None,
         "resumo"      : "9 de 12 processo(s) classificados como APTO",
         "avisos"      : [],
         "erro"        : None,
@@ -619,6 +661,18 @@ class Lote(BaseModel):
     concluido_em: str | None = None
     arquivos    : list[str] = Field(default_factory=list, description="PDFs recebidos neste lote")
     etapa       : str | None = Field(None, description="Passo corrente, para exibir a quem espera")
+    decorrido_s : int | None = Field(
+        None,
+        description="Segundos de espera na fila, de processamento em curso, ou o "
+                    "total gasto depois de concluído — conforme o status. Vem do "
+                    "relógio do serviço, não depende do fuso de quem consulta.",
+        examples=[491],
+    )
+    lotes_na_frente: int | None = Field(
+        None,
+        description="Quantos lotes precisam terminar antes deste começar. "
+                    "Só vem preenchido com status 'na_fila'.",
+    )
     resumo      : str | None = Field(
         None, examples=["9 de 12 processo(s) classificados como APTO"]
     )
@@ -820,6 +874,17 @@ async def _gravar_lote(arquivos: list, origem: str) -> dict:
     nomes, total_bytes = [], 0
     for arq in arquivos:
         nome = _nome_pdf_seguro(arq.filename)
+
+        # Dois PDFs de pastas diferentes podem chegar com o mesmo nome — o
+        # painel deixa juntar arquivos de várias pastas num lote só. Sem
+        # desambiguar, o segundo sobrescreveria o primeiro e o lote
+        # processaria um processo a menos sem avisar ninguém.
+        if nome in nomes:
+            base, seq = nome[:-4], 2
+            while f"{base}-{seq}.pdf" in nomes:
+                seq += 1
+            nome = f"{base}-{seq}.pdf"
+
         destino = entrada / nome
         with open(destino, "wb") as f:
             while chunk := await arq.read(1024 * 1024):
@@ -1157,6 +1222,39 @@ _ESTILO = """
   .b-erro { background:#fde5e3; color:#9b2c22; }
   .av-item { font-size:.85rem; padding:.45rem .7rem; border-radius:6px;
     background:#fff5e6; border:1px solid #f2dcb3; color:#7a4b00; margin-top:.3rem; }
+
+  /* Sinal de vida: um lote silencioso por oito minutos é indistinguível de um
+     lote travado. O ponto pisca, a barra corre e a última linha do log muda —
+     três evidências independentes de que ainda está andando. */
+  .pulso { display:inline-block; width:.45rem; height:.45rem; border-radius:50%;
+    background:currentColor; margin-right:.4rem; vertical-align:middle;
+    animation:pisca 1.3s ease-in-out infinite; }
+  @keyframes pisca { 0%,100% { opacity:1 } 50% { opacity:.2 } }
+  .barra { height:4px; border-radius:3px; background:#eef2f6;
+    overflow:hidden; margin-top:.6rem; }
+  .barra i { display:block; height:100%; width:32%; border-radius:3px;
+    background:#1F4E79; animation:corre 1.7s ease-in-out infinite; }
+  @keyframes corre { 0% { margin-left:-32% } 100% { margin-left:100% } }
+  .solta { border:2px dashed #ccd6e0; border-radius:9px; padding:1.3rem 1rem;
+    text-align:center; background:#fbfcfd; transition:.15s; }
+  .solta.sobre { border-color:#1F4E79; background:#eef4fa; }
+  .solta strong { display:block; margin-bottom:.55rem; color:#3d4a57; font-size:.95rem; }
+  .arq { display:flex; align-items:center; gap:.6rem; padding:.4rem .1rem;
+    border-bottom:1px solid #f1f4f7; font-size:.88rem; }
+  .arq:last-child { border-bottom:0; }
+  .arq .nome { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .arq .kb { color:#8b98a5; font-size:.8rem; flex:none; }
+  .arq .tira { border:0; background:none; color:#9b2c22; cursor:pointer;
+    font-size:1.05rem; line-height:1; padding:.1rem .35rem; border-radius:5px; flex:none; }
+  .arq .tira:hover { background:#fde5e3; }
+  .excedeu { color:#9b2c22; font-weight:600; }
+  .andando { margin-top:.55rem; font-size:.88rem; color:#3d4a57; }
+  .andando b { font-weight:600; }
+  .ao-vivo { margin-top:.3rem; font:12px/1.5 ui-monospace,Consolas,monospace;
+    color:#7b8794; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  @media (prefers-reduced-motion:reduce) {
+    .pulso, .barra i { animation:none }
+  }
   a.dl { color:#1F4E79; font-weight:600; text-decoration:none; }
   a.dl:hover { text-decoration:underline; }
   pre.log { background:#10161c; color:#c8d6e2; border-radius:7px; padding:.8rem;
@@ -1215,15 +1313,31 @@ PAINEL = """<!doctype html>
 
   <section>
     <h2><span class="num">1</span> Enviar processos</h2>
-    <div class="linha">
-      <input type="file" id="files" multiple accept="application/pdf,.pdf">
-      <button id="btn-up">Enviar e processar</button>
+
+    <input type="file" id="files" multiple accept="application/pdf,.pdf" hidden>
+    <div id="solta" class="solta">
+      <strong>Arraste os PDFs aqui</strong>
+      <button type="button" class="ghost" id="btn-escolher">ou escolha os arquivos</button>
+      <p class="vazio" style="padding:0">Pode escolher várias vezes, inclusive de pastas
+        diferentes — os arquivos se somam. Até __MAX_MB__ MB por lote.</p>
     </div>
-    <p class="vazio" id="up-msg">Cada envio vira um lote independente, processado em fila.</p>
+
+    <div id="lista"></div>
+
+    <div class="linha" style="margin-top:.9rem">
+      <button id="btn-up" disabled>Enviar e processar</button>
+      <button class="ghost" id="btn-limpar" hidden>Limpar seleção</button>
+      <span class="vazio" id="total" style="padding:0"></span>
+    </div>
+
+    <p class="vazio" id="up-msg">Cada envio vira um lote independente, processado em
+      fila — um por vez. A leitura dos PDFs e a análise levam alguns minutos por
+      processo; pode fechar a página e voltar depois.</p>
   </section>
 
   <section>
-    <h2><span class="num">2</span> Lotes</h2>
+    <h2><span class="num">2</span> Lotes <span id="contador" class="vazio"
+        style="padding:0;font-weight:400"></span></h2>
     <div id="lotes"><p class="vazio">Carregando...</p></div>
   </section>
 
@@ -1242,28 +1356,156 @@ const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':
 
 const CLASSE = {na_fila:'b-fila', processando:'b-proc', concluido:'b-ok', erro:'b-erro'};
 
+// A lista é redesenhada a cada 3 s. Sem isto, o log que o procurador abre para
+// acompanhar o lote fecha sozinho na próxima rodada — justamente enquanto ele
+// está olhando. 'toggle' não borbulha, daí a captura.
+const abertos = new Set();
+document.addEventListener('toggle', e => {
+  const id = e.target.dataset && e.target.dataset.lote;
+  if (!id) return;
+  e.target.open ? abertos.add(id) : abertos.delete(id);
+}, true);
+
 $('#sair').onclick = async () => { await fetch('/painel/logout',{method:'POST'}); location.reload(); };
 
+// ── Seleção de arquivos ──────────────────────────────────────────
+//
+// A escolha ACUMULA. Um <input type=file> descarta a seleção anterior a cada
+// nova escolha, então quem tem os PDFs em pastas diferentes seria obrigado a
+// mandar um lote por pasta. Guardamos os File aqui e montamos o FormData na
+// hora do envio — o input serve só de porta de entrada.
+
+const MAX_MB = __MAX_MB__;
+let escolhidos = [];
+
+const tamanho = b => b >= 1048576 ? (b/1048576).toFixed(1) + ' MB' : Math.max(1, Math.round(b/1024)) + ' KB';
+const chave = f => `${f.name}::${f.size}::${f.lastModified}`;
+
+function juntar(lista) {
+  const recusados = [];
+  let repetidos = 0;
+  for (const f of lista) {
+    if (!/\\.pdf$/i.test(f.name)) { recusados.push(f.name); continue; }
+    if (escolhidos.some(e => chave(e) === chave(f))) { repetidos++; continue; }
+    escolhidos.push(f);
+  }
+  let msg = '';
+  if (recusados.length) msg += `Ignorado(s) por não ser PDF: ${recusados.join(', ')}. `;
+  if (repetidos) msg += `${repetidos} arquivo(s) já estavam na lista. `;
+  if (msg) $('#up-msg').textContent = msg;
+  desenharSelecao();
+}
+
+function desenharSelecao() {
+  const total = escolhidos.reduce((s, f) => s + f.size, 0);
+  const excedeu = total > MAX_MB * 1048576;
+
+  $('#lista').innerHTML = escolhidos.map((f, i) => `
+    <div class="arq">
+      <span class="nome">${esc(f.name)}</span>
+      <span class="kb">${tamanho(f.size)}</span>
+      <button class="tira" data-i="${i}" title="Tirar da lista">&times;</button>
+    </div>`).join('');
+
+  $('#btn-up').disabled = !escolhidos.length || excedeu;
+  $('#btn-up').textContent = escolhidos.length
+    ? `Enviar ${escolhidos.length} PDF(s) e processar`
+    : 'Enviar e processar';
+  $('#btn-limpar').hidden = !escolhidos.length;
+  $('#total').innerHTML = escolhidos.length
+    ? (excedeu
+        ? `<span class="excedeu">${tamanho(total)} — acima do limite de ${MAX_MB} MB. Tire alguns arquivos.</span>`
+        : `${tamanho(total)} no total`)
+    : '';
+}
+
+$('#lista').onclick = e => {
+  const i = e.target.dataset && e.target.dataset.i;
+  if (i === undefined) return;
+  escolhidos.splice(Number(i), 1);
+  desenharSelecao();
+};
+
+$('#btn-escolher').onclick = () => $('#files').click();
+$('#btn-limpar').onclick = () => { escolhidos = []; desenharSelecao(); };
+
+$('#files').onchange = e => {
+  juntar(e.target.files);
+  e.target.value = '';   // libera reescolher o MESMO arquivo depois de removê-lo
+};
+
+const solta = $('#solta');
+['dragenter','dragover'].forEach(ev => solta.addEventListener(ev, e => {
+  e.preventDefault(); solta.classList.add('sobre');
+}));
+['dragleave','drop'].forEach(ev => solta.addEventListener(ev, e => {
+  e.preventDefault(); solta.classList.remove('sobre');
+}));
+solta.addEventListener('drop', e => juntar(e.dataTransfer.files));
+
 $('#btn-up').onclick = async () => {
-  const inp = $('#files');
-  if (!inp.files.length) { $('#up-msg').textContent = 'Selecione ao menos um PDF.'; return; }
+  if (!escolhidos.length) { $('#up-msg').textContent = 'Selecione ao menos um PDF.'; return; }
   const fd = new FormData();
-  for (const f of inp.files) fd.append('arquivos', f);
+  for (const f of escolhidos) fd.append('arquivos', f);
   $('#btn-up').disabled = true;
-  $('#up-msg').textContent = 'Enviando...';
+  $('#up-msg').textContent = `Enviando ${escolhidos.length} PDF(s)...`;
   try {
     const r = await fetch('/painel/lotes', {method:'POST', body:fd});
     const j = await r.json();
-    $('#up-msg').textContent = r.ok
-      ? `Lote ${j.lote_id} criado com ${j.arquivos.length} PDF(s).`
-      : 'Falha: ' + (j.detail || 'erro desconhecido');
-    inp.value = '';
+    if (r.ok) {
+      $('#up-msg').textContent =
+        `Lote ${j.lote_id} criado com ${j.arquivos.length} PDF(s) — acompanhe abaixo.`;
+      escolhidos = [];
+    } else {
+      $('#up-msg').textContent = 'Falha: ' + (j.detail || 'erro desconhecido');
+    }
+    desenharSelecao();
     carregar();
-  } finally { $('#btn-up').disabled = false; }
+  } finally { $('#btn-up').disabled = !escolhidos.length; }
 };
+
+// "há 3 min" diz mais do que "iniciado 14:31:02" para quem está esperando.
+function duracao(s) {
+  if (s == null) return '';
+  if (s < 60) return `${s} s`;
+  const min = Math.floor(s / 60), h = Math.floor(min / 60);
+  return h ? `${h} h ${String(min % 60).padStart(2, '0')} min` : `${min} min`;
+}
+
+// Última linha do log, sem o timestamp que o servidor prefixa.
+function ultimaLinha(l) {
+  if (!l.log || !l.log.length) return '';
+  const bruta = l.log[l.log.length - 1]
+    .replace(/^\\d{4}-\\d\\d-\\d\\d \\d\\d:\\d\\d:\\d\\d\\s+/, '')
+    .replace(/^──\\s*|\\s*──$/g, '');
+  return bruta.length > 120 ? bruta.slice(0, 120) + '…' : bruta;
+}
+
+function andamento(l) {
+  if (l.status === 'na_fila') {
+    const frente = l.lotes_na_frente
+      ? `${l.lotes_na_frente} lote(s) na frente`
+      : 'é o próximo a entrar';
+    return `<div class="andando"><b>Na fila</b> — ${frente}.
+              Aguardando há ${duracao(l.decorrido_s)}.</div>
+            <div class="barra"><i></i></div>`;
+  }
+  if (l.status === 'processando') {
+    const viva = ultimaLinha(l);
+    return `<div class="andando"><b>${esc(l.etapa || 'Processando')}</b>
+              — há ${duracao(l.decorrido_s)}. Leva alguns minutos por processo.</div>
+            <div class="barra"><i></i></div>
+            ${viva ? `<div class="ao-vivo">${esc(viva)}</div>` : ''}`;
+  }
+  if (l.status === 'concluido' && l.decorrido_s != null) {
+    return `<div class="andando" style="color:#5c6b7a">Processado em ${duracao(l.decorrido_s)}.</div>`;
+  }
+  return '';
+}
 
 function cartaoLote(l) {
   const comAviso = l.status === 'concluido' && l.avisos.length;
+  const emCurso = l.status === 'na_fila' || l.status === 'processando';
   const cls = comAviso ? 'b-alerta' : (CLASSE[l.status] || 'b-fila');
   const rotulo = comAviso ? 'concluído com avisos' : l.status;
   return `
@@ -1275,12 +1517,14 @@ function cartaoLote(l) {
           ${l.arquivos.length} PDF(s) &middot; ${esc(l.origem||'')} &middot; ${esc(l.criado_em||'')}
         </span>
       </div>
-      <span class="badge ${cls}">${esc(rotulo)}</span>
+      <span class="badge ${cls}">${emCurso ? '<span class="pulso"></span>' : ''}${esc(rotulo)}</span>
     </div>
+    ${andamento(l)}
     ${l.resumo ? `<div style="margin-top:.5rem;font-size:.9rem">${esc(l.resumo)}</div>` : ''}
     ${l.erro ? `<div class="erro-msg">${esc(l.erro)}</div>` : ''}
     ${l.avisos.map(a => `<div class="av-item">&#9888; ${esc(a)}</div>`).join('')}
-    ${l.log && l.log.length ? `<details style="margin-top:.6rem">
+    ${l.log && l.log.length ? `<details style="margin-top:.6rem" data-lote="${esc(l.lote_id)}"
+      ${abertos.has(l.lote_id) ? 'open' : ''}>
       <summary>Ver log</summary><pre class="log">${esc(l.log.join('\\n'))}</pre></details>` : ''}
   </div>`;
 }
@@ -1294,6 +1538,13 @@ async function carregar() {
       ? j.lotes.map(cartaoLote).join('')
       : '<p class="vazio">Nenhum lote enviado ainda.</p>';
 
+    // O procurador pode estar com a seção 3 na tela e não ver o cartão do lote.
+    const ativos = j.lotes.filter(l => l.status === 'na_fila' || l.status === 'processando').length;
+    $('#contador').textContent = ativos ? `— ${ativos} em andamento` : '';
+    document.title = ativos
+      ? `(${ativos}) Triagem de Execuções Fiscais — PGMS`
+      : 'Triagem de Execuções Fiscais — PGMS';
+
     const rel = await (await fetch('/painel/relatorios')).json();
     $('#relatorios').innerHTML = rel.arquivos.length
       ? rel.arquivos.map(a => `<tr>
@@ -1303,7 +1554,8 @@ async function carregar() {
   } catch (e) { /* rede instável — proxima rodada tenta de novo */ }
 }
 
+desenharSelecao();
 carregar();
 setInterval(carregar, 3000);
 </script></body></html>
-"""
+""".replace("__MAX_MB__", str(MAX_MB_LOTE))
