@@ -45,6 +45,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
+from typing import Any
 
 from fastapi import (
     Cookie, Depends, FastAPI, File, Form, HTTPException,
@@ -1241,6 +1242,53 @@ async def planilha_lote(lote_id: str, consumidor: str = Depends(autenticar_api))
     `/arquivos/agente1_planilha`, mantido porque já está integrado.
     """
     return _resposta_arquivo(_lote_do_consumidor(lote_id, consumidor), "agente1_planilha")
+
+
+_RESPOSTAS_XLSX: dict[int | str, dict[str, Any]] = {
+    200: {"content": {_XLSX: {}}, "description": "Arquivo .xlsx"},
+    404: {"model": Erro, "description": "Lote inexistente, de outro consumidor, ou sem a planilha"},
+    **_ERROS_AUTH,
+}
+
+
+@app.get(
+    "/api/v1/lotes/{lote_id}/planilha/agente1",
+    tags=["Lotes"],
+    summary="Baixar a planilha do Agente 1",
+    response_class=FileResponse,
+    responses=_RESPOSTAS_XLSX,
+)
+async def planilha_agente1(lote_id: str, consumidor: str = Depends(autenticar_api)):
+    """
+    Excel de revisão da extração: um processo por linha, com a classificação
+    APTO / NÃO APTO e o motivo.
+
+    **Só deste lote.** Sai da pasta isolada do lote.
+    """
+    return _resposta_arquivo(_lote_do_consumidor(lote_id, consumidor), "agente1_planilha")
+
+
+@app.get(
+    "/api/v1/lotes/{lote_id}/planilha/agente2",
+    tags=["Lotes"],
+    summary="Baixar a planilha do Agente 2",
+    response_class=FileResponse,
+    responses=_RESPOSTAS_XLSX,
+)
+async def planilha_agente2(lote_id: str, consumidor: str = Depends(autenticar_api)):
+    """
+    Excel de priorização jurídico-fiscal: prioridade, ação recomendada e alerta
+    de prescrição.
+
+    **Atenção — este arquivo é ACUMULADO.** O Agente 2 o regera a partir do
+    histórico inteiro a cada lote, então ele traz também os processos dos lotes
+    anteriores, não só os deste. É o desenho do relatório do procurador, que
+    existe para dar a visão do acervo.
+
+    Para o recorte exato deste lote, use `GET /api/v1/lotes/{lote_id}/resultado`
+    (mesma priorização, em JSON) ou `/arquivos/agente2_json`.
+    """
+    return _resposta_arquivo(_lote_do_consumidor(lote_id, consumidor), "agente2_planilha")
 
 
 # ════════════════════════════════════════════════════════════════
