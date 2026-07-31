@@ -77,7 +77,8 @@ o OCR já satura a CPU.
 | `GET /api/v1/lotes` | Lista os lotes deste consumidor |
 | `GET /api/v1/lotes/{id}` | Estado do lote, com log |
 | `GET /api/v1/lotes/{id}/resultado` | Priorização completa (`409` enquanto não concluir) |
-| `GET /api/v1/lotes/{id}/planilha` | Excel de revisão do lote |
+| `GET /api/v1/lotes/{id}/planilha/agente1` | Excel de revisão do Agente 1 — só deste lote |
+| `GET /api/v1/lotes/{id}/planilha/agente2` | Excel de priorização do Agente 2 — acumulado |
 | `GET /health` | Healthcheck, sem autenticação |
 
 Cada consumidor só enxerga os próprios lotes — o token de um recebe `404` no lote de

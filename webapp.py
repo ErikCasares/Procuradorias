@@ -924,12 +924,6 @@ app = FastAPI(
             "name": "Serviço",
             "description": "Estado do serviço. Sem autenticação, sem dado sensível.",
         },
-        {
-            "name": "Painel",
-            "description": "Rotas internas do painel do procurador — sessão por cookie, "
-                           "não fazem parte da integração. Documentadas para quem mantém "
-                           "o serviço.",
-        },
     ],
     lifespan=lifespan,
 )
@@ -1225,25 +1219,6 @@ async def baixar_arquivo_lote(
     return _resposta_arquivo(_lote_do_consumidor(lote_id, consumidor), tipo.value)
 
 
-@app.get(
-    "/api/v1/lotes/{lote_id}/planilha",
-    tags=["Lotes"],
-    summary="Baixar a planilha de revisão do lote",
-    response_class=FileResponse,
-    responses={
-        200: {"content": {_XLSX: {}}, "description": "Arquivo .xlsx"},
-        404: {"model": Erro, "description": "Lote inexistente, de outro consumidor, ou sem planilha"},
-        **_ERROS_AUTH,
-    },
-)
-async def planilha_lote(lote_id: str, consumidor: str = Depends(autenticar_api)):
-    """
-    Excel de revisão do Agente 1 — atalho para
-    `/arquivos/agente1_planilha`, mantido porque já está integrado.
-    """
-    return _resposta_arquivo(_lote_do_consumidor(lote_id, consumidor), "agente1_planilha")
-
-
 _RESPOSTAS_XLSX: dict[int | str, dict[str, Any]] = {
     200: {"content": {_XLSX: {}}, "description": "Arquivo .xlsx"},
     404: {"model": Erro, "description": "Lote inexistente, de outro consumidor, ou sem a planilha"},
@@ -1295,7 +1270,7 @@ async def planilha_agente2(lote_id: str, consumidor: str = Depends(autenticar_ap
 # PAINEL — uso manual do procurador
 # ════════════════════════════════════════════════════════════════
 
-@app.post("/painel/login", tags=["Painel"], summary="Abrir sessão no painel")
+@app.post("/painel/login", include_in_schema=False, summary="Abrir sessão no painel")
 async def login(senha: str = Form(...)):
     if not PAINEL_ATIVO:
         raise HTTPException(503, "Painel sem senha configurada")
@@ -1322,7 +1297,7 @@ async def login(senha: str = Form(...)):
     return resp
 
 
-@app.post("/painel/logout", tags=["Painel"], summary="Encerrar a sessão")
+@app.post("/painel/logout", include_in_schema=False, summary="Encerrar a sessão")
 async def logout(sessao: str = Cookie(None)):
     _sessoes.pop(sessao or "", None)
     resp = JSONResponse({"ok": True})
@@ -1330,7 +1305,7 @@ async def logout(sessao: str = Cookie(None)):
     return resp
 
 
-@app.post("/painel/lotes", tags=["Painel"], summary="Enviar lote pelo painel", response_model=Lote)
+@app.post("/painel/lotes", include_in_schema=False, summary="Enviar lote pelo painel", response_model=Lote)
 async def painel_criar(
     arquivos: list[UploadFile] = File(...),
     _=Depends(exigir_painel),
@@ -1341,7 +1316,7 @@ async def painel_criar(
 
 @app.get(
     "/painel/lotes",
-    tags=["Painel"],
+    include_in_schema=False,
     summary="Listar todos os lotes",
     response_model=ListaLotesComLog,
 )
@@ -1356,7 +1331,7 @@ async def painel_listar(
 
 @app.get(
     "/painel/lotes/{lote_id}/arquivos/{tipo}",
-    tags=["Painel"],
+    include_in_schema=False,
     summary="Baixar um artefato do lote pelo painel",
     response_class=FileResponse,
     responses={404: {"model": Erro, "description": "Lote ou artefato inexistente"}},
@@ -1377,7 +1352,7 @@ async def painel_baixar_arquivo(lote_id: str, tipo: TipoArquivo, _=Depends(exigi
 
 @app.get(
     "/painel/relatorios",
-    tags=["Painel"],
+    include_in_schema=False,
     summary="Listar os relatórios acumulados",
     response_model=ListaRelatorios,
 )
@@ -1399,7 +1374,7 @@ async def painel_relatorios(_=Depends(exigir_painel)):
 
 @app.get(
     "/painel/relatorios/{nome}",
-    tags=["Painel"],
+    include_in_schema=False,
     summary="Baixar um relatório",
     response_class=FileResponse,
     responses={
