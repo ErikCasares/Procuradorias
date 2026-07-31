@@ -2144,10 +2144,61 @@ def process_prompts_to_excel(prompts, output_excel):
         if col in df.columns:
             df[col] = df[col].astype(str).replace({"nan": "", "None": ""})
 
+    # ── Ordenar por decisión (APTO primero) para lectura rápida ──
+    # Mismo criterio que el reporte del Agente 2 (ALTA→MEDIA→BAIXA):
+    # lo accionable arriba. Orden estable: dentro de cada grupo se
+    # mantiene el orden de procesamiento de los PDFs.
+    _ORDEN_DECISION = {
+        "APTO": 0, "Informação insuficiente": 1, "NO APTO": 2, "FORA DE ESCOPO": 3,
+    }
+    if not df.empty and "Decisión" in df.columns:
+        df["_ord_dec"] = df["Decisión"].map(lambda d: _ORDEN_DECISION.get(d, 9))
+        df = df.sort_values(by="_ord_dec", kind="stable").drop(columns=["_ord_dec"])
+
     with pd.ExcelWriter(output_excel, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="Resultados")
         ws = writer.sheets["Resultados"]
+        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
         from openpyxl.utils import get_column_letter
+
+        # ── Estilos (mismo layout del reporte del Agente 2) ──
+        font_header  = Font(name="Arial", bold=True, color="FFFFFF", size=11)
+        fill_header  = PatternFill("solid", fgColor="1F4E79")
+        align_header = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        borde        = Border(*[Side(style="thin", color="D0D0D0")] * 4)
+
+        fills_decision = {
+            "APTO"                   : PatternFill("solid", fgColor="C6E0B4"),  # verde suave
+            "Informação insuficiente": PatternFill("solid", fgColor="FFE699"),  # amarillo suave
+            "NO APTO"                : PatternFill("solid", fgColor="F8CBAD"),  # rojo suave
+            "FORA DE ESCOPO"         : PatternFill("solid", fgColor="D9D9D9"),  # gris
+        }
+
+        # Header
+        for col_idx in range(1, len(df.columns) + 1):
+            c = ws.cell(row=1, column=col_idx)
+            c.font      = font_header
+            c.fill      = fill_header
+            c.alignment = align_header
+            c.border    = borde
+
+        # Filas de datos
+        col_decision = (list(df.columns).index("Decisión") + 1) if "Decisión" in df.columns else None
+        font_dato    = Font(name="Arial", size=10)
+        align_dato   = Alignment(vertical="top", wrap_text=True)
+        for row_idx in range(2, len(df) + 2):
+            fill = None
+            if col_decision:
+                fill = fills_decision.get(ws.cell(row=row_idx, column=col_decision).value)
+            for col_idx in range(1, len(df.columns) + 1):
+                c = ws.cell(row=row_idx, column=col_idx)
+                c.font      = font_dato
+                c.border    = borde
+                c.alignment = align_dato
+                if fill and col_idx == col_decision:
+                    c.fill = fill
+
+        # Forzar texto puro en las columnas de identificadores
         for col_name in cols_texto:
             if col_name in df.columns:
                 col_idx = df.columns.get_loc(col_name) + 1
@@ -2158,6 +2209,28 @@ def process_prompts_to_excel(prompts, output_excel):
                         cell.value = str(cell.value)
                         cell.data_type = "s"
                         cell.number_format = "@"
+
+        # Anchos de columna
+        anchos = {
+            "CASO": 34, "Última data de interação": 16, "Status da citação": 30,
+            "Fecha orden citación": 14, "Fecha intento citación": 14,
+            "Fecha citación efectiva": 14, "Resultado da penhora": 30,
+            "Decisión": 16, "Motivo": 45, "Fonte da decisão": 20,
+            "Respuesta GPT": 50, "Páginas via OCR": 14, "Confiança OCR (%)": 12,
+            "Tipo de Processo": 28, "Confiança Tipo Processo": 12,
+            "A2_numero_processo": 22, "A2_cpf_cnpj": 20, "A2_nome_executado": 30,
+            "A2_nome_exequente": 30, "A2_tipo_tributo": 18, "A2_exercicio": 12,
+            "A2_numero_cda": 22, "A2_data_inscricao": 14,
+            "A2_valor_original": 16, "A2_valor_atualizado": 16, "A2_vara": 28,
+        }
+        for col_idx, col_name in enumerate(df.columns, start=1):
+            letra = get_column_letter(col_idx)
+            ws.column_dimensions[letra].width = anchos.get(col_name, 18)
+
+        # Congelar header y activar autofiltro
+        ws.freeze_panes = "A2"
+        ws.auto_filter.ref = f"A1:{get_column_letter(len(df.columns))}{len(df)+1}"
+
     print(f"Planilla Excel generada: {output_excel}")
 # ===========================================================================
 # 7.1 — SALIDA ESTRUCTURADA PARA EL AGENTE 2
