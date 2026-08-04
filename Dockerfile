@@ -19,7 +19,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY promptV7.1.py agente2.py webapp.py gerar_credencial.py ./
+COPY promptV7.1.py agente2.py webapp.py buscar_processo.py gerar_credencial.py ./
 
 # Pastas de trabalho — montadas como volumes pelo docker-compose.
 # Criadas aqui para o Agente 1 não quebrar no os.listdir() se o volume faltar.
