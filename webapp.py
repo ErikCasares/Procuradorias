@@ -56,6 +56,10 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, Field
 
+# Mesma busca da linha de comando (`python buscar_processo.py <numero>`), para a
+# API e o terminal nunca divergirem sobre onde o processo está.
+from buscar_processo import buscar_dados
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [web] %(levelname)s — %(message)s",
@@ -705,6 +709,65 @@ class ProcessoAnalisado(BaseModel):
     processado_em: str | None = None
 
 
+class EntidadesProcesso(BaseModel):
+    """Dados que o Agente 1 extraiu do PDF — todos como texto, como saíram."""
+    model_config = ConfigDict(extra="allow")
+
+    numero_processo : str | None = None
+    cpf_cnpj        : str | None = None
+    nome_executado  : str | None = None
+    nome_exequente  : str | None = None
+    tipo_tributo    : str | None = Field(None, examples=["IPTU"])
+    exercicio       : str | None = None
+    numero_cda      : str | None = None
+    data_inscricao  : str | None = None
+    valor_original  : str | None = Field(None, examples=["R$ 12.480,55"])
+    valor_atualizado: str | None = None
+    vara            : str | None = None
+
+
+class TriagemAgente1(BaseModel):
+    """Extração e classificação do Agente 1 para um processo."""
+    model_config = ConfigDict(extra="allow")
+
+    lote_id  : str | None = Field(None, description="Lote em que este processo foi triado")
+    id_lote  : str | None = Field(
+        None,
+        description="Nome do PDF de origem — o Agente 1 chama o arquivo assim. "
+                    "Não confundir com `lote_id`.",
+    )
+    entidades      : EntidadesProcesso | None = None
+    decisao_agente1: str | None = Field(
+        None,
+        description="APTO ou NÃO APTO. Na prática vem sempre APTO: o processo "
+                    "reprovado na triagem não entra no resultado.",
+        examples=["APTO"],
+    )
+    motivo_agente1     : str | None = None
+    status_citacao     : str | None = None
+    resultado_penhora  : str | None = None
+    ultima_movimentacao: str | None = Field(None, examples=["2019-03-14"])
+    confianca_ocr_media: float | None = Field(
+        None,
+        description="Média da confiança do OCR nas páginas digitalizadas, de 0 a 100. "
+                    "Valor baixo pede conferência no PDF.",
+        examples=[92.4],
+    )
+
+
+class ProcessoConsultado(BaseModel):
+    numero_processo: str = Field(description="Número como está gravado, com a pontuação original")
+    encontrado_em: list[str] = Field(
+        description="Quais fontes têm o processo: 'agente1', 'agente2', ou as duas"
+    )
+    agente1: TriagemAgente1 | None = Field(
+        None, description="Nulo quando só o Agente 2 tem o processo"
+    )
+    agente2: ProcessoAnalisado | None = Field(
+        None, description="Nulo enquanto o Agente 2 não analisou o processo"
+    )
+
+
 class Lote(BaseModel):
     model_config = ConfigDict(json_schema_extra={"example": {
         "lote_id"     : "20260729-143000-a1b2c3",
@@ -888,6 +951,17 @@ serial — um por vez, porque o OCR já satura a CPU.
 
 Ciclo de vida: `na_fila` → `processando` → `concluido` | `erro`
 
+## Consulta por número de processo
+
+Quando a pergunta parte do processo e não do lote:
+
+```http
+GET /api/v1/processos?numero=0752821-68.2013.8.05.0001
+```
+
+Devolve a triagem do Agente 1 e a priorização do Agente 2 do processo, procurando em
+todos os lotes já enviados por este consumidor. A pontuação do número é indiferente.
+
 ## Sempre confira `avisos`
 
 A extração trata OCR quebrado, erro de API e PDF ilegível internamente e **encerra com
@@ -919,6 +993,10 @@ app = FastAPI(
         {
             "name": "Lotes",
             "description": "Envio e acompanhamento dos lotes. É o contrato da integração.",
+        },
+        {
+            "name": "Processos",
+            "description": "Consulta de um processo pelo número CNJ, atravessando os lotes já enviados.",
         },
         {
             "name": "Serviço",
@@ -1264,6 +1342,118 @@ async def planilha_agente2(lote_id: str, consumidor: str = Depends(autenticar_ap
     (mesma priorização, em JSON) ou `/arquivos/agente2_json`.
     """
     return _resposta_arquivo(_lote_do_consumidor(lote_id, consumidor), "agente2_planilha")
+
+
+# ════════════════════════════════════════════════════════════════
+# CONSULTA POR NÚMERO DE PROCESSO
+# ════════════════════════════════════════════════════════════════
+#
+# A busca varre a pasta JSON/ compartilhada, onde o histórico do Agente 2 é
+# acumulativo e mistura os lotes de todos os consumidores. Daí o filtro por
+# origem: quem consulta só alcança o que ele mesmo mandou, a mesma regra das
+# rotas de lote. Sem ele bastaria adivinhar um número CNJ — que é público — para
+# ler nome, CPF/CNPJ e valor da dívida de processo alheio.
+
+_RE_ARQUIVO_LOTE = re.compile(r"^lote_(.+)_agente2\.json$")
+
+
+def _lote_da_origem(nome_arquivo: str) -> dict | None:
+    """
+    Lote que originou um arquivo da pasta JSON/ — chamam-se 'lote_<id>_agente2.json'.
+
+    Nulo para nome fora desse padrão: são as rodadas manuais por linha de
+    comando, que não pertencem a consumidor nenhum.
+    """
+    achado = _RE_ARQUIVO_LOTE.match(Path(nome_arquivo or "").name)
+    return _lotes.get(achado.group(1)) if achado else None
+
+
+def _filtro_do_consumidor(consumidor: str):
+    """Predicado que a busca aplica a cada arquivo: só os lotes deste consumidor."""
+    def do_consumidor(nome_arquivo: str) -> bool:
+        lote = _lote_da_origem(nome_arquivo)
+        return bool(lote) and lote.get("origem") == consumidor
+    return do_consumidor
+
+
+def _com_lote_id(achado: dict | None) -> dict | None:
+    """Troca a procedência interna pelo lote_id — o consumidor não vê nome de arquivo."""
+    if not achado:
+        return None
+    origem = achado.get("origem_lote") or achado.get("_origem_arquivo") or ""
+    lote   = _lote_da_origem(origem)
+    limpo  = {
+        k: v for k, v in achado.items()
+        if not k.startswith("_") and k != "origem_lote"
+    }
+    limpo["lote_id"] = lote["id"] if lote else None
+    return limpo
+
+
+@app.get(
+    "/api/v1/processos",
+    tags=["Processos"],
+    summary="Consultar um processo pelo número",
+    response_model=ProcessoConsultado,
+    responses={
+        404: {"model": Erro, "description": "Nenhum processo com esse número nos lotes deste consumidor"},
+        **_ERROS_AUTH,
+    },
+)
+async def consultar_processo(
+    numero: str = Query(
+        ...,
+        min_length=1,
+        description="Número CNJ do processo. A pontuação é indiferente — "
+                    "'0752821-68.2013.8.05.0001' e '07528216820138050001' acham o mesmo.",
+        examples=["0752821-68.2013.8.05.0001"],
+    ),
+    consumidor: str = Depends(autenticar_api),
+):
+    """
+    Tudo o que os dois agentes sabem sobre **um** processo, sem precisar do `lote_id`.
+
+    Serve para quando a pergunta parte do processo, não do lote: o SIAP tem o número
+    em mãos e quer a triagem do Agente 1 (dados extraídos e classificação) junto da
+    priorização do Agente 2 (prioridade, ação recomendada, alerta de prescrição).
+
+    A busca cobre **todos** os lotes deste consumidor, não um só. Cada bloco vem
+    nulo quando aquela fonte não tem o processo — veja `encontrado_em`:
+
+    - só `agente1`: o Agente 2 ainda não analisou, ou outro lote reanalisou o
+      mesmo processo depois (o histórico do Agente 2 guarda uma linha por número)
+    - só `agente2`: a análise ficou no histórico acumulado, mas o JSON do lote que
+      a gerou já não está na pasta
+
+    Responde `404` quando o número não aparece em lote nenhum deste consumidor. Isso
+    inclui o processo classificado como **NÃO APTO** — ele não entra no resultado do
+    Agente 1, então não há o que consultar.
+    """
+    # Em thread: a varredura lê os JSON da pasta inteira, e travar o event loop
+    # aqui atrasaria o polling de todos os outros lotes.
+    dados = await asyncio.to_thread(
+        buscar_dados, numero, str(PASTA_JSON), _filtro_do_consumidor(consumidor)
+    )
+
+    a1 = _com_lote_id(dados["agente1"])
+    a2 = _com_lote_id(dados["agente2"])
+    if not a1 and not a2:
+        raise HTTPException(
+            404,
+            "Processo não encontrado nos lotes deste consumidor. Confira o número; "
+            "processo classificado como NÃO APTO não entra no resultado dos agentes.",
+        )
+
+    return {
+        "numero_processo": (
+            ((a1 or {}).get("entidades") or {}).get("numero_processo")
+            or (a2 or {}).get("numero_processo")
+            or numero
+        ),
+        "encontrado_em": [nome for nome, achado in (("agente1", a1), ("agente2", a2)) if achado],
+        "agente1": a1,
+        "agente2": a2,
+    }
 
 
 # ════════════════════════════════════════════════════════════════

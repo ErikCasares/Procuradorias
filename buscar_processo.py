@@ -62,15 +62,21 @@ def _dim(t):      return _cor(t, "2")      # apagado
  
 # ── Leitura das fontes ────────────────────────────────────────────
  
-def _buscar_em_json_agente1(pasta: str, numero_norm: str):
+def _buscar_em_json_agente1(pasta: str, numero_norm: str, filtro_arquivo=None):
     """
     Procura o processo nos arquivos *_agente2.json do Agente 1.
     Retorna o dict do processo (com decisão e entidades) ou None.
+
+    filtro_arquivo — função que recebe o nome do arquivo e devolve se ele pode
+    ser lido. É o que a API usa para restringir a busca aos lotes do próprio
+    consumidor; na linha de comando fica None e lê tudo.
     """
     # Todos os *_agente2.json, EXCETO os *_agente2_resultado.json (que são do Agente 2)
     padrao = os.path.join(pasta, f"*{SUFIJO_A1}")
     for caminho in sorted(glob.glob(padrao)):
         if caminho.endswith("_resultado.json"):
+            continue
+        if filtro_arquivo and not filtro_arquivo(os.path.basename(caminho)):
             continue
         try:
             with open(caminho, encoding="utf-8") as f:
@@ -86,15 +92,19 @@ def _buscar_em_json_agente1(pasta: str, numero_norm: str):
     return None
  
  
-def _buscar_em_historial_agente2(pasta: str, numero_norm: str):
+def _buscar_em_historial_agente2(pasta: str, numero_norm: str, filtro_arquivo=None):
     """
     Procura o processo no historial_agente2.jsonl do Agente 2.
     Retorna o dict do registro (com análise) ou None.
+
+    filtro_arquivo recebe aqui o 'origem_lote' do registro — o nome do JSON do
+    Agente 1 que originou a análise —, para o mesmo recorte por lote da busca
+    no Agente 1.
     """
     caminho = os.path.join(pasta, HISTORIAL_A2)
     if not os.path.exists(caminho):
         return None
- 
+
     with open(caminho, encoding="utf-8") as f:
         for linha in f:
             linha = linha.strip()
@@ -105,9 +115,12 @@ def _buscar_em_historial_agente2(pasta: str, numero_norm: str):
             except json.JSONDecodeError:
                 continue
             np = rec.get("numero_processo")
-            if np and _normalizar_numero(np) == numero_norm:
-                rec["_origem_arquivo"] = HISTORIAL_A2
-                return rec
+            if not np or _normalizar_numero(np) != numero_norm:
+                continue
+            if filtro_arquivo and not filtro_arquivo(rec.get("origem_lote") or ""):
+                continue
+            rec["_origem_arquivo"] = HISTORIAL_A2
+            return rec
     return None
  
  
@@ -174,7 +187,34 @@ def _mostrar_agente2(rec: dict):
  
  
 # ── Fluxo principal ───────────────────────────────────────────────
- 
+
+def buscar_dados(numero: str, pasta: str = PASTA_JSON, filtro_arquivo=None) -> dict:
+    """
+    O núcleo da busca, sem imprimir nada — é o que a API consome.
+
+    Devolve sempre o mesmo formato; None em 'agente1'/'agente2' significa que
+    aquela fonte não tem o processo:
+
+        {
+          "numero"            : "0752821-68.2013.8.05.0001",
+          "numero_normalizado": "07528216820138050001",
+          "agente1"           : {...} | None,
+          "agente2"           : {...} | None,
+        }
+
+    Número vazio ou pasta inexistente devolvem as duas fontes vazias em vez de
+    estourar — quem chama decide se isso é 404 ou mensagem no terminal.
+    """
+    numero_norm = _normalizar_numero(numero)
+    achados = {"agente1": None, "agente2": None}
+
+    if numero_norm and os.path.isdir(pasta):
+        achados["agente1"] = _buscar_em_json_agente1(pasta, numero_norm, filtro_arquivo)
+        achados["agente2"] = _buscar_em_historial_agente2(pasta, numero_norm, filtro_arquivo)
+
+    return {"numero": numero, "numero_normalizado": numero_norm, **achados}
+
+
 def buscar(numero: str, pasta: str = PASTA_JSON):
     numero_norm = _normalizar_numero(numero)
  
@@ -189,10 +229,11 @@ def buscar(numero: str, pasta: str = PASTA_JSON):
         return
  
     print(_dim(f"\nBuscando processo {numero} em {pasta} ..."))
- 
-    proc_a1 = _buscar_em_json_agente1(pasta, numero_norm)
-    rec_a2  = _buscar_em_historial_agente2(pasta, numero_norm)
- 
+
+    dados   = buscar_dados(numero, pasta)
+    proc_a1 = dados["agente1"]
+    rec_a2  = dados["agente2"]
+
     if not proc_a1 and not rec_a2:
         print(_alerta(f"\nProcesso não encontrado: {numero}"))
         print(_dim("Possíveis motivos:"))
