@@ -1886,92 +1886,24 @@ def _parsear_respuesta_gpt(respuesta):
     return decision, motivo
 
 def call_chatgpt(full_text, fecha, citacion, penhora):
+
     """
-    Estrategia en dos pasos:
-      1. Intenta con texto filtrado (rápido y barato).
-      2. Si GPT responde INFORMAÇÃO INSUFICIENTE, reintenta con texto completo.
+
+    GPT deshabilitado temporalmente.
+
+    Mantiene la misma interfaz para no modificar el resto del código.
+
     """
-    fecha_str    = fecha    or "Não especificado"
-    citacion_str = citacion or "Não especificado"
-    penhora_str  = penhora  or "Não especificado"
 
-    # Nota de advertencia contextual según lo que detectó el sistema
-    nota_extra = ""
-    if "solicitado" in penhora_str.lower():
-        nota_extra = (
-            "\n⚠️ NOTA DO SISTEMA: O status da penhora indica que o SISBAJUD/BacenJud "
-            "foi APENAS SOLICITADO em petição. Não foi encontrado documento de resultado "
-            "(extrato, comprovante de bloqueio ou resposta dos bancos). "
-            "Classifique como APTO salvo se encontrar evidência contrária no texto.\n"
-        )
-    elif "tentativa" in penhora_str.lower():
-        nota_extra = (
-            "\n⚠️ NOTA DO SISTEMA: O sistema detectou apenas TENTATIVA de penhora, "
-            "sem resultado confirmado. Classifique como APTO salvo evidência contrária.\n"
-        )
-    elif "não encontrado" in penhora_str.lower():
-        nota_extra = (
-            "\n⚠️ NOTA DO SISTEMA: O sistema não encontrou informação de penhora no processo. "
-            "Verifique cuidadosamente o texto antes de classificar como NÃO APTO.\n"
-        )
+    print("  [GPT] Deshabilitado.")
 
-    # --- Paso 1: texto filtrado ---
-    texto_filtrado = _filtrar_texto_relevante(full_text)
+    return (
 
-    if len(texto_filtrado) < 200:
-        texto_filtrado = None
+        "DECISÃO: CHAMADA PENDENTE\n"
 
-    if texto_filtrado:
-        texto_truncado = texto_filtrado[:MAX_CHARS_FILTRADO]
-        prompt_paso1 = PROMPT_TEMPLATE_FULL.format(
-            fecha=fecha_str,
-            citacion=citacion_str,
-            penhora=penhora_str,
-            full_text=texto_truncado,
-        ) + nota_extra
+        "JUSTIFICATIVA: GPT desabilitado no momento."
 
-        try:
-            resp1 = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {"role": "system", "content": "Você é um assistente jurídico especializado em execuções fiscais brasileiras. Responda sempre em português, de forma objetiva e estruturada."},
-                    {"role": "user",   "content": prompt_paso1}
-                ],
-                temperature=0
-            )
-            respuesta1 = resp1.choices[0].message.content.strip()
-            decision1, _ = _parsear_respuesta_gpt(respuesta1)
-
-            if decision1 and "INSUFICIENTE" not in decision1.upper():
-                print(f"  [GPT] Decidido en paso 1 (texto filtrado, {len(texto_truncado)} chars)")
-                return respuesta1
-
-        except Exception as e:
-            print(f"  [GPT] Error en paso 1: {e}")
-
-    # --- Paso 2: texto completo (fallback) ---
-    print(f"  [GPT] Escalando a paso 2 (texto completo)")
-    texto_completo_truncado = full_text[:MAX_CHARS_GPT]
-    prompt_paso2 = PROMPT_TEMPLATE_FULL.format(
-        fecha=fecha_str,
-        citacion=citacion_str,
-        penhora=penhora_str,
-        full_text=texto_completo_truncado,
-    )
-    try:
-        resp2 = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "Você é um assistente jurídico especializado em execuções fiscais brasileiras. Responda sempre em português, de forma objetiva e estruturada."},
-                {"role": "user",   "content": prompt_paso2}
-            ],
-            temperature=0
-        )
-        return resp2.choices[0].message.content.strip()
-    except Exception as e:
-        print(f"  [GPT] Error en paso 2: {e}")
-        return "Error en API"
-# 8. Guardar prompts en un archivo de texto
+    )# 8. Guardar prompts en un archivo de texto
 def save_prompts_to_file(prompts, output_file):
     with open(output_file, 'w', encoding='utf-8') as file:
         for pdf_file, _, _, _, _, _, _, prompt, respuesta, _, ocr_metadata, tipo_processo, _ in prompts:
