@@ -36,11 +36,24 @@ def _extraer_fechas_de_texto(text_norm):
     _PATRON_COMPLETO = r"(\d{1,2}) de (janeiro|fevereiro|marco|abril|maio|junho|julho|agosto|setembro|outubro|novembro|dezembro) de (\d{4})"
     _PATRON_ABREV    = r"(\d{1,2})\s+(jan|fev|mar|abr|mai|jun|jul|ago|set|out|nov|dez)\.?\s+(\d{4})"
     fechas = []
+
+    def _try_add(anio, mes, dia, origen):
+        # Una fecha inválida (ruido de OCR, p.ej. '31 de novembro' o '29 de
+        # fevereiro' en año no bisiesto) se ignora con log claro y NO tumba
+        # el procesamiento del PDF completo.
+        try:
+            fechas.append(datetime(int(anio), mes, int(dia)))
+        except ValueError as e:
+            logging.warning(
+                f"_extraer_fechas_de_texto: fecha inválida ignorada "
+                f"({dia}/{mes}/{anio}, {origen}): {e}"
+            )
+
     for dia, mes_txt, anio in re.findall(_PATRON_COMPLETO, text_norm):
-        fechas.append(datetime(int(anio), _MESES_COMPLETOS[mes_txt], int(dia)))
+        _try_add(anio, _MESES_COMPLETOS[mes_txt], dia, "mes completo")
     for dia, mes_txt, anio in re.findall(_PATRON_ABREV, text_norm):
         if mes_txt in _MESES_ABREV:
-            fechas.append(datetime(int(anio), _MESES_ABREV[mes_txt], int(dia)))
+            _try_add(anio, _MESES_ABREV[mes_txt], dia, "mes abreviado")
     return fechas
 
 
@@ -52,16 +65,11 @@ logging.basicConfig(level=logging.INFO)
 from datetime import datetime  # asegurate de tener este import arriba
 
 CURRENT_DIR      = os.path.dirname(os.path.abspath(__file__))
-
-# Las tres carpetas son sobreescribibles por variable de entorno para que la API
-# pueda dar a cada lote su propio espacio aislado — sin eso, dos lotes en paralelo
-# se pisarían el JSON de traspaso, que tiene nombre fijo. Sin las variables el
-# comportamiento es el de siempre: subcarpetas junto al script.
-input_directory  = os.environ.get("PASTA_ENTRADA")    or os.path.join(CURRENT_DIR, "processos pra analiser")
+input_directory  = os.path.join(CURRENT_DIR, "processos pra analiser")
 
 # Carpetas de salida
-PASTA_JSON       = os.environ.get("PASTA_JSON")       or os.path.join(CURRENT_DIR, "JSON")         # JSON + prompts que escribe el Agente 1
-PASTA_RESULTADOS = os.environ.get("PASTA_RESULTADOS") or os.path.join(CURRENT_DIR, "resultados")   # Excel de resultados
+PASTA_JSON       = os.path.join(CURRENT_DIR, "JSON")         # JSON + prompts que escribe el Agente 1
+PASTA_RESULTADOS = os.path.join(CURRENT_DIR, "resultados")   # Excel de resultados
 
 os.makedirs(PASTA_JSON, exist_ok=True)
 os.makedirs(PASTA_RESULTADOS, exist_ok=True)
@@ -1903,7 +1911,8 @@ def call_chatgpt(full_text, fecha, citacion, penhora):
 
         "JUSTIFICATIVA: GPT desabilitado no momento."
 
-    )# 8. Guardar prompts en un archivo de texto
+    )
+# 8. Guardar prompts en un archivo de texto
 def save_prompts_to_file(prompts, output_file):
     with open(output_file, 'w', encoding='utf-8') as file:
         for pdf_file, _, _, _, _, _, _, prompt, respuesta, _, ocr_metadata, tipo_processo, _ in prompts:
@@ -2076,61 +2085,10 @@ def process_prompts_to_excel(prompts, output_excel):
         if col in df.columns:
             df[col] = df[col].astype(str).replace({"nan": "", "None": ""})
 
-    # ── Ordenar por decisión (APTO primero) para lectura rápida ──
-    # Mismo criterio que el reporte del Agente 2 (ALTA→MEDIA→BAIXA):
-    # lo accionable arriba. Orden estable: dentro de cada grupo se
-    # mantiene el orden de procesamiento de los PDFs.
-    _ORDEN_DECISION = {
-        "APTO": 0, "Informação insuficiente": 1, "NO APTO": 2, "FORA DE ESCOPO": 3,
-    }
-    if not df.empty and "Decisión" in df.columns:
-        df["_ord_dec"] = df["Decisión"].map(lambda d: _ORDEN_DECISION.get(d, 9))
-        df = df.sort_values(by="_ord_dec", kind="stable").drop(columns=["_ord_dec"])
-
     with pd.ExcelWriter(output_excel, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="Resultados")
         ws = writer.sheets["Resultados"]
-        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
         from openpyxl.utils import get_column_letter
-
-        # ── Estilos (mismo layout del reporte del Agente 2) ──
-        font_header  = Font(name="Arial", bold=True, color="FFFFFF", size=11)
-        fill_header  = PatternFill("solid", fgColor="1F4E79")
-        align_header = Alignment(horizontal="center", vertical="center", wrap_text=True)
-        borde        = Border(*[Side(style="thin", color="D0D0D0")] * 4)
-
-        fills_decision = {
-            "APTO"                   : PatternFill("solid", fgColor="C6E0B4"),  # verde suave
-            "Informação insuficiente": PatternFill("solid", fgColor="FFE699"),  # amarillo suave
-            "NO APTO"                : PatternFill("solid", fgColor="F8CBAD"),  # rojo suave
-            "FORA DE ESCOPO"         : PatternFill("solid", fgColor="D9D9D9"),  # gris
-        }
-
-        # Header
-        for col_idx in range(1, len(df.columns) + 1):
-            c = ws.cell(row=1, column=col_idx)
-            c.font      = font_header
-            c.fill      = fill_header
-            c.alignment = align_header
-            c.border    = borde
-
-        # Filas de datos
-        col_decision = (list(df.columns).index("Decisión") + 1) if "Decisión" in df.columns else None
-        font_dato    = Font(name="Arial", size=10)
-        align_dato   = Alignment(vertical="top", wrap_text=True)
-        for row_idx in range(2, len(df) + 2):
-            fill = None
-            if col_decision:
-                fill = fills_decision.get(ws.cell(row=row_idx, column=col_decision).value)
-            for col_idx in range(1, len(df.columns) + 1):
-                c = ws.cell(row=row_idx, column=col_idx)
-                c.font      = font_dato
-                c.border    = borde
-                c.alignment = align_dato
-                if fill and col_idx == col_decision:
-                    c.fill = fill
-
-        # Forzar texto puro en las columnas de identificadores
         for col_name in cols_texto:
             if col_name in df.columns:
                 col_idx = df.columns.get_loc(col_name) + 1
@@ -2141,46 +2099,27 @@ def process_prompts_to_excel(prompts, output_excel):
                         cell.value = str(cell.value)
                         cell.data_type = "s"
                         cell.number_format = "@"
-
-        # Anchos de columna
-        anchos = {
-            "CASO": 34, "Última data de interação": 16, "Status da citação": 30,
-            "Fecha orden citación": 14, "Fecha intento citación": 14,
-            "Fecha citación efectiva": 14, "Resultado da penhora": 30,
-            "Decisión": 16, "Motivo": 45, "Fonte da decisão": 20,
-            "Respuesta GPT": 50, "Páginas via OCR": 14, "Confiança OCR (%)": 12,
-            "Tipo de Processo": 28, "Confiança Tipo Processo": 12,
-            "A2_numero_processo": 22, "A2_cpf_cnpj": 20, "A2_nome_executado": 30,
-            "A2_nome_exequente": 30, "A2_tipo_tributo": 18, "A2_exercicio": 12,
-            "A2_numero_cda": 22, "A2_data_inscricao": 14,
-            "A2_valor_original": 16, "A2_valor_atualizado": 16, "A2_vara": 28,
-        }
-        for col_idx, col_name in enumerate(df.columns, start=1):
-            letra = get_column_letter(col_idx)
-            ws.column_dimensions[letra].width = anchos.get(col_name, 18)
-
-        # Congelar header y activar autofiltro
-        ws.freeze_panes = "A2"
-        ws.auto_filter.ref = f"A1:{get_column_letter(len(df.columns))}{len(df)+1}"
-
     print(f"Planilla Excel generada: {output_excel}")
 # ===========================================================================
 # 7.1 — SALIDA ESTRUCTURADA PARA EL AGENTE 2
-# ===========================================================================
+# =======================================================================
 
 def exportar_json_agente2(prompts, resultados_excel, output_json):
     """
     Genera el JSON de interfaz entre Agente 1 y Agente 2.
-    Solo incluye procesos con Decisión == "APTO".
+    [7.2] Incluye TODOS los procesos (APTO, NO APTO, Informação insuficiente,
+    FORA DE ESCOPO, etc.). Cada processo lleva 'decisao_agente1' para que el
+    Agente 2 filtre por decisión qué acciona, y pueda registrar todos para
+    historial / seguimento da evolução do processo no tempo.
     Los campos vacíos se guardan como null — nunca se omiten.
     """
     import json
     from datetime import datetime as _dt
-
-    VERSION_AGENTE1 = "7.1"
+    
+    VERSION_AGENTE1 = "7.2"
 
     idx = {r["CASO"]: r for r in resultados_excel} if resultados_excel else {}
-    processos_apto = []
+    processos = []
 
     for tupla in prompts:
         (pdf_file, fecha_reciente, citacion, fecha_orden, fecha_intento,
@@ -2192,9 +2131,8 @@ def exportar_json_agente2(prompts, resultados_excel, output_json):
         motivo   = res.get("Motivo", "")
         fonte    = res.get("Fonte da decisão", "")
 
-        if decision.upper() != "APTO":
-            continue
-
+        # [7.2] Ya NO se filtra por APTO: se incluyen TODOS los procesos.
+        #       El Agente 2 filtra por 'decisao_agente1' qué acciona.
         ent = entidades or {}
 
         def _nulo(val):
@@ -2211,7 +2149,7 @@ def exportar_json_agente2(prompts, resultados_excel, output_json):
             if conf_dict else None
         )
 
-        processos_apto.append({
+        processos.append({
             "id_lote"                : pdf_file,
             "decisao_agente1"        : decision,
             "motivo_agente1"         : _nulo(motivo),
@@ -2237,22 +2175,35 @@ def exportar_json_agente2(prompts, resultados_excel, output_json):
             }
         })
 
+    # [7.2] Desglose por decisión (trazabilidad en metadata)
+    conteo_decisiones = {}
+    for p in processos:
+        _d = (p.get("decisao_agente1") or "SEM_DECISAO").strip().upper()
+        conteo_decisiones[_d] = conteo_decisiones.get(_d, 0) + 1
+    total_aptos = conteo_decisiones.get("APTO", 0)
+
     payload = {
         "metadata": {
-            "generado_em"      : _dt.now().strftime("%Y-%m-%dT%H:%M:%S"),
-            "total_procesados" : len(prompts),
-            "total_aptos"      : len(processos_apto),
-            "version_agente1"  : VERSION_AGENTE1,
+            "generado_em"       : _dt.now().strftime("%Y-%m-%dT%H:%M:%S"),
+            "total_procesados"  : len(prompts),
+            "total_incluidos"   : len(processos),
+            "total_aptos"       : total_aptos,
+            "conteo_decisiones" : conteo_decisiones,
+            "version_agente1"   : VERSION_AGENTE1,
         },
-        "processos": processos_apto,
+        "processos": processos,
     }
 
     with open(output_json, 'w', encoding='utf-8') as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
     print(f"JSON Agente 2 generado: {output_json}")
-    print(f"  {len(processos_apto)} processo(s) APTO(s) de {len(prompts)} procesados")
+    print(f"  {len(processos)} processo(s) incluído(s) de {len(prompts)} procesados "
+          f"({total_aptos} APTO(s))")
+    print(f"  Desglose por decisão: {conteo_decisiones}")
     return payload
+
+
 # 10. Ejecutar el flujo
 if __name__ == "__main__":
     prompts = generate_prompts(input_directory)
@@ -2261,7 +2212,7 @@ if __name__ == "__main__":
     # Generar Excel (Agente 1 — revisión humana)
     process_prompts_to_excel(prompts, output_file_excel)
 
-    # [7.1] Generar JSON para el Agente 2 (solo procesos APTO)
+    # [7.2] Generar JSON para el Agente 2 (TODOS los procesos; A2 filtra por decisao_agente1)
     import pandas as _pd
     _df = _pd.read_excel(output_file_excel)
     resultados_para_json = _df.to_dict(orient="records")

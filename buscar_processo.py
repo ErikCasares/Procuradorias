@@ -62,21 +62,15 @@ def _dim(t):      return _cor(t, "2")      # apagado
  
 # ── Leitura das fontes ────────────────────────────────────────────
  
-def _buscar_em_json_agente1(pasta: str, numero_norm: str, filtro_arquivo=None):
+def _buscar_em_json_agente1(pasta: str, numero_norm: str):
     """
     Procura o processo nos arquivos *_agente2.json do Agente 1.
     Retorna o dict do processo (com decisão e entidades) ou None.
-
-    filtro_arquivo — função que recebe o nome do arquivo e devolve se ele pode
-    ser lido. É o que a API usa para restringir a busca aos lotes do próprio
-    consumidor; na linha de comando fica None e lê tudo.
     """
     # Todos os *_agente2.json, EXCETO os *_agente2_resultado.json (que são do Agente 2)
     padrao = os.path.join(pasta, f"*{SUFIJO_A1}")
     for caminho in sorted(glob.glob(padrao)):
         if caminho.endswith("_resultado.json"):
-            continue
-        if filtro_arquivo and not filtro_arquivo(os.path.basename(caminho)):
             continue
         try:
             with open(caminho, encoding="utf-8") as f:
@@ -92,19 +86,22 @@ def _buscar_em_json_agente1(pasta: str, numero_norm: str, filtro_arquivo=None):
     return None
  
  
-def _buscar_em_historial_agente2(pasta: str, numero_norm: str, filtro_arquivo=None):
+def _buscar_em_historial_agente2(pasta: str, numero_norm: str):
     """
     Procura o processo no historial_agente2.jsonl do Agente 2.
     Retorna o dict do registro (com análise) ou None.
-
-    filtro_arquivo recebe aqui o 'origem_lote' do registro — o nome do JSON do
-    Agente 1 que originou a análise —, para o mesmo recorte por lote da busca
-    no Agente 1.
     """
     caminho = os.path.join(pasta, HISTORIAL_A2)
     if not os.path.exists(caminho):
         return None
-
+ 
+    # [FIX] O historial é APPEND-ONLY: um processo pode ter várias linhas.
+    #       Ficar com o registro MAIS RECENTE que tenha análise; se nenhuma
+    #       linha tiver análise (ex.: só houve erro), cair no último registro
+    #       para poder mostrar o motivo do erro. Nunca devolver o 1º cegamente.
+    com_analise    = None   # último registro COM analise não-vazia (preferido)
+    ultimo_qualquer = None  # último registro do processo (fallback p/ mostrar erro)
+    total_analises = 0
     with open(caminho, encoding="utf-8") as f:
         for linha in f:
             linha = linha.strip()
@@ -115,13 +112,35 @@ def _buscar_em_historial_agente2(pasta: str, numero_norm: str, filtro_arquivo=No
             except json.JSONDecodeError:
                 continue
             np = rec.get("numero_processo")
-            if not np or _normalizar_numero(np) != numero_norm:
-                continue
-            if filtro_arquivo and not filtro_arquivo(rec.get("origem_lote") or ""):
-                continue
-            rec["_origem_arquivo"] = HISTORIAL_A2
-            return rec
+            if np and _normalizar_numero(np) == numero_norm:
+                total_analises += 1
+                ultimo_qualquer = rec
+                if rec.get("analise"):          # dict não-vazio
+                    com_analise = rec
+
+    escolhido = com_analise or ultimo_qualquer
+    if escolhido is not None:
+        escolhido["_origem_arquivo"] = HISTORIAL_A2
+        escolhido["_total_analises"] = total_analises
+        return escolhido
     return None
+
+
+def _agente1_desde_historial(rec: dict):
+    """
+    Reconstrói a visão do Agente 1 a partir do snapshot que o Agente 2 arrasta
+    para o historial (campo 'agente1'). Usado quando o processo não está mais
+    no JSON do Agente 1 (ex.: o JSON foi sobrescrito por uma corrida posterior).
+    Devolve um dict no formato que _mostrar_agente1 espera, ou None.
+    """
+    a1 = rec.get("agente1")
+    if not a1:
+        return None
+    proc = dict(a1)
+    if not proc.get("decisao_agente1"):      # _mostrar_agente1 faz .upper() nisso
+        proc["decisao_agente1"] = ""
+    proc["_origem_arquivo"] = "historial_agente2.jsonl (dados do Agente 1 arrastados)"
+    return proc
  
  
 # ── Apresentação ──────────────────────────────────────────────────
@@ -162,10 +181,32 @@ def _mostrar_agente1(proc: dict):
  
  
 def _mostrar_agente2(rec: dict):
-    an = rec.get("analise", {})
+    an = rec.get("analise", {}) or {}
     print(_titulo("\n┌─ AGENTE 2 — Análise jurídico-fiscal"))
     print(_dim(f"│  fonte: {rec.get('_origem_arquivo','?')}"))
     print("│")
+
+    total = rec.get("_total_analises")
+    if total and total > 1:
+        print(_linha("Vezes analisado", total))
+
+    # [FIX] Se o registro é de ERRO (analisar_processo falhou), mostrar o
+    #       motivo em vez de deixar tudo em "—" sem explicação.
+    erro = rec.get("erro")
+    if erro:
+        print(_linha("Status", _alerta("FALHA NA ANÁLISE")))
+        print(_linha("Erro",   _alerta(erro)))
+        print(_dim("│  (o Agente 2 não conseguiu analisar este processo;"))
+        print(_dim("│   os campos abaixo ficam vazios por isso)"))
+        print("│")
+
+    # [7.x] NÃO APTO: mostrar a triagem do Agente 1, não uma priorização.
+    status_triagem = an.get("status_triagem")
+    if status_triagem and status_triagem.upper() != "APTO":
+        print(_linha("Triagem Agente 1", _cor(status_triagem, "1;33")))
+        print(_dim("│  (processo NÃO APTO na triagem — sem análise jurídico-fiscal no Agente 2)"))
+        print("│")
+
     prioridade = an.get("prioridade", "")
     prio_fmt = {
         "ALTA":  _alerta("ALTA"),
@@ -187,34 +228,7 @@ def _mostrar_agente2(rec: dict):
  
  
 # ── Fluxo principal ───────────────────────────────────────────────
-
-def buscar_dados(numero: str, pasta: str = PASTA_JSON, filtro_arquivo=None) -> dict:
-    """
-    O núcleo da busca, sem imprimir nada — é o que a API consome.
-
-    Devolve sempre o mesmo formato; None em 'agente1'/'agente2' significa que
-    aquela fonte não tem o processo:
-
-        {
-          "numero"            : "0752821-68.2013.8.05.0001",
-          "numero_normalizado": "07528216820138050001",
-          "agente1"           : {...} | None,
-          "agente2"           : {...} | None,
-        }
-
-    Número vazio ou pasta inexistente devolvem as duas fontes vazias em vez de
-    estourar — quem chama decide se isso é 404 ou mensagem no terminal.
-    """
-    numero_norm = _normalizar_numero(numero)
-    achados = {"agente1": None, "agente2": None}
-
-    if numero_norm and os.path.isdir(pasta):
-        achados["agente1"] = _buscar_em_json_agente1(pasta, numero_norm, filtro_arquivo)
-        achados["agente2"] = _buscar_em_historial_agente2(pasta, numero_norm, filtro_arquivo)
-
-    return {"numero": numero, "numero_normalizado": numero_norm, **achados}
-
-
+ 
 def buscar(numero: str, pasta: str = PASTA_JSON):
     numero_norm = _normalizar_numero(numero)
  
@@ -229,11 +243,10 @@ def buscar(numero: str, pasta: str = PASTA_JSON):
         return
  
     print(_dim(f"\nBuscando processo {numero} em {pasta} ..."))
-
-    dados   = buscar_dados(numero, pasta)
-    proc_a1 = dados["agente1"]
-    rec_a2  = dados["agente2"]
-
+ 
+    proc_a1 = _buscar_em_json_agente1(pasta, numero_norm)
+    rec_a2  = _buscar_em_historial_agente2(pasta, numero_norm)
+ 
     if not proc_a1 and not rec_a2:
         print(_alerta(f"\nProcesso não encontrado: {numero}"))
         print(_dim("Possíveis motivos:"))
@@ -247,7 +260,11 @@ def buscar(numero: str, pasta: str = PASTA_JSON):
     if proc_a1:
         _mostrar_agente1(proc_a1)
     else:
-        print(_dim("\n(sem registro no JSON do Agente 1 — pode ter sido NÃO APTO)"))
+        proc_a1_hist = _agente1_desde_historial(rec_a2) if rec_a2 else None
+        if proc_a1_hist:
+            _mostrar_agente1(proc_a1_hist)
+        else:
+            print(_dim("\n(sem registro no JSON do Agente 1 — pode ter sido NÃO APTO)"))
  
     if rec_a2:
         _mostrar_agente2(rec_a2)
@@ -284,4 +301,3 @@ def main():
  
 if __name__ == "__main__":
     main()
- 

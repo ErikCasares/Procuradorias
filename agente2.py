@@ -63,7 +63,21 @@ HISTORIAL_JSONL   = "historial_agente2.jsonl"   # registro acumulativo — una l
 REPORTE_XLSX      = "historial_agente2.xlsx"    # reporte Excel acumulativo para el procurador
 INTERVALO_WATCH   = 10                          # segundos entre chequeos del watcher
 
-VERSION_AGENTE2 = "0.1-placeholder"
+# ── Limiares de prioridade OPERACIONAL ────────────────────────────────
+# [FIX] Estas constantes eram usadas em _calcular_prioridad() mas nunca
+#       tinham sido definidas → NameError ('LIMIAR_PRIORIDADE_ALTA' is not
+#       defined) que derrubava a análise de todo processo sem risco de
+#       prescrição. Valores conforme o docstring de _calcular_prioridad.
+#
+# ASSUNÇÃO PROVISÓRIA (definição HERA, NÃO jurídica): R$ 5.000 / R$ 1.000
+# foram escolhidos pela equipe apenas para ORDENAR o trabalho do procurador;
+# não derivam de norma nem definem ajuizamento. Substituir pelo valor mínimo
+# de ajuizamento oficial da PGMS quando definido — basta trocar a variável de
+# ambiente, sem tocar no fluxo. >>> CONFIRMAR limiares com a PGMS. <<<
+LIMIAR_PRIORIDADE_ALTA  = float(os.environ.get("LIMIAR_PRIORIDADE_ALTA",  "5000"))
+LIMIAR_PRIORIDADE_MEDIA = float(os.environ.get("LIMIAR_PRIORIDADE_MEDIA", "1000"))
+
+VERSION_AGENTE2 = "0.2-placeholder"
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -119,20 +133,23 @@ def _cargar_processos_registrados(path_jsonl: str) -> dict:
 
 def _escribir_historial(path_jsonl: str, resultados: list, origen: str):
     """
-    Agrega al historial JSONL solo los procesos que no están registrados aún.
-    Si un processo ya existe (mismo numero_processo), lo actualiza reescribiendo
-    el archivo completo con la línea actualizada — operación atómica vía archivo temp.
-
-    Parámetros:
-        path_jsonl  — ruta del archivo .jsonl
-        resultados  — lista de dicts resultado del analisar_processo()
-        origen      — nombre del archivo JSON del Agente 1 (para trazabilidad)
-
-    Devuelve (nuevos, actualizados) — conteo para el log.
+    Anexa ao historial JSONL uma linha por processo analisado — APPEND-ONLY.
+    NÃO reescreve linhas antigas: guarda a história completa das análises.
+ 
+    O contador vez_analisada reflete quantas vezes o mesmo numero_processo
+    já foi analisado. Útil quando a recomendação muda entre análises — por
+    evolução do processo (documentos juntados) ou por não-determinismo do
+    LLM quando o Gemini entrar.
+ 
+    A deduplicação ('último estado por processo') deixou de acontecer aqui:
+    passou a ser uma VISTA calculada na geração do Excel — ver
+    _ultimo_estado_por_processo().
+ 
+    Devolve (novos, reanalises) — conteo para o log.
+    (Antes devolvia (nuevos, actualizados); ajustar o texto no call site.)
     """
-    # Leer estado actual del historial
-    existentes = {}   # numero_processo → dict completo
-    orden = []        # mantener orden de inserción
+    # Contagem prévia por numero_processo (para vez_analisada)
+    contagens = {}
     if os.path.exists(path_jsonl):
         with open(path_jsonl, encoding="utf-8") as f:
             for line in f:
@@ -141,51 +158,101 @@ def _escribir_historial(path_jsonl: str, resultados: list, origen: str):
                     continue
                 try:
                     rec = json.loads(line)
-                    np = rec.get("numero_processo")
-                    if np:
-                        existentes[np] = rec
-                        if np not in orden:
-                            orden.append(np)
                 except json.JSONDecodeError:
-                    pass  # líneas corruptas se descartan en la reescritura
-
-    nuevos      = 0
-    actualizados = 0
-
+                    continue  # linha corrompida — ignorada na contagem
+                np = rec.get("numero_processo")
+                if np:
+                    contagens[np] = contagens.get(np, 0) + 1
+ 
+    novos      = 0
+    reanalises = 0
+    linhas     = []
+    contador   = dict(contagens)   # contagem acumulada (disco + esta corrida)
+    vistos     = set()             # numero_processo já vistos nesta corrida
+ 
     for r in resultados:
         np = (r.get("entidades") or {}).get("numero_processo") or r.get("numero_processo")
         if not np:
-            # Sin número de processo — siempre agregar (sin deduplicar)
-            log.warning(f"  Processo sin numero_processo — se agrega sin deduplicar: {r.get('id_lote','?')}")
+            log.warning(
+                f"  Processo sem numero_processo — agregado sem deduplicar: "
+                f"{r.get('id_lote','?')}"
+            )
             np = f"SIN_NP_{r.get('id_lote','desconocido')}"
-
-        # Construir registro JSONL
+ 
+        vez = contador.get(np, 0) + 1
+        contador[np] = vez
+ 
         registro = {
-            "numero_processo"  : np,
-            "id_lote"          : r.get("id_lote"),
-            "nome_executado"   : r.get("nome_executado"),
-            "analise"          : r.get("analise", {}),
-            "processado_em"    : r.get("processado_em"),
-            "origem_lote"      : origen,
+            "numero_processo" : np,
+            "id_lote"         : r.get("id_lote"),
+            "nome_executado"  : r.get("nome_executado"),
+            "agente1"         : r.get("agente1"),
+            "vez_analisada"   : vez,
+            "analise"         : r.get("analise", {}),
+            "processado_em"   : r.get("processado_em"),
+            "origem_lote"     : origen,
         }
-
-        if np in existentes:
-            existentes[np] = registro   # actualizar en lugar de duplicar
-            actualizados += 1
+        linhas.append(json.dumps(registro, ensure_ascii=False))
+ 
+        if np in contagens or np in vistos:
+            reanalises += 1
         else:
-            existentes[np] = registro
-            orden.append(np)
-            nuevos += 1
+            novos += 1
+        vistos.add(np)
+ 
+    if linhas:
+        # Append em bloco, modo 'a' — nunca toca linhas antigas.
+        try:
+            with open(path_jsonl, "a", encoding="utf-8") as f:
+                f.write("\n".join(linhas) + "\n")
+        except OSError as e:
+            # Falha VISÍVEL: loga claro e propaga. O caller decide.
+            log.error(f"_escribir_historial: FALHA ao gravar {path_jsonl}: {e}")
+            raise
+ 
+    return novos, reanalises
 
-    # Reescribir el archivo completo (operación atómica)
-    path_tmp = path_jsonl + ".tmp"
-    with open(path_tmp, "w", encoding="utf-8") as f:
-        for np in orden:
-            f.write(json.dumps(existentes[np], ensure_ascii=False) + "\n")
-    os.replace(path_tmp, path_jsonl)  # atómico en todos los OS
-
-    return nuevos, actualizados
-
+def _ultimo_estado_por_processo(path_jsonl: str) -> list:
+    """
+    Lê o historial APPEND-ONLY e devolve a VISTA deduplicada:
+    um registro por numero_processo (o MAIS RECENTE), com o campo
+    'vez_analisada' = total de análises desse processo no historial.
+ 
+    Mantém a ordem de primeira aparição. É o que alimenta o Excel:
+    uma linha por processo, mostrando o último estado + quantas vezes
+    foi reanalisado. Linhas corrompidas são puladas com warning.
+    """
+    ultimo = {}   # numero_processo -> registro mais recente
+    total  = {}   # numero_processo -> contagem de análises
+    orden  = []   # ordem de primeira aparição
+ 
+    if not os.path.exists(path_jsonl):
+        return []
+ 
+    with open(path_jsonl, encoding="utf-8") as f:
+        for i, line in enumerate(f):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                log.warning(f"_ultimo_estado_por_processo: linha {i} corrompida — ignorada")
+                continue
+            np = rec.get("numero_processo")
+            if not np:
+                continue
+            if np not in total:
+                orden.append(np)
+            total[np] = total.get(np, 0) + 1
+            ultimo[np] = rec
+ 
+    saida = []
+    for np in orden:
+        rec = dict(ultimo[np])
+        rec["vez_analisada"] = total[np]   # garante o total real, não o da última linha
+        saida.append(rec)
+    return saida
 
 # ════════════════════════════════════════════════════════════════════
 # NÚCLEO DE ANÁLISIS
@@ -205,6 +272,48 @@ def analisar_processo(processo: dict) -> dict:
     """
     ent = processo.get("entidades", {})
 
+    decisao = (processo.get("decisao_agente1") or "").strip()
+    motivo  = processo.get("motivo_agente1") or ""
+
+    # Snapshot dos dados do Agente 1 — arrastado ao historial para que a
+    # busca mostre a triagem/entidades mesmo se o JSON do Agente 1 já tiver
+    # sido sobrescrito por uma corrida posterior.
+    snapshot_a1 = {
+        "decisao_agente1"    : decisao,
+        "motivo_agente1"     : motivo or None,
+        "status_citacao"     : processo.get("status_citacao"),
+        "resultado_penhora"  : processo.get("resultado_penhora"),
+        "ultima_movimentacao": processo.get("ultima_movimentacao"),
+        "confianca_ocr_media": processo.get("confianca_ocr_media"),
+        "entidades"          : ent,
+    }
+
+    # [7.x] Só processos APTO recebem análise jurídico-fiscal completa.
+    #       NÃO APTO / Informação insuficiente / FORA DE ESCOPO: registra-se
+    #       apenas a triagem do Agente 1, SEM rodar priorização/penhora —
+    #       não faz sentido recomendar cobrança sobre processo não apto.
+    if decisao.upper() != "APTO":
+        return {
+            "id_lote"         : processo.get("id_lote"),
+            "numero_processo" : ent.get("numero_processo"),
+            "nome_executado"  : ent.get("nome_executado"),
+            "agente1"         : snapshot_a1,
+            "analise": {
+                "status_triagem"    : decisao or "SEM DECISÃO",
+                "prioridade"        : None,
+                "acao_recomendada"  : None,
+                "justificativa"     : (
+                    f"Sem análise no Agente 2 — processo "
+                    f"'{decisao or 'SEM DECISÃO'}' na triagem do Agente 1"
+                    + (f": {motivo}" if motivo else "")
+                ),
+                "alerta_prescricao" : False,
+                "observacoes"       : [],
+            },
+            "processado_em": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+        }
+
+    # ── APTO → análise jurídico-fiscal completa ──────────────────────
     prioridad    = _calcular_prioridad(processo)
     accion       = _recomendar_accion(processo)
     alerta_presc = _verificar_prescricao(processo)
@@ -228,6 +337,7 @@ def analisar_processo(processo: dict) -> dict:
         "id_lote"          : processo.get("id_lote"),
         "numero_processo"  : ent.get("numero_processo"),
         "nome_executado"   : ent.get("nome_executado"),
+        "agente1"          : snapshot_a1,
         "analise": {
             "prioridade"        : prioridad,
             "acao_recomendada"  : accion,
@@ -252,16 +362,43 @@ def _valor_numerico(valor_str):
         return 0.0
 
 
+
 def _calcular_prioridad(processo: dict) -> str:
     """
-    ALTA  → valor >= R$ 10.000 o sin movimentação >= 5 años
-    MEDIA → valor entre R$ 1.000 y R$ 10.000
-    BAIXA → valor < R$ 1.000
+    Prioridade OPERACIONAL (ordem em que o procurador analisa os casos).
+    NÃO é critério de ajuizamento: BAIXA nunca significa "não cobrar" — o
+    processo segue tramitando normalmente.
+ 
+    Critérios (provisórios — ver limiares e notas abaixo):
+      ALTA  → valor >= LIMIAR_PRIORIDADE_ALTA (R$ 5.000)
+              OU risco de prescrição (art. 174 CTN)
+              OU sem movimentação >= 5 anos  [ver ASSUNÇÃO nº 3]
+      MEDIA → valor entre LIMIAR_PRIORIDADE_MEDIA (R$ 1.000) e ALTA
+      BAIXA → valor < LIMIAR_PRIORIDADE_MEDIA (R$ 1.000)
+ 
+    Dois eixos combinados: RECUPERABILIDADE (valor) e URGÊNCIA/RISCO
+    (prescrição). Um crédito pequeno prestes a prescrever entra em ALTA
+    porque perdê-lo é perda definitiva do crédito.
+ 
+    ASSUNÇÃO PROVISÓRIA (definição HERA, NÃO jurídica): os limiares
+    R$ 5.000 / R$ 1.000 foram escolhidos pela equipe apenas para ordenar o
+    trabalho; não derivam de norma. Substituir pelo valor mínimo de
+    ajuizamento oficial da PGMS quando for definido — basta trocar a variável
+    de ambiente, sem tocar no fluxo.
+ 
+    ASSUNÇÃO nº 3 (PENDENTE de confirmação PGMS): "sem movimentação >= 5 anos"
+    pode configurar prescrição intercorrente (art. 40 §4º da LEF, Súmula 314
+    do STJ). Gatilho de ALTA mantido idêntico à 0.1 por ora; revisar quando a
+    prescrição intercorrente for modelada.
     """
     ent   = processo.get("entidades", {})
     valor = _valor_numerico(ent.get("valor_atualizado")) or \
             _valor_numerico(ent.get("valor_original"))
-
+ 
+    # Eixo urgência/risco: prescrição empurra para ALTA, independente do valor.
+    if _verificar_prescricao(processo):
+        return "ALTA"
+ 
     anos_parado = 0
     ultima = processo.get("ultima_movimentacao")
     if ultima:
@@ -270,10 +407,10 @@ def _calcular_prioridad(processo: dict) -> str:
             anos_parado = (datetime.now() - dt).days / 365
         except ValueError:
             pass
-
-    if valor >= 10_000 or anos_parado >= 5:
+ 
+    if valor >= LIMIAR_PRIORIDADE_ALTA or anos_parado >= 5:
         return "ALTA"
-    elif valor >= 1_000:
+    elif valor >= LIMIAR_PRIORIDADE_MEDIA:
         return "MEDIA"
     else:
         return "BAIXA"
@@ -376,10 +513,12 @@ def processar_lote(path_json: str):
             resultado = analisar_processo(proc)
             resultados.append(resultado)
             analise = resultado["analise"]
+            _prio = analise.get("prioridade") or analise.get("status_triagem") or "—"
+            _acao = analise.get("acao_recomendada") or "—"
             log.info(
-                f"  [{analise['prioridade']}] "
+                f"  [{_prio}] "
                 f"{resultado.get('nome_executado','—')} — "
-                f"{analise['acao_recomendada'][:55]}..."
+                f"{_acao[:55]}"
             )
         except Exception as e:
             log.error(f"  Error en {proc.get('id_lote','?')}: {e}")
