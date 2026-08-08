@@ -36,24 +36,11 @@ def _extraer_fechas_de_texto(text_norm):
     _PATRON_COMPLETO = r"(\d{1,2}) de (janeiro|fevereiro|marco|abril|maio|junho|julho|agosto|setembro|outubro|novembro|dezembro) de (\d{4})"
     _PATRON_ABREV    = r"(\d{1,2})\s+(jan|fev|mar|abr|mai|jun|jul|ago|set|out|nov|dez)\.?\s+(\d{4})"
     fechas = []
-
-    def _try_add(anio, mes, dia, origen):
-        # Una fecha inválida (ruido de OCR, p.ej. '31 de novembro' o '29 de
-        # fevereiro' en año no bisiesto) se ignora con log claro y NO tumba
-        # el procesamiento del PDF completo.
-        try:
-            fechas.append(datetime(int(anio), mes, int(dia)))
-        except ValueError as e:
-            logging.warning(
-                f"_extraer_fechas_de_texto: fecha inválida ignorada "
-                f"({dia}/{mes}/{anio}, {origen}): {e}"
-            )
-
     for dia, mes_txt, anio in re.findall(_PATRON_COMPLETO, text_norm):
-        _try_add(anio, _MESES_COMPLETOS[mes_txt], dia, "mes completo")
+        fechas.append(datetime(int(anio), _MESES_COMPLETOS[mes_txt], int(dia)))
     for dia, mes_txt, anio in re.findall(_PATRON_ABREV, text_norm):
         if mes_txt in _MESES_ABREV:
-            _try_add(anio, _MESES_ABREV[mes_txt], dia, "mes abreviado")
+            fechas.append(datetime(int(anio), _MESES_ABREV[mes_txt], int(dia)))
     return fechas
 
 
@@ -2107,19 +2094,16 @@ def process_prompts_to_excel(prompts, output_excel):
 def exportar_json_agente2(prompts, resultados_excel, output_json):
     """
     Genera el JSON de interfaz entre Agente 1 y Agente 2.
-    [7.2] Incluye TODOS los procesos (APTO, NO APTO, Informação insuficiente,
-    FORA DE ESCOPO, etc.). Cada processo lleva 'decisao_agente1' para que el
-    Agente 2 filtre por decisión qué acciona, y pueda registrar todos para
-    historial / seguimento da evolução do processo no tempo.
+    Solo incluye procesos con Decisión == "APTO".
     Los campos vacíos se guardan como null — nunca se omiten.
     """
     import json
     from datetime import datetime as _dt
     
-    VERSION_AGENTE1 = "7.2"
+    VERSION_AGENTE1 = "7.1"
 
     idx = {r["CASO"]: r for r in resultados_excel} if resultados_excel else {}
-    processos = []
+    processos_apto = []
 
     for tupla in prompts:
         (pdf_file, fecha_reciente, citacion, fecha_orden, fecha_intento,
@@ -2131,8 +2115,9 @@ def exportar_json_agente2(prompts, resultados_excel, output_json):
         motivo   = res.get("Motivo", "")
         fonte    = res.get("Fonte da decisão", "")
 
-        # [7.2] Ya NO se filtra por APTO: se incluyen TODOS los procesos.
-        #       El Agente 2 filtra por 'decisao_agente1' qué acciona.
+        if decision.upper() != "APTO":
+            continue
+
         ent = entidades or {}
 
         def _nulo(val):
@@ -2149,7 +2134,7 @@ def exportar_json_agente2(prompts, resultados_excel, output_json):
             if conf_dict else None
         )
 
-        processos.append({
+        processos_apto.append({
             "id_lote"                : pdf_file,
             "decisao_agente1"        : decision,
             "motivo_agente1"         : _nulo(motivo),
@@ -2175,32 +2160,21 @@ def exportar_json_agente2(prompts, resultados_excel, output_json):
             }
         })
 
-    # [7.2] Desglose por decisión (trazabilidad en metadata)
-    conteo_decisiones = {}
-    for p in processos:
-        _d = (p.get("decisao_agente1") or "SEM_DECISAO").strip().upper()
-        conteo_decisiones[_d] = conteo_decisiones.get(_d, 0) + 1
-    total_aptos = conteo_decisiones.get("APTO", 0)
-
     payload = {
         "metadata": {
-            "generado_em"       : _dt.now().strftime("%Y-%m-%dT%H:%M:%S"),
-            "total_procesados"  : len(prompts),
-            "total_incluidos"   : len(processos),
-            "total_aptos"       : total_aptos,
-            "conteo_decisiones" : conteo_decisiones,
-            "version_agente1"   : VERSION_AGENTE1,
+            "generado_em"      : _dt.now().strftime("%Y-%m-%dT%H:%M:%S"),
+            "total_procesados" : len(prompts),
+            "total_aptos"      : len(processos_apto),
+            "version_agente1"  : VERSION_AGENTE1,
         },
-        "processos": processos,
+        "processos": processos_apto,
     }
 
     with open(output_json, 'w', encoding='utf-8') as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
     print(f"JSON Agente 2 generado: {output_json}")
-    print(f"  {len(processos)} processo(s) incluído(s) de {len(prompts)} procesados "
-          f"({total_aptos} APTO(s))")
-    print(f"  Desglose por decisão: {conteo_decisiones}")
+    print(f"  {len(processos_apto)} processo(s) APTO(s) de {len(prompts)} procesados")
     return payload
 
 
@@ -2212,7 +2186,7 @@ if __name__ == "__main__":
     # Generar Excel (Agente 1 — revisión humana)
     process_prompts_to_excel(prompts, output_file_excel)
 
-    # [7.2] Generar JSON para el Agente 2 (TODOS los procesos; A2 filtra por decisao_agente1)
+    # [7.1] Generar JSON para el Agente 2 (solo procesos APTO)
     import pandas as _pd
     _df = _pd.read_excel(output_file_excel)
     resultados_para_json = _df.to_dict(orient="records")
