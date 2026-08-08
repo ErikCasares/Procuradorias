@@ -480,13 +480,15 @@ def _publico(lote: dict, incluir_log=False, incluir_analises=False) -> dict:
 _RE_RESUMO = re.compile(r"(\d+)\s+processo\(s\)\s+APTO\(s\)\s+de\s+(\d+)\s+procesados")
 
 _SINTOMAS = (
-    ("poppler",             "Poppler indisponível — o OCR não conseguiu renderizar as páginas escaneadas"),
-    ("tesseract",           "Tesseract indisponível — o OCR não rodou"),
-    ("401",                 "OpenAI recusou a autenticação (401) — verifique a OPENAI_API_KEY"),
-    ("429",                 "OpenAI limitou as chamadas (429) — cota ou rate limit atingido"),
-    ("insufficient_quota",  "Cota da OpenAI esgotada"),
-    ("sin texto extraíble", "Algum PDF ficou sem texto extraível — confira a qualidade do digitalizado"),
-    ("memoryerror",         "Memória insuficiente durante o OCR — reduza OCR_MAX_WORKERS ou OCR_DPI"),
+    (("poppler",),             "Poppler indisponível — o OCR não conseguiu renderizar as páginas escaneadas"),
+    (("tesseract",),           "Tesseract indisponível — o OCR não rodou"),
+    (("error code: 401", "invalid_api_key", "authenticationerror"),
+                               "OpenAI recusou a autenticação (401) — verifique a OPENAI_API_KEY"),
+    (("error code: 429", "ratelimiterror", "rate_limit_exceeded", "rate limit reached"),
+                               "OpenAI limitou as chamadas (429) — cota ou rate limit atingido"),
+    (("insufficient_quota",),  "Cota da OpenAI esgotada"),
+    (("sin texto extraíble",), "Algum PDF ficou sem texto extraível — confira a qualidade do digitalizado"),
+    (("memoryerror",),         "Memória insuficiente durante o OCR — reduza OCR_MAX_WORKERS ou OCR_DPI"),
 )
 
 
@@ -499,7 +501,8 @@ def _diagnosticar(linhas: list) -> tuple:
     if m:
         resumo = f"{m.group(1)} de {m.group(2)} processo(s) classificados como APTO"
 
-    avisos = [msg for chave, msg in _SINTOMAS if chave.lower() in baixo]
+    avisos = [msg for gatilhos, msg in _SINTOMAS
+              if any(g.lower() in baixo for g in gatilhos)]
     if m and m.group(1) == "0" and int(m.group(2)) > 0:
         avisos.insert(0, "Nenhum processo foi classificado como APTO — o resultado sairá vazio")
 
