@@ -52,11 +52,16 @@ logging.basicConfig(level=logging.INFO)
 from datetime import datetime  # asegurate de tener este import arriba
 
 CURRENT_DIR      = os.path.dirname(os.path.abspath(__file__))
-input_directory  = os.path.join(CURRENT_DIR, "processos pra analiser")
+
+# Las tres carpetas son sobreescribibles por variable de entorno para que la API
+# pueda dar a cada lote su propio espacio aislado — sin eso, dos lotes en paralelo
+# se pisarían el JSON de traspaso, que tiene nombre fijo. Sin las variables el
+# comportamiento es el de siempre: subcarpetas junto al script.
+input_directory  = os.environ.get("PASTA_ENTRADA")    or os.path.join(CURRENT_DIR, "processos pra analiser")
 
 # Carpetas de salida
-PASTA_JSON       = os.path.join(CURRENT_DIR, "JSON")         # JSON + prompts que escribe el Agente 1
-PASTA_RESULTADOS = os.path.join(CURRENT_DIR, "resultados")   # Excel de resultados
+PASTA_JSON       = os.environ.get("PASTA_JSON")       or os.path.join(CURRENT_DIR, "JSON")         # JSON + prompts que escribe el Agente 1
+PASTA_RESULTADOS = os.environ.get("PASTA_RESULTADOS") or os.path.join(CURRENT_DIR, "resultados")   # Excel de resultados
 
 os.makedirs(PASTA_JSON, exist_ok=True)
 os.makedirs(PASTA_RESULTADOS, exist_ok=True)
@@ -1898,8 +1903,7 @@ def call_chatgpt(full_text, fecha, citacion, penhora):
 
         "JUSTIFICATIVA: GPT desabilitado no momento."
 
-    )
-# 8. Guardar prompts en un archivo de texto
+    )# 8. Guardar prompts en un archivo de texto
 def save_prompts_to_file(prompts, output_file):
     with open(output_file, 'w', encoding='utf-8') as file:
         for pdf_file, _, _, _, _, _, _, prompt, respuesta, _, ocr_metadata, tipo_processo, _ in prompts:
@@ -2072,10 +2076,61 @@ def process_prompts_to_excel(prompts, output_excel):
         if col in df.columns:
             df[col] = df[col].astype(str).replace({"nan": "", "None": ""})
 
+    # ── Ordenar por decisión (APTO primero) para lectura rápida ──
+    # Mismo criterio que el reporte del Agente 2 (ALTA→MEDIA→BAIXA):
+    # lo accionable arriba. Orden estable: dentro de cada grupo se
+    # mantiene el orden de procesamiento de los PDFs.
+    _ORDEN_DECISION = {
+        "APTO": 0, "Informação insuficiente": 1, "NO APTO": 2, "FORA DE ESCOPO": 3,
+    }
+    if not df.empty and "Decisión" in df.columns:
+        df["_ord_dec"] = df["Decisión"].map(lambda d: _ORDEN_DECISION.get(d, 9))
+        df = df.sort_values(by="_ord_dec", kind="stable").drop(columns=["_ord_dec"])
+
     with pd.ExcelWriter(output_excel, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="Resultados")
         ws = writer.sheets["Resultados"]
+        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
         from openpyxl.utils import get_column_letter
+
+        # ── Estilos (mismo layout del reporte del Agente 2) ──
+        font_header  = Font(name="Arial", bold=True, color="FFFFFF", size=11)
+        fill_header  = PatternFill("solid", fgColor="1F4E79")
+        align_header = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        borde        = Border(*[Side(style="thin", color="D0D0D0")] * 4)
+
+        fills_decision = {
+            "APTO"                   : PatternFill("solid", fgColor="C6E0B4"),  # verde suave
+            "Informação insuficiente": PatternFill("solid", fgColor="FFE699"),  # amarillo suave
+            "NO APTO"                : PatternFill("solid", fgColor="F8CBAD"),  # rojo suave
+            "FORA DE ESCOPO"         : PatternFill("solid", fgColor="D9D9D9"),  # gris
+        }
+
+        # Header
+        for col_idx in range(1, len(df.columns) + 1):
+            c = ws.cell(row=1, column=col_idx)
+            c.font      = font_header
+            c.fill      = fill_header
+            c.alignment = align_header
+            c.border    = borde
+
+        # Filas de datos
+        col_decision = (list(df.columns).index("Decisión") + 1) if "Decisión" in df.columns else None
+        font_dato    = Font(name="Arial", size=10)
+        align_dato   = Alignment(vertical="top", wrap_text=True)
+        for row_idx in range(2, len(df) + 2):
+            fill = None
+            if col_decision:
+                fill = fills_decision.get(ws.cell(row=row_idx, column=col_decision).value)
+            for col_idx in range(1, len(df.columns) + 1):
+                c = ws.cell(row=row_idx, column=col_idx)
+                c.font      = font_dato
+                c.border    = borde
+                c.alignment = align_dato
+                if fill and col_idx == col_decision:
+                    c.fill = fill
+
+        # Forzar texto puro en las columnas de identificadores
         for col_name in cols_texto:
             if col_name in df.columns:
                 col_idx = df.columns.get_loc(col_name) + 1
@@ -2086,10 +2141,32 @@ def process_prompts_to_excel(prompts, output_excel):
                         cell.value = str(cell.value)
                         cell.data_type = "s"
                         cell.number_format = "@"
+
+        # Anchos de columna
+        anchos = {
+            "CASO": 34, "Última data de interação": 16, "Status da citação": 30,
+            "Fecha orden citación": 14, "Fecha intento citación": 14,
+            "Fecha citación efectiva": 14, "Resultado da penhora": 30,
+            "Decisión": 16, "Motivo": 45, "Fonte da decisão": 20,
+            "Respuesta GPT": 50, "Páginas via OCR": 14, "Confiança OCR (%)": 12,
+            "Tipo de Processo": 28, "Confiança Tipo Processo": 12,
+            "A2_numero_processo": 22, "A2_cpf_cnpj": 20, "A2_nome_executado": 30,
+            "A2_nome_exequente": 30, "A2_tipo_tributo": 18, "A2_exercicio": 12,
+            "A2_numero_cda": 22, "A2_data_inscricao": 14,
+            "A2_valor_original": 16, "A2_valor_atualizado": 16, "A2_vara": 28,
+        }
+        for col_idx, col_name in enumerate(df.columns, start=1):
+            letra = get_column_letter(col_idx)
+            ws.column_dimensions[letra].width = anchos.get(col_name, 18)
+
+        # Congelar header y activar autofiltro
+        ws.freeze_panes = "A2"
+        ws.auto_filter.ref = f"A1:{get_column_letter(len(df.columns))}{len(df)+1}"
+
     print(f"Planilla Excel generada: {output_excel}")
 # ===========================================================================
 # 7.1 — SALIDA ESTRUCTURADA PARA EL AGENTE 2
-# =======================================================================
+# ===========================================================================
 
 def exportar_json_agente2(prompts, resultados_excel, output_json):
     """
@@ -2099,7 +2176,7 @@ def exportar_json_agente2(prompts, resultados_excel, output_json):
     """
     import json
     from datetime import datetime as _dt
-    
+
     VERSION_AGENTE1 = "7.1"
 
     idx = {r["CASO"]: r for r in resultados_excel} if resultados_excel else {}
@@ -2176,8 +2253,6 @@ def exportar_json_agente2(prompts, resultados_excel, output_json):
     print(f"JSON Agente 2 generado: {output_json}")
     print(f"  {len(processos_apto)} processo(s) APTO(s) de {len(prompts)} procesados")
     return payload
-
-
 # 10. Ejecutar el flujo
 if __name__ == "__main__":
     prompts = generate_prompts(input_directory)
