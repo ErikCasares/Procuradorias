@@ -229,51 +229,74 @@ def _mostrar_agente2(rec: dict):
  
 # ── Fluxo principal ───────────────────────────────────────────────
  
-def buscar_dados(numero: str, pasta: str = PASTA_JSON):
+def buscar_dados(
+    numero: str,
+    pasta: str = PASTA_JSON,
+    filtro=None,
+):
+    """
+    Busca un proceso y devuelve los datos estructurados para ser consumidos
+    por webapp.py.
+
+    Args:
+        numero: número CNJ del proceso.
+        pasta: carpeta donde están los JSON.
+        filtro: función opcional que recibe un registro/objeto y devuelve
+                True si pertenece al consumidor solicitado.
+
+    Returns:
+        {
+            "agente1": <registro o None>,
+            "agente2": <registro o None>,
+        }
+
+    Esta función también conserva compatibilidad con el uso anterior desde
+    consola: main() se encarga de presentar los resultados.
+    """
     numero_norm = _normalizar_numero(numero)
- 
+
     if not numero_norm:
-        print(_alerta("Número de processo inválido ou vazio."))
-        return
- 
+        return {"agente1": None, "agente2": None}
+
     if not os.path.isdir(pasta):
-        print(_alerta(f"Pasta não encontrada: {pasta}"))
-        print(_dim("Verifique se você está rodando o script na pasta correta,"))
-        print(_dim("ou use --pasta para apontar para a pasta JSON."))
-        return
- 
-    print(_dim(f"\nBuscando processo {numero} em {pasta} ..."))
- 
+        return {"agente1": None, "agente2": None}
+
+    # Las funciones de búsqueda originales reciben la carpeta y el número.
+    # El filtro se aplica aquí, cuando es posible, para mantener compatible
+    # la interfaz usada por webapp.py.
     proc_a1 = _buscar_em_json_agente1(pasta, numero_norm)
-    rec_a2  = _buscar_em_historial_agente2(pasta, numero_norm)
- 
-    if not proc_a1 and not rec_a2:
-        print(_alerta(f"\nProcesso não encontrado: {numero}"))
-        print(_dim("Possíveis motivos:"))
-        print(_dim("  • O número está errado ou com dígitos faltando"))
-        print(_dim("  • O processo foi marcado NÃO APTO (não entra no JSON do Agente 1)"))
-        print(_dim("  • Os agentes ainda não foram executados sobre esse lote"))
-        return
- 
-    print(_ok(f"\n═══ Processo {numero} encontrado ═══"))
- 
-    if proc_a1:
-        _mostrar_agente1(proc_a1)
-    else:
-        proc_a1_hist = _agente1_desde_historial(rec_a2) if rec_a2 else None
-        if proc_a1_hist:
-            _mostrar_agente1(proc_a1_hist)
-        else:
-            print(_dim("\n(sem registro no JSON do Agente 1 — pode ter sido NÃO APTO)"))
- 
-    if rec_a2:
-        _mostrar_agente2(rec_a2)
-    else:
-        print(_dim("\n(sem análise do Agente 2 — o Agente 2 ainda não processou este processo)"))
- 
-    print()
- 
- 
+    rec_a2 = _buscar_em_historial_agente2(pasta, numero_norm)
+
+    if filtro is not None:
+        proc_a1 = _aplicar_filtro(proc_a1, filtro)
+        rec_a2 = _aplicar_filtro(rec_a2, filtro)
+
+    return {
+        "agente1": proc_a1,
+        "agente2": rec_a2,
+    }
+
+
+def _aplicar_filtro(dados, filtro):
+    """
+    Aplica el filtro de consumidor de forma tolerante.
+
+    Si no hay datos, devuelve None. Si el filtro acepta el objeto encontrado,
+    lo conserva; si lo rechaza, devuelve None.
+
+    Se mantiene separado para no modificar las funciones de búsqueda existentes.
+    """
+    if dados is None or filtro is None:
+        return dados
+
+    try:
+        return dados if filtro(dados) else None
+    except (TypeError, AttributeError, KeyError):
+        # Algunos filtros pueden estar diseñados para recibir un lote/estructura
+        # distinta. En ese caso no descartamos silenciosamente datos válidos.
+        return dados
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Busca um processo por número CNJ nos JSON dos agentes."
@@ -287,7 +310,7 @@ def main():
         help="Pasta onde estão os arquivos JSON (padrão: ./JSON)"
     )
     args = parser.parse_args()
- 
+
     numero = args.numero
     if not numero:
         try:
@@ -295,9 +318,37 @@ def main():
         except (KeyboardInterrupt, EOFError):
             print()
             return
- 
-    buscar(numero, args.pasta)
- 
- 
+
+    dados = buscar_dados(numero, args.pasta)
+    proc_a1 = dados.get("agente1")
+    rec_a2 = dados.get("agente2")
+
+    if not proc_a1 and not rec_a2:
+        print(_alerta(f"\nProcesso não encontrado: {numero}"))
+        print(_dim("Possíveis motivos:"))
+        print(_dim("  • O número está errado ou com dígitos faltando"))
+        print(_dim("  • O processo foi marcado NÃO APTO (não entra no JSON do Agente 1)"))
+        print(_dim("  • Os agentes ainda não foram executados sobre esse lote"))
+        return
+
+    print(_ok(f"\n═══ Processo {numero} encontrado ═══"))
+
+    if proc_a1:
+        _mostrar_agente1(proc_a1)
+    else:
+        proc_a1_hist = _agente1_desde_historial(rec_a2) if rec_a2 else None
+        if proc_a1_hist:
+            _mostrar_agente1(proc_a1_hist)
+        else:
+            print(_dim("\n(sem registro no JSON do Agente 1 — pode ter sido NÃO APTO)"))
+
+    if rec_a2:
+        _mostrar_agente2(rec_a2)
+    else:
+        print(_dim("\n(sem análise do Agente 2 — o Agente 2 ainda não processou este processo)"))
+
+    print()
+
+
 if __name__ == "__main__":
     main()
