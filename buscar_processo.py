@@ -229,7 +229,7 @@ def _mostrar_agente2(rec: dict):
  
 # ── Fluxo principal ───────────────────────────────────────────────
  
-def buscar(numero: str, pasta: str = PASTA_JSON):
+def buscar_dados(numero: str, pasta: str = PASTA_JSON):
     numero_norm = _normalizar_numero(numero)
  
     if not numero_norm:
