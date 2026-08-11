@@ -73,7 +73,7 @@ _timestamp = datetime.now().strftime("%Y-%m-%d_%Hh%M")
 output_file_prompts = os.path.join(PASTA_JSON, "prompts_generadosV7_1.txt")
 output_file_excel   = os.path.join(PASTA_RESULTADOS, f"resultados_V7_1_{_timestamp}.xlsx")
 output_file_json    = os.path.join(PASTA_JSON, "resultados_procesosV7_1_agente2.json")
-
+output_file_historial = os.path.join(PASTA_JSON, "historial_classificacoes.jsonl")
 
 
 # Plantilla resumida (usada solo para guardar en el .txt)
@@ -2253,6 +2253,73 @@ def exportar_json_agente2(prompts, resultados_excel, output_json):
     print(f"JSON Agente 2 generado: {output_json}")
     print(f"  {len(processos_apto)} processo(s) APTO(s) de {len(prompts)} procesados")
     return payload
+
+# ===========================================================================
+# 7.2 — HISTÓRICO DE CLASSIFICAÇÕES (auditoria acumulativa — TODAS as decisões)
+# ===========================================================================
+
+def exportar_historial_classificacoes(prompts, resultados_excel, output_jsonl):
+    """
+    Registra TODAS as classificações do lote (APTO, NÃO APTO, INFORMAÇÃO
+    INSUFICIENTE, FORA DE ESCOPO) num JSONL — uma linha por processo.
+
+    Diferente de exportar_json_agente2(), NÃO filtra por decisão: o objetivo
+    é auditoria. É APPEND-ONLY — se o arquivo já existe, acrescenta ao final,
+    nunca sobrescreve o rastro anterior.
+
+    Cada linha vai dentro de try/except: um processo corrompido é registrado
+    no log e pulado, sem derrubar o lote inteiro.
+    """
+    import json
+    from datetime import datetime as _dt
+
+    def _nulo(val):
+        if val is None:
+            return None
+        v = str(val).strip()
+        return None if v in ("", "nan", "None", "Não especificado") else v
+
+    idx = {r["CASO"]: r for r in resultados_excel} if resultados_excel else {}
+
+    gravados, erros = 0, 0
+    # 'a' = append: acumula entre execuções quando output_jsonl é compartilhado
+    with open(output_jsonl, "a", encoding="utf-8") as f:
+        for tupla in prompts:
+            try:
+                (pdf_file, fecha_reciente, citacion, fecha_orden, fecha_intento,
+                 fecha_efectiva, penhora, prompt, respuesta_gpt, full_text,
+                 ocr_metadata, tipo_processo, entidades) = tupla
+
+                res      = idx.get(pdf_file, {})
+                decision = res.get("Decisión", "")
+                motivo   = res.get("Motivo", "")
+                fonte    = res.get("Fonte da decisão", "")
+                ent      = entidades or {}
+
+                registro = {
+                    "classificado_em"    : _dt.now().strftime("%Y-%m-%dT%H:%M:%S"),
+                    "numero_processo"    : _nulo(ent.get("numero_processo")),
+                    "decisao"            : _nulo(decision),
+                    "motivo"             : _nulo(motivo),
+                    "fonte_decisao"      : _nulo(fonte),
+                    "ultima_movimentacao": fecha_reciente.strftime("%Y-%m-%d") if fecha_reciente else None,
+                    "status_citacao"     : _nulo(citacion),
+                    "resultado_penhora"  : _nulo(penhora),
+                    "id_lote"            : pdf_file,
+                    "nome_executado"     : _nulo(ent.get("nome_executado")),
+                    "cpf_cnpj"           : _nulo(ent.get("cpf_cnpj")),
+                }
+                f.write(json.dumps(registro, ensure_ascii=False) + "\n")
+                gravados += 1
+            except Exception as e:
+                erros += 1
+                _id = tupla[0] if isinstance(tupla, (list, tuple)) and tupla else "desconhecido"
+                print(f"[HISTORIAL] ERRO ao registrar '{_id}': {e}")
+
+    print(f"Histórico de classificações: {output_jsonl}")
+    print(f"  {gravados} classificação(ões) registrada(s), {erros} com erro")
+    return gravados, erros
+
 # 10. Ejecutar el flujo
 if __name__ == "__main__":
     prompts = generate_prompts(input_directory)
@@ -2266,3 +2333,5 @@ if __name__ == "__main__":
     _df = _pd.read_excel(output_file_excel)
     resultados_para_json = _df.to_dict(orient="records")
     exportar_json_agente2(prompts, resultados_para_json, output_file_json)
+    # [7.2] Registrar TODAS as classificações para auditoria (append-only)
+    exportar_historial_classificacoes(prompts, resultados_para_json, output_file_historial)

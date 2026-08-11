@@ -562,7 +562,29 @@ async def _processar_lote(lote: dict):
         traspasse = saida_json / "resultados_procesosV7_1_agente2.json"
         if not traspasse.exists():
             raise RuntimeError("O Agente 1 não gerou o JSON de traspasse")
-
+        # ── [V7.2] Auditoria — anexa as classificações do lote ao histórico compartilhado ──
+        # O Agente 1 grava um JSONL na sua pasta ISOLADA (saida_json); aqui anexamos
+        # ao arquivo COMPARTILHADO (PASTA_JSON), que acumula TODAS as decisões —
+        # inclusive NÃO APTO — entre lotes. Append-only. Falha aqui não derruba o lote.
+        try:
+            audit_lote = saida_json / "historial_classificacoes.jsonl"
+            if audit_lote.exists():
+                PASTA_JSON.mkdir(parents=True, exist_ok=True)
+                destino = PASTA_JSON / "historial_classificacoes.jsonl"
+                with open(audit_lote, encoding="utf-8") as _src, \
+                     open(destino, "a", encoding="utf-8") as _dst:
+                    _dst.write(_src.read())
+                lote["log"].append(
+                    f"{_agora()}  Auditoria: classificações anexadas ao histórico compartilhado"
+                )
+            else:
+                lote["log"].append(
+                    f"{_agora()}  AVISO: Agente 1 não gerou historial_classificacoes.jsonl"
+                )
+        except Exception as e:
+            lote["log"].append(f"{_agora()}  ERRO ao anexar auditoria: {e}")
+            log.exception(f"Falha ao anexar auditoria do lote {lote_id}")
+            
         # ── Agente 2 — nome de arquivo por lote, pastas COMPARTILHADAS ──
         # O nome derivado do lote evita que um lote sobrescreva o resultado do
         # outro; as pastas compartilhadas mantêm o histórico do procurador
