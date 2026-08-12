@@ -780,16 +780,54 @@ class TriagemAgente1(BaseModel):
     )
 
 
+class ClassificacaoAuditoria(BaseModel):
+    """
+    Uma classificação registrada na auditoria (historial_classificacoes.jsonl).
+    Diferente de agente1/agente2, cobre TODAS as decisões — inclusive NÃO APTO.
+    Registro plano: sem 'entidades' aninhadas.
+    """
+    model_config = ConfigDict(extra="allow")
+
+    classificado_em    : str | None = Field(None, examples=["2026-08-05T09:30:00"])
+    numero_processo    : str | None = None
+    decisao            : str | None = Field(None, examples=["NÃO APTO"])
+    motivo             : str | None = Field(None, examples=["Penhora de imóvel efetivada"])
+    fonte_decisao      : str | None = None
+    ultima_movimentacao: str | None = None
+    status_citacao     : str | None = None
+    resultado_penhora  : str | None = None
+    id_lote            : str | None = Field(None, description="Nome do PDF de origem")
+    nome_executado     : str | None = None
+    cpf_cnpj           : str | None = None
+
+
+class AuditoriaProcesso(BaseModel):
+    """
+    Bloco de auditoria de um processo: a classificação vigente (a mais recente)
+    mais o histórico completo. O histórico é APPEND-ONLY, então um processo pode
+    ter várias linhas (foi reclassificado entre lotes) — daí `total`.
+    """
+    atual    : ClassificacaoAuditoria | None = None
+    historico: list[ClassificacaoAuditoria] = Field(default_factory=list)
+    total    : int = 0
+
+
 class ProcessoConsultado(BaseModel):
     numero_processo: str = Field(description="Número como está gravado, com a pontuação original")
     encontrado_em: list[str] = Field(
-        description="Quais fontes têm o processo: 'agente1', 'agente2', ou as duas"
+        description="Quais fontes têm o processo: 'agente1', 'agente2' e/ou 'auditoria'"
     )
     agente1: TriagemAgente1 | None = Field(
         None, description="Nulo quando só o Agente 2 tem o processo"
     )
     agente2: ProcessoAnalisado | None = Field(
         None, description="Nulo enquanto o Agente 2 não analisou o processo"
+    )
+    auditoria: AuditoriaProcesso | None = Field(
+        None,
+        description="Classificação de triagem — TODAS as decisões, inclusive NÃO APTO. "
+                    "É aqui que aparece um processo reprovado na triagem, que não entra "
+                    "em `agente1`/`agente2`. Nulo se o lote foi processado antes da auditoria.",
     )
 
 
@@ -1373,11 +1411,12 @@ async def planilha_agente2(lote_id: str, consumidor: str = Depends(autenticar_ap
 # CONSULTA POR NÚMERO DE PROCESSO
 # ════════════════════════════════════════════════════════════════
 #
-# A busca varre a pasta JSON/ compartilhada, onde o histórico do Agente 2 é
-# acumulativo e mistura os lotes de todos os consumidores. Daí o filtro por
-# origem: quem consulta só alcança o que ele mesmo mandou, a mesma regra das
-# rotas de lote. Sem ele bastaria adivinhar um número CNJ — que é público — para
-# ler nome, CPF/CNPJ e valor da dívida de processo alheio.
+# A busca varre a pasta JSON/ compartilhada, que mistura os lotes de todos os
+# consumidores. DECISÃO DE NEGÓCIO: esta consulta por número é VISÍVEL A TODOS
+# os tokens válidos — não recorta por consumidor. Qualquer token autenticado
+# alcança qualquer processo (inclusive nome, CPF/CNPJ e valor da dívida) pelo
+# número CNJ. A autenticação (token) continua exigida; o recorte por origem,
+# não. As demais rotas (por lote_id) seguem isoladas por consumidor.
 
 _RE_ARQUIVO_LOTE = re.compile(r"^lote_(.+)_agente2\.json$")
 
@@ -1399,6 +1438,15 @@ def _filtro_do_consumidor(consumidor: str):
         lote = _lote_da_origem(nome_arquivo)
         return bool(lote) and lote.get("origem") == consumidor
     return do_consumidor
+
+
+def _sem_internos(rec: dict | None) -> dict | None:
+    """Tira as chaves internas '_...' que a busca anexa (ex.: _origem_arquivo,
+    _total_classificacoes). Usado no bloco de auditoria, que é um registro plano
+    e não passa por _com_lote_id."""
+    if not rec:
+        return None
+    return {k: v for k, v in rec.items() if not k.startswith("_")}
 
 
 def _com_lote_id(achado: dict | None) -> dict | None:
@@ -1442,42 +1490,71 @@ async def consultar_processo(
     em mãos e quer a triagem do Agente 1 (dados extraídos e classificação) junto da
     priorização do Agente 2 (prioridade, ação recomendada, alerta de prescrição).
 
-    A busca cobre **todos** os lotes deste consumidor, não um só. Cada bloco vem
-    nulo quando aquela fonte não tem o processo — veja `encontrado_em`:
+    A busca cobre **todos** os lotes, de todos os consumidores (esta consulta é
+    visível a todos — a auth continua exigida, o recorte por origem não). Cada
+    bloco vem nulo quando aquela fonte não tem o processo — veja `encontrado_em`:
 
     - só `agente1`: o Agente 2 ainda não analisou, ou outro lote reanalisou o
       mesmo processo depois (o histórico do Agente 2 guarda uma linha por número)
     - só `agente2`: a análise ficou no histórico acumulado, mas o JSON do lote que
       a gerou já não está na pasta
+    - `auditoria` presente: a triagem do processo (TODAS as decisões). É a única
+      fonte que mostra um processo **NÃO APTO**, que não entra em agente1/agente2.
 
-    Responde `404` quando o número não aparece em lote nenhum deste consumidor. Isso
-    inclui o processo classificado como **NÃO APTO** — ele não entra no resultado do
-    Agente 1, então não há o que consultar.
+    Responde `404` só quando o número não aparece em fonte nenhuma. Um processo
+    **NÃO APTO** NÃO dá mais 404: ele aparece no bloco `auditoria` (desde que o
+    lote tenha sido processado com a auditoria ligada).
     """
     # Em thread: a varredura lê os JSON da pasta inteira, e travar o event loop
     # aqui atrasaria o polling de todos os outros lotes.
+    #
+    # SEM filtro por consumidor: esta consulta é visível a todos (decisão de
+    # negócio). A auth já rodou em Depends(autenticar_api); `consumidor` fica
+    # só como prova de token válido, não recorta o resultado.
     dados = await asyncio.to_thread(
-        buscar_dados, numero, str(PASTA_JSON), _filtro_do_consumidor(consumidor)
+        buscar_dados, numero, str(PASTA_JSON)
     )
 
     a1 = _com_lote_id(dados["agente1"])
     a2 = _com_lote_id(dados["agente2"])
-    if not a1 and not a2:
+
+    # Auditoria — TODAS as decisões, inclusive NÃO APTO. Registro plano: só
+    # limpamos as chaves internas '_...'; não há mapeamento de lote_id aqui.
+    aud_atual = dados.get("auditoria")
+    aud_hist  = dados.get("auditoria_historico") or []
+    auditoria = None
+    if aud_atual:
+        auditoria = {
+            "atual"    : _sem_internos(aud_atual),
+            "historico": [_sem_internos(h) for h in aud_hist],
+            "total"    : aud_atual.get("_total_classificacoes") or len(aud_hist) or 1,
+        }
+
+    # 404 só quando NENHUMA fonte tem o processo. O NÃO APTO cai em `auditoria`,
+    # então deixa de dar 404 — era exatamente o bug.
+    if not a1 and not a2 and not auditoria:
         raise HTTPException(
             404,
-            "Processo não encontrado nos lotes deste consumidor. Confira o número; "
-            "processo classificado como NÃO APTO não entra no resultado dos agentes.",
+            "Processo não encontrado. Confira o número. Se o lote foi processado "
+            "antes de a auditoria ser ligada, a classificação pode não ter sido registrada.",
         )
+
+    fontes = [
+        nome for nome, achado in (("agente1", a1), ("agente2", a2), ("auditoria", auditoria))
+        if achado
+    ]
 
     return {
         "numero_processo": (
             ((a1 or {}).get("entidades") or {}).get("numero_processo")
             or (a2 or {}).get("numero_processo")
+            or ((auditoria or {}).get("atual") or {}).get("numero_processo")
             or numero
         ),
-        "encontrado_em": [nome for nome, achado in (("agente1", a1), ("agente2", a2)) if achado],
+        "encontrado_em": fontes,
         "agente1": a1,
         "agente2": a2,
+        "auditoria": auditoria,
     }
 
 
