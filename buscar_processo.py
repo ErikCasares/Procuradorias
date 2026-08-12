@@ -1,67 +1,79 @@
 """
-BUSCAR PROCESSO — consulta por número CNJ
+BUSCAR PROCESSO v2 — consulta por número CNJ
 HERA Tecnologia / PGMS
- 
+
 Lê os arquivos JSON da pasta JSON/ e mostra as informações de um processo
 específico, buscando pelo número do processo (CNJ).
- 
-Procura em duas fontes:
-  1. JSON do Agente 1  → resultados_*_agente2.json  (dados extraídos + decisão)
-  2. Histórico Agente 2 → historial_agente2.jsonl    (análise e priorização)
- 
+
+Procura em TRÊS fontes:
+  1. JSON do Agente 1  → resultados_*_agente2.json     (dados extraídos + decisão — SÓ APTO)
+  2. Histórico Agente 2 → historial_agente2.jsonl       (análise e priorização — SÓ APTO)
+  3. Auditoria (V7.2)  → historial_classificacoes.jsonl (TODAS as decisões, inclusive NÃO APTO)
+
+  A fonte 3 é a que faz um processo NÃO APTO aparecer nesta consulta. As fontes
+  1 e 2 só contêm processos APTO, por desenho do pipeline.
+
 Uso:
     # Modo interativo — pergunta o número e mostra
-    python buscar_processo.py
- 
+    python buscar_processo_v2.py
+
     # Modo direto — passa o número como argumento
-    python buscar_processo.py 0752821-68.2013.8.05.0001
- 
+    python buscar_processo_v2.py 0752821-68.2013.8.05.0001
+
     # Apontar para outra pasta JSON
-    python buscar_processo.py --pasta /caminho/JSON 0752821-68.2013.8.05.0001
- 
+    python buscar_processo_v2.py --pasta /caminho/JSON 0752821-68.2013.8.05.0001
+
 Observação:
     A busca é flexível quanto à formatação do número: ignora pontos, traços e
     espaços. Então "0752821-68.2013.8.05.0001" e "07528216820138050001"
     encontram o mesmo processo.
+
+Nota de compatibilidade:
+    Esta é a versão CLI. O webapp.py continua usando buscar_processo.py até que
+    a rota de API seja cabeada. A auditoria (fonte 3) é COMPARTILHADA entre
+    consumidores e os registros NÃO trazem campo 'consumidor', então esta versão
+    NÃO deve ser exposta por API sem antes estampar o consumidor no append do
+    webapp — do contrário quebraria o isolamento entre consumidores.
 """
- 
+
 import os
 import re
 import sys
 import json
 import glob
 import argparse
- 
- 
+
+
 # ── Configuração ──────────────────────────────────────────────────
-CURRENT_DIR   = os.path.dirname(os.path.abspath(__file__))
-PASTA_JSON    = os.path.join(CURRENT_DIR, "JSON")
-SUFIJO_A1     = "_agente2.json"        # JSON do Agente 1 (não confundir com _resultado)
-HISTORIAL_A2  = "historial_agente2.jsonl"
- 
- 
+CURRENT_DIR       = os.path.dirname(os.path.abspath(__file__))
+PASTA_JSON        = os.path.join(CURRENT_DIR, "JSON")
+SUFIJO_A1         = "_agente2.json"                  # JSON do Agente 1 (não confundir com _resultado)
+HISTORIAL_A2      = "historial_agente2.jsonl"
+HISTORIAL_CLASSIF = "historial_classificacoes.jsonl"  # [v2] auditoria V7.2 — TODAS as decisões
+
+
 # ── Utilidades ────────────────────────────────────────────────────
- 
+
 def _normalizar_numero(numero: str) -> str:
     """Remove tudo que não é dígito, para comparar números CNJ com formatações diferentes."""
     return re.sub(r"\D", "", str(numero or ""))
- 
- 
+
+
 def _cor(texto, codigo):
     """Aplica cor ANSI se o terminal suportar; senão, texto puro."""
     if sys.stdout.isatty():
         return f"\033[{codigo}m{texto}\033[0m"
     return texto
- 
+
 def _titulo(t):   return _cor(t, "1;36")   # ciano negrito
 def _label(t):    return _cor(t, "1;37")   # branco negrito
 def _ok(t):       return _cor(t, "1;32")   # verde
 def _alerta(t):   return _cor(t, "1;31")   # vermelho
 def _dim(t):      return _cor(t, "2")      # apagado
- 
- 
+
+
 # ── Leitura das fontes ────────────────────────────────────────────
- 
+
 def _buscar_em_json_agente1(pasta: str, numero_norm: str):
     """
     Procura o processo nos arquivos *_agente2.json do Agente 1.
@@ -77,15 +89,15 @@ def _buscar_em_json_agente1(pasta: str, numero_norm: str):
                 payload = json.load(f)
         except (json.JSONDecodeError, OSError):
             continue
- 
+
         for proc in payload.get("processos", []):
             np = (proc.get("entidades") or {}).get("numero_processo")
             if np and _normalizar_numero(np) == numero_norm:
                 proc["_origem_arquivo"] = os.path.basename(caminho)
                 return proc
     return None
- 
- 
+
+
 def _buscar_em_historial_agente2(pasta: str, numero_norm: str):
     """
     Procura o processo no historial_agente2.jsonl do Agente 2.
@@ -94,7 +106,7 @@ def _buscar_em_historial_agente2(pasta: str, numero_norm: str):
     caminho = os.path.join(pasta, HISTORIAL_A2)
     if not os.path.exists(caminho):
         return None
- 
+
     # [FIX] O historial é APPEND-ONLY: um processo pode ter várias linhas.
     #       Ficar com o registro MAIS RECENTE que tenha análise; se nenhuma
     #       linha tiver análise (ex.: só houve erro), cair no último registro
@@ -126,6 +138,45 @@ def _buscar_em_historial_agente2(pasta: str, numero_norm: str):
     return None
 
 
+def _buscar_em_historial_classificacoes(pasta: str, numero_norm: str):
+    """
+    [v2] Procura no historial_classificacoes.jsonl (auditoria V7.2 — TODAS as
+    decisões, inclusive NÃO APTO). É esta fonte que faz o NÃO APTO aparecer.
+
+    APPEND-ONLY: um processo pode ter várias linhas (foi reclassificado entre
+    lotes). Devolve uma tupla:
+        (registro_mais_recente | None, historico_completo: list)
+    O 'mais recente' representa o estado vigente; o histórico completo é o que
+    dá valor de auditoria (mostra a evolução da decisão).
+    """
+    caminho = os.path.join(pasta, HISTORIAL_CLASSIF)
+    if not os.path.exists(caminho):
+        return None, []
+
+    historico = []
+    with open(caminho, encoding="utf-8") as f:
+        for linha in f:
+            linha = linha.strip()
+            if not linha:
+                continue
+            try:
+                rec = json.loads(linha)
+            except json.JSONDecodeError:
+                # Linha corrompida no histórico — pula, não derruba a busca
+                continue
+            if _normalizar_numero(rec.get("numero_processo")) == numero_norm:
+                historico.append(rec)
+
+    if not historico:
+        return None, []
+
+    # "estado atual" = classificação mais recente por classificado_em
+    recente = max(historico, key=lambda r: r.get("classificado_em") or "")
+    recente["_origem_arquivo"] = HISTORIAL_CLASSIF
+    recente["_total_classificacoes"] = len(historico)
+    return recente, historico
+
+
 def _agente1_desde_historial(rec: dict):
     """
     Reconstrói a visão do Agente 1 a partir do snapshot que o Agente 2 arrasta
@@ -141,16 +192,26 @@ def _agente1_desde_historial(rec: dict):
         proc["decisao_agente1"] = ""
     proc["_origem_arquivo"] = "historial_agente2.jsonl (dados do Agente 1 arrastados)"
     return proc
- 
- 
+
+
 # ── Apresentação ──────────────────────────────────────────────────
- 
+
 def _linha(label, valor):
     """Formata 'Label: valor', mostrando '—' se vazio."""
     v = valor if (valor is not None and str(valor).strip() != "") else _dim("—")
     return f"  {_label(label + ':'):<28} {v}"
- 
- 
+
+
+def _fmt_decisao(decisao: str):
+    """Colore a decisão conforme o tipo: APTO verde, NÃO APTO vermelho, resto amarelo."""
+    d = (decisao or "").upper()
+    if d == "APTO":
+        return _ok(decisao)
+    if "NÃO APTO" in d or "NAO APTO" in d:
+        return _alerta(decisao)
+    return _cor(decisao, "1;33")   # amarelo: INFORMAÇÃO INSUFICIENTE / FORA DE ESCOPO
+
+
 def _mostrar_agente1(proc: dict):
     ent = proc.get("entidades", {})
     print(_titulo("\n┌─ AGENTE 1 — Triagem e dados extraídos"))
@@ -178,8 +239,41 @@ def _mostrar_agente1(proc: dict):
     conf = proc.get("confianca_ocr_media")
     if conf is not None:
         print(_linha("Confiança OCR", f"{conf}%"))
- 
- 
+
+
+def _mostrar_auditoria(rec: dict, historico=None):
+    """
+    [v2] Mostra a classificação de auditoria (fonte 3). O registro é PLANO
+    (usa 'decisao'/'motivo', não 'entidades'), então tem apresentação própria.
+    É aqui que um processo NÃO APTO fica visível na consulta.
+    """
+    print(_titulo("\n┌─ AUDITORIA — Classificação (todas as decisões)"))
+    print(_dim(f"│  fonte: {rec.get('_origem_arquivo','?')}"))
+    print("│")
+    print(_linha("Decisão",             _fmt_decisao(rec.get("decisao"))))
+    print(_linha("Motivo",              rec.get("motivo")))
+    print(_linha("Fonte da decisão",    rec.get("fonte_decisao")))
+    print(_linha("Classificado em",     rec.get("classificado_em")))
+    print(_linha("Executado",           rec.get("nome_executado")))
+    print(_linha("CPF/CNPJ",            rec.get("cpf_cnpj")))
+    print(_linha("Status citação",      rec.get("status_citacao")))
+    print(_linha("Resultado penhora",   rec.get("resultado_penhora")))
+    print(_linha("Última movimentação", rec.get("ultima_movimentacao")))
+    print(_linha("Lote (origem)",       rec.get("id_lote")))
+
+    total = rec.get("_total_classificacoes")
+    if historico and total and total > 1:
+        print("│")
+        print(f"  {_label('Histórico de classificações:')} {_dim(f'({total} registros)')}")
+        # do mais antigo ao mais recente, para ler a evolução da decisão
+        for h in sorted(historico, key=lambda r: r.get("classificado_em") or ""):
+            quando = h.get("classificado_em") or "—"
+            dec    = h.get("decisao") or "—"
+            mot    = h.get("motivo") or ""
+            sufixo = f"  —  {mot}" if mot else ""
+            print(f"    • {_dim(quando)}  {_fmt_decisao(dec)}{sufixo}")
+
+
 def _mostrar_agente2(rec: dict):
     an = rec.get("analise", {}) or {}
     print(_titulo("\n┌─ AGENTE 2 — Análise jurídico-fiscal"))
@@ -225,10 +319,10 @@ def _mostrar_agente2(rec: dict):
             print(f"    • {o}")
     print(_linha("Processado em",    rec.get("processado_em")))
     print(_linha("Origem (lote)",    rec.get("origem_lote")))
- 
- 
+
+
 # ── Fluxo principal ───────────────────────────────────────────────
- 
+
 def buscar_dados(
     numero: str,
     pasta: str = PASTA_JSON,
@@ -248,6 +342,8 @@ def buscar_dados(
         {
             "agente1": <registro o None>,
             "agente2": <registro o None>,
+            "auditoria": <registro más reciente o None>,   # [v2]
+            "auditoria_historico": <lista de registros>,    # [v2]
         }
 
     Esta función también conserva compatibilidad con el uso anterior desde
@@ -256,24 +352,32 @@ def buscar_dados(
     numero_norm = _normalizar_numero(numero)
 
     if not numero_norm:
-        return {"agente1": None, "agente2": None}
+        return {"agente1": None, "agente2": None, "auditoria": None, "auditoria_historico": []}
 
     if not os.path.isdir(pasta):
-        return {"agente1": None, "agente2": None}
+        return {"agente1": None, "agente2": None, "auditoria": None, "auditoria_historico": []}
 
     # Las funciones de búsqueda originales reciben la carpeta y el número.
     # El filtro se aplica aquí, cuando es posible, para mantener compatible
     # la interfaz usada por webapp.py.
     proc_a1 = _buscar_em_json_agente1(pasta, numero_norm)
-    rec_a2 = _buscar_em_historial_agente2(pasta, numero_norm)
+    rec_a2  = _buscar_em_historial_agente2(pasta, numero_norm)
+    audit_recente, audit_historico = _buscar_em_historial_classificacoes(pasta, numero_norm)
 
     if filtro is not None:
-        proc_a1 = _aplicar_filtro(proc_a1, filtro)
-        rec_a2 = _aplicar_filtro(rec_a2, filtro)
+        proc_a1       = _aplicar_filtro(proc_a1, filtro)
+        rec_a2        = _aplicar_filtro(rec_a2, filtro)
+        audit_recente = _aplicar_filtro(audit_recente, filtro)
+        # Se o filtro rejeitou o registro mais recente, some com o histórico
+        # também — todas as linhas são do mesmo processo/consumidor.
+        if audit_recente is None:
+            audit_historico = []
 
     return {
         "agente1": proc_a1,
         "agente2": rec_a2,
+        "auditoria": audit_recente,
+        "auditoria_historico": audit_historico,
     }
 
 
@@ -299,7 +403,7 @@ def _aplicar_filtro(dados, filtro):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Busca um processo por número CNJ nos JSON dos agentes."
+        description="Busca um processo por número CNJ nos JSON dos agentes (v2 — com auditoria)."
     )
     parser.add_argument(
         "numero", nargs="?",
@@ -320,32 +424,46 @@ def main():
             return
 
     dados = buscar_dados(numero, args.pasta)
-    proc_a1 = dados.get("agente1")
-    rec_a2 = dados.get("agente2")
+    proc_a1        = dados.get("agente1")
+    rec_a2         = dados.get("agente2")
+    auditoria      = dados.get("auditoria")
+    auditoria_hist = dados.get("auditoria_historico", [])
 
-    if not proc_a1 and not rec_a2:
+    if not proc_a1 and not rec_a2 and not auditoria:
         print(_alerta(f"\nProcesso não encontrado: {numero}"))
         print(_dim("Possíveis motivos:"))
         print(_dim("  • O número está errado ou com dígitos faltando"))
-        print(_dim("  • O processo foi marcado NÃO APTO (não entra no JSON do Agente 1)"))
+        print(_dim("  • O lote foi processado antes da V7.2 (sem historial_classificacoes.jsonl)"))
         print(_dim("  • Os agentes ainda não foram executados sobre esse lote"))
         return
 
     print(_ok(f"\n═══ Processo {numero} encontrado ═══"))
 
+    # Agente 1 — dados extraídos (só existe para APTO, ou reconstruído do histórico do A2)
     if proc_a1:
         _mostrar_agente1(proc_a1)
     else:
         proc_a1_hist = _agente1_desde_historial(rec_a2) if rec_a2 else None
         if proc_a1_hist:
             _mostrar_agente1(proc_a1_hist)
-        else:
-            print(_dim("\n(sem registro no JSON do Agente 1 — pode ter sido NÃO APTO)"))
+        elif not auditoria:
+            print(_dim("\n(sem registro no JSON do Agente 1)"))
 
+    # [v2] Auditoria — é aqui que o NÃO APTO fica visível
+    if auditoria:
+        _mostrar_auditoria(auditoria, auditoria_hist)
+
+    # Agente 2 — análise jurídico-fiscal (só para APTO)
     if rec_a2:
         _mostrar_agente2(rec_a2)
     else:
-        print(_dim("\n(sem análise do Agente 2 — o Agente 2 ainda não processou este processo)"))
+        dec = (auditoria or {}).get("decisao", "").upper()
+        if dec and "APTO" in dec and "NÃO" not in dec and "NAO" not in dec:
+            print(_dim("\n(sem análise do Agente 2 — o Agente 2 ainda não processou este processo)"))
+        elif dec:
+            print(_dim("\n(sem análise do Agente 2 — processo não é APTO na triagem, comportamento esperado)"))
+        else:
+            print(_dim("\n(sem análise do Agente 2)"))
 
     print()
 
