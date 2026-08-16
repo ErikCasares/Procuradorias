@@ -170,8 +170,9 @@ def _buscar_em_historial_classificacoes(pasta: str, numero_norm: str):
     if not historico:
         return None, []
 
-    # "estado atual" = classificação mais recente por classificado_em
-    recente = max(historico, key=lambda r: r.get("classificado_em") or "")
+    # "estado atual" = registro mais recente. v8.0 grava 'extraido_em' (extração);
+    # versões antigas gravavam 'classificado_em' (classificação). Usa os dois.
+    recente = max(historico, key=lambda r: r.get("classificado_em") or r.get("extraido_em") or "")
     recente["_origem_arquivo"] = HISTORIAL_CLASSIF
     recente["_total_classificacoes"] = len(historico)
     return recente, historico
@@ -229,14 +230,26 @@ def _mostrar_agente1(proc: dict):
     print(_linha("Valor atualizado",ent.get("valor_atualizado")))
     print(_linha("Vara",            ent.get("vara")))
     print("│")
-    decisao = proc.get("decisao_agente1", "")
-    dec_fmt = _ok(decisao) if decisao.upper() == "APTO" else decisao
-    print(_linha("Decisão Agente 1", dec_fmt))
-    print(_linha("Motivo",          proc.get("motivo_agente1")))
+    decisao = proc.get("decisao_agente1") or ""
+    if decisao:  # só versões antigas (v7) trazem decisão
+        dec_fmt = _ok(decisao) if decisao.upper() == "APTO" else decisao
+        print(_linha("Decisão Agente 1", dec_fmt))
+        print(_linha("Motivo",          proc.get("motivo_agente1")))
+    # v8.0: sinais processuais no lugar da decisão
+    sinais = proc.get("sinais_processuais") or {}
+    if sinais.get("extincao"):
+        print(_linha("Sinal extinção", sinais.get("extincao")))
+    if sinais.get("parcelamento"):
+        print(_linha("Sinal parcelamento", sinais.get("parcelamento")))
+    if sinais.get("suspensao_art40_lef"):
+        print(_linha("Sinal art.40 LEF", sinais.get("suspensao_art40_lef")))
     print(_linha("Status citação",  proc.get("status_citacao")))
     print(_linha("Resultado penhora",proc.get("resultado_penhora")))
     print(_linha("Última movimentação", proc.get("ultima_movimentacao")))
-    conf = proc.get("confianca_ocr_media")
+    # OCR: v8.0 aninha em 'ocr'; v7 usava 'confianca_ocr_media' no topo.
+    conf = (proc.get("ocr") or {}).get("confianca_media")
+    if conf is None:
+        conf = proc.get("confianca_ocr_media")
     if conf is not None:
         print(_linha("Confiança OCR", f"{conf}%"))
 
@@ -247,13 +260,23 @@ def _mostrar_auditoria(rec: dict, historico=None):
     (usa 'decisao'/'motivo', não 'entidades'), então tem apresentação própria.
     É aqui que um processo NÃO APTO fica visível na consulta.
     """
-    print(_titulo("\n┌─ AUDITORIA — Classificação (todas as decisões)"))
+    print(_titulo("\n┌─ AUDITORIA — Triagem/extração (todos os processos)"))
     print(_dim(f"│  fonte: {rec.get('_origem_arquivo','?')}"))
     print("│")
-    print(_linha("Decisão",             _fmt_decisao(rec.get("decisao"))))
-    print(_linha("Motivo",              rec.get("motivo")))
-    print(_linha("Fonte da decisão",    rec.get("fonte_decisao")))
-    print(_linha("Classificado em",     rec.get("classificado_em")))
+    # v8.0: registro de EXTRAÇÃO (sem 'decisao'). Versões antigas traziam decisão.
+    if rec.get("decisao"):
+        print(_linha("Decisão",          _fmt_decisao(rec.get("decisao"))))
+        print(_linha("Motivo",           rec.get("motivo")))
+        print(_linha("Fonte da decisão", rec.get("fonte_decisao")))
+    else:
+        print(_dim("│  (registro de extração — Agente 1 v8.0 não emite APTO/NÃO APTO)"))
+        if rec.get("extincao"):
+            print(_linha("Sinal extinção",     rec.get("extincao")))
+        if rec.get("parcelamento"):
+            print(_linha("Sinal parcelamento", rec.get("parcelamento")))
+        if rec.get("suspensao_art40_lef"):
+            print(_linha("Sinal art.40 LEF",   rec.get("suspensao_art40_lef")))
+    print(_linha("Registrado em",       rec.get("classificado_em") or rec.get("extraido_em")))
     print(_linha("Executado",           rec.get("nome_executado")))
     print(_linha("CPF/CNPJ",            rec.get("cpf_cnpj")))
     print(_linha("Status citação",      rec.get("status_citacao")))

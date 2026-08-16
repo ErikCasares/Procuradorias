@@ -393,6 +393,18 @@ _XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 # regerado do histórico inteiro a cada lote, então traz também os lotes anteriores.
 _XLSX_AGENTE2 = "historial_agente2.xlsx"
 
+# O Agente 1 (agente1.py v8.0) grava o JSON de interface com nome COM TIMESTAMP
+# ('saida_agente1_V8_AAAA-MM-DD_HHhMM.json'), não mais com nome fixo. Como cada
+# lote tem sua pasta json/ isolada, há no máximo um por pasta; pegamos o mais
+# recente por segurança.
+_GLOB_JSON_AGENTE1 = "saida_agente1_*.json"
+
+
+def _achar_json_agente1(pasta_json: Path):
+    """Caminho do JSON de traspasse do Agente 1 nesta pasta, ou None."""
+    achados = sorted(pasta_json.glob(_GLOB_JSON_AGENTE1))
+    return achados[-1] if achados else None
+
 
 def _arquivos_do_lote(lote: dict) -> dict:
     """
@@ -410,8 +422,8 @@ def _arquivos_do_lote(lote: dict) -> dict:
         if p.exists():
             mapa["agente1_planilha"] = (p, f"lote_{lid}_agente1.xlsx", _XLSX)
 
-    p = d / "json" / "resultados_procesosV7_1_agente2.json"
-    if p.exists():
+    p = _achar_json_agente1(d / "json")
+    if p and p.exists():
         mapa["agente1_json"] = (p, f"lote_{lid}_agente1.json", "application/json")
 
     p = PASTA_JSON / f"lote_{lid}_agente2_resultado.json"
@@ -473,11 +485,15 @@ def _publico(lote: dict, incluir_log=False, incluir_analises=False) -> dict:
 # DIAGNÓSTICO DO DESFECHO
 # ════════════════════════════════════════════════════════════════
 #
-# O promptV7.1.py trata OCR quebrado e erro de API internamente e ainda assim
-# encerra com código 0 — um lote pode "terminar bem" tendo classificado zero
-# processos. Sem isto o consumidor recebe status de sucesso e planilha vazia.
+# O agente1.py trata OCR quebrado internamente e ainda assim encerra com código
+# 0 — um lote pode "terminar bem" tendo extraído zero processos. Sem isto o
+# consumidor recebe status de sucesso e planilha vazia.
+#
+# [v8.0] O Agente 1 não classifica mais (sem APTO/NÃO APTO) e não chama LLM.
+# A linha de resumo mudou de "N APTO(s) de M procesados" para
+# "N processo(s) exportado(s) (todos, sem filtro)".
 
-_RE_RESUMO = re.compile(r"(\d+)\s+processo\(s\)\s+APTO\(s\)\s+de\s+(\d+)\s+procesados")
+_RE_RESUMO = re.compile(r"(\d+)\s+processo\(s\)\s+exportado\(s\)")
 
 _SINTOMAS = (
     (("poppler",),             "Poppler indisponível — o OCR não conseguiu renderizar as páginas escaneadas"),
@@ -499,12 +515,12 @@ def _diagnosticar(linhas: list) -> tuple:
     resumo = None
     m = _RE_RESUMO.search(texto)
     if m:
-        resumo = f"{m.group(1)} de {m.group(2)} processo(s) classificados como APTO"
+        resumo = f"{m.group(1)} processo(s) extraído(s) pelo Agente 1"
 
     avisos = [msg for gatilhos, msg in _SINTOMAS
               if any(g.lower() in baixo for g in gatilhos)]
-    if m and m.group(1) == "0" and int(m.group(2)) > 0:
-        avisos.insert(0, "Nenhum processo foi classificado como APTO — o resultado sairá vazio")
+    if m and m.group(1) == "0":
+        avisos.insert(0, "O Agente 1 não extraiu nenhum processo — o resultado sairá vazio")
 
     return resumo, avisos
 
@@ -547,27 +563,32 @@ async def _processar_lote(lote: dict):
     try:
         # ── Agente 1 — pastas isoladas deste lote ──
         rc = await _executar(
-            [sys.executable, "promptV7.1.py"],
+            [sys.executable, "agente1.py"],
             {
                 "PASTA_ENTRADA"   : str(entrada),
                 "PASTA_JSON"      : str(saida_json),
                 "PASTA_RESULTADOS": str(saida_result),
             },
             lote,
-            "Agente 1 — extração, OCR e classificação",
+            # v8.0: o Agente 1 só extrai (não emite mais APTO/NÃO APTO).
+            "Agente 1 — extração e OCR",
         )
         if rc != 0:
             raise RuntimeError(f"Agente 1 encerrou com código {rc}")
 
-        traspasse = saida_json / "resultados_procesosV7_1_agente2.json"
-        if not traspasse.exists():
-            raise RuntimeError("O Agente 1 não gerou o JSON de traspasse")
+        traspasse = _achar_json_agente1(saida_json)
+        if not traspasse or not traspasse.exists():
+            raise RuntimeError("O Agente 1 não gerou o JSON de traspasse (saida_agente1_*.json)")
         # ── [V7.2] Auditoria — anexa as classificações do lote ao histórico compartilhado ──
         # O Agente 1 grava um JSONL na sua pasta ISOLADA (saida_json); aqui anexamos
         # ao arquivo COMPARTILHADO (PASTA_JSON), que acumula TODAS as decisões —
         # inclusive NÃO APTO — entre lotes. Append-only. Falha aqui não derruba o lote.
         try:
-            audit_lote = saida_json / "historial_classificacoes.jsonl"
+            # agente1.py v8.0 renomeou o arquivo de auditoria para
+            # 'historico_extracoes.jsonl' (antes 'historial_classificacoes.jsonl').
+            # O acumulador COMPARTILHADO abaixo mantém o nome antigo, para não
+            # quebrar buscar_processo.py nem os dados já acumulados.
+            audit_lote = saida_json / "historico_extracoes.jsonl"
             if audit_lote.exists():
                 PASTA_JSON.mkdir(parents=True, exist_ok=True)
                 destino = PASTA_JSON / "historial_classificacoes.jsonl"
@@ -579,7 +600,7 @@ async def _processar_lote(lote: dict):
                 )
             else:
                 lote["log"].append(
-                    f"{_agora()}  AVISO: Agente 1 não gerou historial_classificacoes.jsonl"
+                    f"{_agora()}  AVISO: Agente 1 não gerou historico_extracoes.jsonl"
                 )
         except Exception as e:
             lote["log"].append(f"{_agora()}  ERRO ao anexar auditoria: {e}")
@@ -764,9 +785,11 @@ class TriagemAgente1(BaseModel):
     entidades      : EntidadesProcesso | None = None
     decisao_agente1: str | None = Field(
         None,
-        description="APTO ou NÃO APTO. Na prática vem sempre APTO: o processo "
-                    "reprovado na triagem não entra no resultado.",
-        examples=["APTO"],
+        description="LEGADO. A partir do Agente 1 v8.0 este campo não é mais "
+                    "preenchido (o Agente 1 deixou de emitir APTO/NÃO APTO e passou "
+                    "a apenas extrair). Fica como null em lotes novos; pode conter "
+                    "'APTO' em registros gerados por versões anteriores.",
+        examples=[None],
     )
     motivo_agente1     : str | None = None
     status_citacao     : str | None = None
