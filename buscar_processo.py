@@ -1,5 +1,5 @@
 """
-BUSCAR PROCESSO v2 — consulta por número CNJ
+BUSCAR PROCESSO v3 — consulta por número CNJ (vista consolidada, sem duplicados)
 HERA Tecnologia / PGMS
 
 Lê os arquivos JSON da pasta JSON/ e mostra as informações de um processo
@@ -50,6 +50,12 @@ PASTA_JSON        = os.path.join(CURRENT_DIR, "JSON")
 SUFIJO_A1         = "_agente2.json"                  # JSON do Agente 1 (não confundir com _resultado)
 HISTORIAL_A2      = "historial_agente2.jsonl"
 HISTORIAL_CLASSIF = "historial_classificacoes.jsonl"  # [v2] auditoria V7.2 — TODAS as decisões
+# [v3.1] O Agente 1 real grava a auditoria com OUTRO nome. Lemos os dois para
+#        não perder o histórico já existente. Ordem: nomes conhecidos da auditoria.
+HISTORIAL_CLASSIF_ALIASES = [
+    "historial_classificacoes.jsonl",   # nome esperado pela busca (v2)
+    "historico_extracoes.jsonl",        # nome real gravado pelo Agente 1 (v8)
+]
 
 
 # ── Utilidades ────────────────────────────────────────────────────
@@ -149,23 +155,30 @@ def _buscar_em_historial_classificacoes(pasta: str, numero_norm: str):
     O 'mais recente' representa o estado vigente; o histórico completo é o que
     dá valor de auditoria (mostra a evolução da decisão).
     """
-    caminho = os.path.join(pasta, HISTORIAL_CLASSIF)
-    if not os.path.exists(caminho):
+    # [v3.1] Ler TODOS os aliases conhecidos da auditoria e unir os registros.
+    #        Assim funciona tanto com o histórico já existente ("historico_
+    #        extracoes.jsonl") quanto com o nome esperado ("historial_
+    #        classificacoes.jsonl"), sem perder dados.
+    caminhos = [os.path.join(pasta, nome) for nome in HISTORIAL_CLASSIF_ALIASES]
+    caminhos = [c for c in caminhos if os.path.exists(c)]
+    if not caminhos:
         return None, []
 
     historico = []
-    with open(caminho, encoding="utf-8") as f:
-        for linha in f:
-            linha = linha.strip()
-            if not linha:
-                continue
-            try:
-                rec = json.loads(linha)
-            except json.JSONDecodeError:
-                # Linha corrompida no histórico — pula, não derruba a busca
-                continue
-            if _normalizar_numero(rec.get("numero_processo")) == numero_norm:
-                historico.append(rec)
+    for caminho in caminhos:
+        with open(caminho, encoding="utf-8") as f:
+            for linha in f:
+                linha = linha.strip()
+                if not linha:
+                    continue
+                try:
+                    rec = json.loads(linha)
+                except json.JSONDecodeError:
+                    # Linha corrompida no histórico — pula, não derruba a busca
+                    continue
+                if _normalizar_numero(rec.get("numero_processo")) == numero_norm:
+                    rec["_origem_auditoria"] = os.path.basename(caminho)
+                    historico.append(rec)
 
     if not historico:
         return None, []
@@ -193,6 +206,61 @@ def _agente1_desde_historial(rec: dict):
         proc["decisao_agente1"] = ""
     proc["_origem_arquivo"] = "historial_agente2.jsonl (dados do Agente 1 arrastados)"
     return proc
+
+
+# ── Consolidação (v3) ─────────────────────────────────────────────
+
+# Ordem de precedência das fontes para o bloco de IDENTIDADE/ENTIDADES.
+# O JSON do Agente 1 é a fonte primária; o snapshot arrastado pelo Agente 2
+# e a auditoria são fallbacks quando o JSON do Agente 1 já foi sobrescrito.
+def _entidades_consolidadas(proc_a1, rec_a2, auditoria):
+    """
+    [v3] Junta as três fontes num ÚNICO bloco de identidade/entidades, sem
+    repetir. Precedência: JSON Agente 1 → snapshot do Agente 2 → auditoria.
+    Cada campo é preenchido pela primeira fonte que o tiver.
+    Devolve um dict plano com os campos de identidade do processo.
+    """
+    ent_a1    = (proc_a1 or {}).get("entidades") or {}
+    snap_a2   = (rec_a2 or {}).get("agente1") or {}   # snapshot arrastado pelo A2
+    ent_a2    = snap_a2.get("entidades") or {}
+    aud       = auditoria or {}
+
+    def pick(*vals):
+        for v in vals:
+            if v is not None and str(v).strip() != "":
+                return v
+        return None
+
+    return {
+        "numero_processo" : pick(ent_a1.get("numero_processo"),
+                                 ent_a2.get("numero_processo"),
+                                 aud.get("numero_processo")),
+        "nome_executado"  : pick(ent_a1.get("nome_executado"),
+                                 ent_a2.get("nome_executado"),
+                                 aud.get("nome_executado")),
+        "nome_exequente"  : pick(ent_a1.get("nome_exequente"),
+                                 ent_a2.get("nome_exequente")),
+        "cpf_cnpj"        : pick(ent_a1.get("cpf_cnpj"),
+                                 ent_a2.get("cpf_cnpj"),
+                                 aud.get("cpf_cnpj")),
+        "tipo_tributo"    : pick(ent_a1.get("tipo_tributo"), ent_a2.get("tipo_tributo")),
+        "exercicio"       : pick(ent_a1.get("exercicio"), ent_a2.get("exercicio")),
+        "numero_cda"      : pick(ent_a1.get("numero_cda"), ent_a2.get("numero_cda")),
+        "data_inscricao"  : pick(ent_a1.get("data_inscricao"), ent_a2.get("data_inscricao")),
+        "valor_original"  : pick(ent_a1.get("valor_original"), ent_a2.get("valor_original")),
+        "valor_atualizado": pick(ent_a1.get("valor_atualizado"), ent_a2.get("valor_atualizado")),
+        "vara"            : pick(ent_a1.get("vara"), ent_a2.get("vara")),
+        # Estado processual: JSON A1 → snapshot A2 [v0.3-B] → auditoria
+        "status_citacao"     : pick((proc_a1 or {}).get("status_citacao"),
+                                    snap_a2.get("status_citacao"),
+                                    aud.get("status_citacao")),
+        "resultado_penhora"  : pick((proc_a1 or {}).get("resultado_penhora"),
+                                    snap_a2.get("resultado_penhora"),
+                                    aud.get("resultado_penhora")),
+        "ultima_movimentacao": pick((proc_a1 or {}).get("ultima_movimentacao"),
+                                    snap_a2.get("ultima_movimentacao"),
+                                    aud.get("ultima_movimentacao")),
+    }
 
 
 # ── Apresentação ──────────────────────────────────────────────────
@@ -344,6 +412,104 @@ def _mostrar_agente2(rec: dict):
     print(_linha("Origem (lote)",    rec.get("origem_lote")))
 
 
+def _mostrar_identidade(ident: dict):
+    """
+    [v3] Bloco ÚNICO com a identidade e os dados do processo. Substitui a
+    repetição de 'entidades' que antes aparecia em Agente 1, Agente 2 e
+    Auditoria. Aqui cada campo é mostrado uma só vez.
+    """
+    print(_titulo("\n┌─ PROCESSO — identificação e dados"))
+    print("│")
+    print(_linha("Nº do processo",   ident.get("numero_processo")))
+    print(_linha("Executado",        ident.get("nome_executado")))
+    print(_linha("Exequente",        ident.get("nome_exequente")))
+    print(_linha("CPF/CNPJ",         ident.get("cpf_cnpj")))
+    print(_linha("Tipo de tributo",  ident.get("tipo_tributo")))
+    print(_linha("Exercício",        ident.get("exercicio")))
+    print(_linha("Nº CDA",           ident.get("numero_cda")))
+    print(_linha("Data inscrição",   ident.get("data_inscricao")))
+    print(_linha("Valor original",   ident.get("valor_original")))
+    print(_linha("Valor atualizado", ident.get("valor_atualizado")))
+    print(_linha("Vara",             ident.get("vara")))
+    print("│")
+    print(_linha("Status citação",      ident.get("status_citacao")))
+    print(_linha("Resultado penhora",   ident.get("resultado_penhora")))
+    print(_linha("Última movimentação", ident.get("ultima_movimentacao")))
+
+
+def _mostrar_agente1_triagem(proc_a1, auditoria):
+    """
+    [v3] Só o que é PRÓPRIO da triagem do Agente 1 — decisão (versões v7),
+    sinais processuais (v8) e confiança OCR. NÃO repete entidades nem estado
+    processual (isso já saiu no bloco de identidade).
+    """
+    proc = proc_a1 or {}
+    aud  = auditoria or {}
+
+    # Fonte dos dados de triagem: preferir o JSON/snapshot do Agente 1; se não
+    # houver, cair na auditoria (registro de extração v8).
+    decisao = (proc.get("decisao_agente1") or aud.get("decisao") or "").strip()
+    motivo  = proc.get("motivo_agente1") or aud.get("motivo")
+    sinais  = proc.get("sinais_processuais") or {
+        "extincao"           : aud.get("extincao"),
+        "parcelamento"       : aud.get("parcelamento"),
+        "suspensao_art40_lef": aud.get("suspensao_art40_lef"),
+    }
+    conf = (proc.get("ocr") or {}).get("confianca_media")
+    if conf is None:
+        conf = proc.get("confianca_ocr_media")
+
+    tem_algo = decisao or any(sinais.values()) or conf is not None
+    if not tem_algo:
+        return
+
+    print(_titulo("\n┌─ AGENTE 1 — Triagem"))
+    print("│")
+    if decisao:
+        print(_linha("Decisão Agente 1", _fmt_decisao(decisao)))
+        if motivo:
+            print(_linha("Motivo", motivo))
+    else:
+        print(_dim("│  (registro de extração v8 — Agente 1 não emite APTO/NÃO APTO)"))
+    if sinais.get("extincao"):
+        print(_linha("Sinal extinção", sinais.get("extincao")))
+    if sinais.get("parcelamento"):
+        print(_linha("Sinal parcelamento", sinais.get("parcelamento")))
+    if sinais.get("suspensao_art40_lef"):
+        print(_linha("Sinal art.40 LEF", sinais.get("suspensao_art40_lef")))
+    if conf is not None:
+        print(_linha("Confiança OCR", f"{conf}%"))
+
+
+def _mostrar_historico_auditoria(historico: list):
+    """
+    [v3] Histórico COMPLETO da auditoria (append-only). Mostra a evolução das
+    decisões/extrações do mais antigo ao mais recente. Não repete entidades —
+    só o eixo temporal (quando, decisão/estado, motivo).
+    """
+    def _quando(h):
+        return h.get("classificado_em") or h.get("extraido_em") or ""
+
+    ordenado = sorted(historico, key=_quando)
+    print(_titulo("\n┌─ AUDITORIA — histórico de registros"))
+    print(_dim(f"│  {len(ordenado)} registro(s) — append-only, do mais antigo ao mais recente"))
+    print("│")
+    for h in ordenado:
+        quando = _quando(h) or "—"
+        dec    = h.get("decisao")
+        if dec:
+            estado = _fmt_decisao(dec)
+            mot    = h.get("motivo") or ""
+            sufixo = f"  —  {mot}" if mot else ""
+        else:
+            # registro de extração v8 (sem decisão): mostrar sinais se houver
+            sinais = [k for k in ("extincao","parcelamento","suspensao_art40_lef") if h.get(k)]
+            estado = _dim("extração") + (f"  [{', '.join(sinais)}]" if sinais else "")
+            sufixo = ""
+        lote = h.get("id_lote") or ""
+        print(f"    • {_dim(quando)}  {estado}{sufixo}  {_dim(lote)}")
+
+
 # ── Fluxo principal ───────────────────────────────────────────────
 
 def buscar_dados(
@@ -462,31 +628,34 @@ def main():
 
     print(_ok(f"\n═══ Processo {numero} encontrado ═══"))
 
-    # Agente 1 — dados extraídos (só existe para APTO, ou reconstruído do histórico do A2)
-    if proc_a1:
-        _mostrar_agente1(proc_a1)
-    else:
-        proc_a1_hist = _agente1_desde_historial(rec_a2) if rec_a2 else None
-        if proc_a1_hist:
-            _mostrar_agente1(proc_a1_hist)
-        elif not auditoria:
-            print(_dim("\n(sem registro no JSON do Agente 1)"))
+    # [v3] Reconstruir a visão do Agente 1 a partir do snapshot, se o JSON
+    #      do Agente 1 já não estiver em disco.
+    if not proc_a1 and rec_a2:
+        proc_a1 = _agente1_desde_historial(rec_a2)
 
-    # [v2] Auditoria — é aqui que o NÃO APTO fica visível
-    if auditoria:
-        _mostrar_auditoria(auditoria, auditoria_hist)
+    # [v3] BLOCO ÚNICO de identidade/entidades — consolidado das três fontes.
+    #      Cada dado aparece UMA vez; nada de entidades repetidas por agente.
+    ident = _entidades_consolidadas(proc_a1, rec_a2, auditoria)
+    _mostrar_identidade(ident)
 
-    # Agente 2 — análise jurídico-fiscal (só para APTO)
+    # Agente 1 — só o que é PRÓPRIO da triagem (sem repetir entidades)
+    _mostrar_agente1_triagem(proc_a1, auditoria)
+
+    # Agente 2 — análise jurídico-fiscal (só o que é próprio da análise)
     if rec_a2:
         _mostrar_agente2(rec_a2)
     else:
-        dec = (auditoria or {}).get("decisao", "").upper()
+        dec = ((auditoria or {}).get("decisao") or "").upper()
         if dec and "APTO" in dec and "NÃO" not in dec and "NAO" not in dec:
-            print(_dim("\n(sem análise do Agente 2 — o Agente 2 ainda não processou este processo)"))
+            print(_dim("\n(sem análise do Agente 2 — ainda não processado)"))
         elif dec:
-            print(_dim("\n(sem análise do Agente 2 — processo não é APTO na triagem, comportamento esperado)"))
+            print(_dim("\n(sem análise do Agente 2 — processo não é APTO na triagem, esperado)"))
         else:
             print(_dim("\n(sem análise do Agente 2)"))
+
+    # Auditoria — histórico COMPLETO sempre (append-only, valor de auditoria)
+    if auditoria_hist:
+        _mostrar_historico_auditoria(auditoria_hist)
 
     print()
 
