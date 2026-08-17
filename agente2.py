@@ -77,7 +77,7 @@ INTERVALO_WATCH   = 10                          # segundos entre chequeos del wa
 LIMIAR_PRIORIDADE_ALTA  = float(os.environ.get("LIMIAR_PRIORIDADE_ALTA",  "5000"))
 LIMIAR_PRIORIDADE_MEDIA = float(os.environ.get("LIMIAR_PRIORIDADE_MEDIA", "1000"))
 
-VERSION_AGENTE2 = "0.3-placeholder"
+VERSION_AGENTE2 = "0.2-placeholder"
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -171,13 +171,7 @@ def _escribir_historial(path_jsonl: str, resultados: list, origen: str):
     vistos     = set()             # numero_processo já vistos nesta corrida
  
     for r in resultados:
-        # [v0.3] nome_executado ya no viene suelto en el registro; leerlo del
-        #        snapshot del Agente 1 (agente1.entidades) para el Excel/busca.
-        _ent = ((r.get("agente1") or {}).get("entidades")) or {}
-        nome_exec = _ent.get("nome_executado")
-        np = (r.get("entidades") or {}).get("numero_processo") \
-             or r.get("numero_processo") \
-             or _ent.get("numero_processo")
+        np = (r.get("entidades") or {}).get("numero_processo") or r.get("numero_processo")
         if not np:
             log.warning(
                 f"  Processo sem numero_processo — agregado sem deduplicar: "
@@ -191,7 +185,7 @@ def _escribir_historial(path_jsonl: str, resultados: list, origen: str):
         registro = {
             "numero_processo" : np,
             "id_lote"         : r.get("id_lote"),
-            "nome_executado"  : nome_exec,   # [v0.3] derivado de agente1.entidades
+            "nome_executado"  : r.get("nome_executado"),
             "agente1"         : r.get("agente1"),
             "vez_analisada"   : vez,
             "analise"         : r.get("analise", {}),
@@ -284,27 +278,14 @@ def analisar_processo(processo: dict) -> dict:
     # Snapshot dos dados do Agente 1 — arrastado ao historial para que a
     # busca mostre a triagem/entidades mesmo se o JSON do Agente 1 já tiver
     # sido sobrescrito por uma corrida posterior.
-    #
-    # [v0.3] Adelgazado: status_citacao / resultado_penhora / ultima_movimentacao
-    #        / confianca_ocr_media NÃO se copiam mais aqui — já vivem dentro de
-    #        'entidades' e/ou no registro de auditoria (historial_classificacoes).
-    #        Guardá-los em triplicata inflava o JSON e a vista do procurador.
-    #        A camada de apresentação (buscar_processo v3) lê esses campos de
-    #        'entidades'; se algum vier fora de 'entidades' no futuro, adicioná-lo
-    #        de volta AQUI e em UM só lugar.
     snapshot_a1 = {
-        "decisao_agente1"     : decisao,
-        "motivo_agente1"      : motivo or None,
-        "sinais_processuais"  : processo.get("sinais_processuais"),
-        # [v0.3-B] Estado processual re-incluído no snapshot para que a busca
-        #          mostre esses campos MESMO sem o registro de auditoria em
-        #          disco. Ficam UMA vez aqui (não em triplicata como na v0.2).
-        #          >>> AVALIAR: se a auditoria estiver sempre presente, estes
-        #          três podem sair (voltar ao caso A). <<<
-        "status_citacao"      : processo.get("status_citacao"),
-        "resultado_penhora"   : processo.get("resultado_penhora"),
-        "ultima_movimentacao" : processo.get("ultima_movimentacao"),
-        "entidades"           : ent,
+        "decisao_agente1"    : decisao,
+        "motivo_agente1"     : motivo or None,
+        "status_citacao"     : processo.get("status_citacao"),
+        "resultado_penhora"  : processo.get("resultado_penhora"),
+        "ultima_movimentacao": processo.get("ultima_movimentacao"),
+        "confianca_ocr_media": processo.get("confianca_ocr_media"),
+        "entidades"          : ent,
     }
 
     # [7.x] Só processos APTO recebem análise jurídico-fiscal completa.
@@ -314,7 +295,8 @@ def analisar_processo(processo: dict) -> dict:
     if decisao.upper() != "APTO":
         return {
             "id_lote"         : processo.get("id_lote"),
-            "numero_processo" : ent.get("numero_processo"),   # clave de dedup — obligatoria
+            "numero_processo" : ent.get("numero_processo"),
+            "nome_executado"  : ent.get("nome_executado"),
             "agente1"         : snapshot_a1,
             "analise": {
                 "status_triagem"    : decisao or "SEM DECISÃO",
@@ -353,7 +335,8 @@ def analisar_processo(processo: dict) -> dict:
 
     return {
         "id_lote"          : processo.get("id_lote"),
-        "numero_processo"  : ent.get("numero_processo"),   # clave de dedup — obligatoria
+        "numero_processo"  : ent.get("numero_processo"),
+        "nome_executado"   : ent.get("nome_executado"),
         "agente1"          : snapshot_a1,
         "analise": {
             "prioridade"        : prioridad,
@@ -534,7 +517,7 @@ def processar_lote(path_json: str):
             _acao = analise.get("acao_recomendada") or "—"
             log.info(
                 f"  [{_prio}] "
-                f"{((resultado.get('agente1') or {}).get('entidades') or {}).get('nome_executado','—')} — "
+                f"{resultado.get('nome_executado','—')} — "
                 f"{_acao[:55]}"
             )
         except Exception as e:
