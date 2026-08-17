@@ -1,4 +1,4 @@
-"""
+""" VERSÃO 1.0 
 API e painel — Triagem de Execuções Fiscais
 HERA Tecnologia / PGMS — Contrato nº 01/2026
 
