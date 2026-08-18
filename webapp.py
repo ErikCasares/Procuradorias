@@ -529,6 +529,55 @@ def _diagnosticar(linhas: list) -> tuple:
 # PIPELINE
 # ════════════════════════════════════════════════════════════════
 
+# ── [v2] Tradução de código de saída para mensagem que o procurador entende ──
+#
+# Quando o processo é morto por um SINAL do sistema operacional, o returncode
+# vem NEGATIVO (-N = sinal N). O caso mais comum aqui é o -9 (SIGKILL), que o
+# kernel dispara quando a máquina fica sem memória (OOM killer) durante o OCR.
+# Isso NÃO deixa rastro no log (SIGKILL não é uma exceção de Python capturável),
+# então o diagnóstico por texto (_SINTOMAS) não pega — é preciso ler o código.
+_SINAIS_CONHECIDOS = {
+    9:  ("Memória insuficiente durante o processamento — vale a pena TENTAR DE NOVO",
+         "O servidor ficou temporariamente sem memória ao processar este lote "
+         "(o OCR de PDFs escaneados com muitas páginas é o que mais consome). O "
+         "sistema encerrou o Agente 1 para se proteger. NENHUM dado foi "
+         "corrompido e nada do que já rodou foi perdido.\n\n"
+         "IMPORTANTE: este erro é INTERMITENTE — depende da memória livre do "
+         "servidor NAQUELE momento. O MESMO lote costuma funcionar numa segunda "
+         "tentativa, quando há mais memória disponível. Recomendação:\n"
+         "  1) Reenvie o lote — muitas vezes passa na 2ª tentativa.\n"
+         "  2) Se falhar de novo, divida em lotes menores.\n"
+         "  3) Se um único PDF falhar sozinho, ele tem páginas digitalizadas "
+         "demais: reenvie-o isolado; o sistema vai avisar se precisar pulá-lo.\n"
+         "Se persistir, avise o suporte técnico (ajuste de OCR_MAX_WORKERS / OCR_DPI)."),
+    15: ("Processamento interrompido",
+         "O Agente 1 foi encerrado pelo sistema (SIGTERM) antes de terminar — "
+         "geralmente um tempo-limite ou reinício do servidor. Tente reenviar o lote."),
+    11: ("Falha interna no processamento",
+         "O Agente 1 encerrou de forma anormal (falha de segmentação) ao ler "
+         "algum PDF. Avise o suporte técnico com o número do lote."),
+}
+
+
+def _explicar_codigo_saida(rc: int) -> str:
+    """
+    [v2] Devolve uma frase clara para o procurador a partir do returncode do
+    Agente 1. rc negativo = morto por sinal (|rc| = número do sinal).
+    """
+    if rc >= 0:
+        # Saída normal com código de erro (não por sinal).
+        return (f"O Agente 1 terminou com erro (código {rc}). "
+                f"Consulte o log do lote para o detalhe técnico.")
+    sinal = -rc
+    titulo, detalhe = _SINAIS_CONHECIDOS.get(
+        sinal,
+        (f"Processamento interrompido (sinal {sinal})",
+         "O Agente 1 foi encerrado pelo sistema operacional. "
+         "Consulte o log do lote ou avise o suporte técnico."),
+    )
+    return f"{titulo}. {detalhe}"
+
+
 async def _executar(cmd: list, ambiente: dict, lote: dict, etapa: str) -> int:
     lote["etapa"] = etapa
     lote["log"].append(f"{_agora()}  ── {etapa} ──")
@@ -574,7 +623,8 @@ async def _processar_lote(lote: dict):
             "Agente 1 — extração e OCR",
         )
         if rc != 0:
-            raise RuntimeError(f"Agente 1 encerrou com código {rc}")
+            # [v2] Mensagem legível para o procurador em vez do cru "código -9".
+            raise RuntimeError(_explicar_codigo_saida(rc))
 
         traspasse = _achar_json_agente1(saida_json)
         if not traspasse or not traspasse.exists():
