@@ -1624,7 +1624,9 @@ async def consultar_processo(
             or ((auditoria or {}).get("atual") or {}).get("numero_processo")
             or numero
         ),
-        "data": a2,
+        "encontrado_em": fontes,
+        "agente1": a1,
+        "agente2": a2,
         "auditoria": auditoria,
     }
 
