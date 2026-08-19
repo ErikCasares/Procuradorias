@@ -393,6 +393,18 @@ _XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 # regerado do histórico inteiro a cada lote, então traz também os lotes anteriores.
 _XLSX_AGENTE2 = "historial_agente2.xlsx"
 
+# O Agente 1 (agente1.py v8.0) grava o JSON de interface com nome COM TIMESTAMP
+# ('saida_agente1_V8_AAAA-MM-DD_HHhMM.json'), não mais com nome fixo. Como cada
+# lote tem sua pasta json/ isolada, há no máximo um por pasta; pegamos o mais
+# recente por segurança.
+_GLOB_JSON_AGENTE1 = "saida_agente1_*.json"
+
+
+def _achar_json_agente1(pasta_json: Path):
+    """Caminho do JSON de traspasse do Agente 1 nesta pasta, ou None."""
+    achados = sorted(pasta_json.glob(_GLOB_JSON_AGENTE1))
+    return achados[-1] if achados else None
+
 
 def _arquivos_do_lote(lote: dict) -> dict:
     """
@@ -410,8 +422,8 @@ def _arquivos_do_lote(lote: dict) -> dict:
         if p.exists():
             mapa["agente1_planilha"] = (p, f"lote_{lid}_agente1.xlsx", _XLSX)
 
-    p = d / "json" / "resultados_procesosV7_1_agente2.json"
-    if p.exists():
+    p = _achar_json_agente1(d / "json")
+    if p and p.exists():
         mapa["agente1_json"] = (p, f"lote_{lid}_agente1.json", "application/json")
 
     p = PASTA_JSON / f"lote_{lid}_agente2_resultado.json"
@@ -473,11 +485,15 @@ def _publico(lote: dict, incluir_log=False, incluir_analises=False) -> dict:
 # DIAGNÓSTICO DO DESFECHO
 # ════════════════════════════════════════════════════════════════
 #
-# O promptV7.1.py trata OCR quebrado e erro de API internamente e ainda assim
-# encerra com código 0 — um lote pode "terminar bem" tendo classificado zero
-# processos. Sem isto o consumidor recebe status de sucesso e planilha vazia.
+# O agente1.py trata OCR quebrado internamente e ainda assim encerra com código
+# 0 — um lote pode "terminar bem" tendo extraído zero processos. Sem isto o
+# consumidor recebe status de sucesso e planilha vazia.
+#
+# [v8.0] O Agente 1 não classifica mais (sem APTO/NÃO APTO) e não chama LLM.
+# A linha de resumo mudou de "N APTO(s) de M procesados" para
+# "N processo(s) exportado(s) (todos, sem filtro)".
 
-_RE_RESUMO = re.compile(r"(\d+)\s+processo\(s\)\s+APTO\(s\)\s+de\s+(\d+)\s+procesados")
+_RE_RESUMO = re.compile(r"(\d+)\s+processo\(s\)\s+exportado\(s\)")
 
 _SINTOMAS = (
     (("poppler",),             "Poppler indisponível — o OCR não conseguiu renderizar as páginas escaneadas"),
@@ -499,12 +515,12 @@ def _diagnosticar(linhas: list) -> tuple:
     resumo = None
     m = _RE_RESUMO.search(texto)
     if m:
-        resumo = f"{m.group(1)} de {m.group(2)} processo(s) classificados como APTO"
+        resumo = f"{m.group(1)} processo(s) extraído(s) pelo Agente 1"
 
     avisos = [msg for gatilhos, msg in _SINTOMAS
               if any(g.lower() in baixo for g in gatilhos)]
-    if m and m.group(1) == "0" and int(m.group(2)) > 0:
-        avisos.insert(0, "Nenhum processo foi classificado como APTO — o resultado sairá vazio")
+    if m and m.group(1) == "0":
+        avisos.insert(0, "O Agente 1 não extraiu nenhum processo — o resultado sairá vazio")
 
     return resumo, avisos
 
@@ -512,6 +528,55 @@ def _diagnosticar(linhas: list) -> tuple:
 # ════════════════════════════════════════════════════════════════
 # PIPELINE
 # ════════════════════════════════════════════════════════════════
+
+# ── [v2] Tradução de código de saída para mensagem que o procurador entende ──
+#
+# Quando o processo é morto por um SINAL do sistema operacional, o returncode
+# vem NEGATIVO (-N = sinal N). O caso mais comum aqui é o -9 (SIGKILL), que o
+# kernel dispara quando a máquina fica sem memória (OOM killer) durante o OCR.
+# Isso NÃO deixa rastro no log (SIGKILL não é uma exceção de Python capturável),
+# então o diagnóstico por texto (_SINTOMAS) não pega — é preciso ler o código.
+_SINAIS_CONHECIDOS = {
+    9:  ("Memória insuficiente durante o processamento — vale a pena TENTAR DE NOVO",
+         "O servidor ficou temporariamente sem memória ao processar este lote "
+         "(o OCR de PDFs escaneados com muitas páginas é o que mais consome). O "
+         "sistema encerrou o Agente 1 para se proteger. NENHUM dado foi "
+         "corrompido e nada do que já rodou foi perdido.\n\n"
+         "IMPORTANTE: este erro é INTERMITENTE — depende da memória livre do "
+         "servidor NAQUELE momento. O MESMO lote costuma funcionar numa segunda "
+         "tentativa, quando há mais memória disponível. Recomendação:\n"
+         "  1) Reenvie o lote — muitas vezes passa na 2ª tentativa.\n"
+         "  2) Se falhar de novo, divida em lotes menores.\n"
+         "  3) Se um único PDF falhar sozinho, ele tem páginas digitalizadas "
+         "demais: reenvie-o isolado; o sistema vai avisar se precisar pulá-lo.\n"
+         "Se persistir, avise o suporte técnico (ajuste de OCR_MAX_WORKERS / OCR_DPI)."),
+    15: ("Processamento interrompido",
+         "O Agente 1 foi encerrado pelo sistema (SIGTERM) antes de terminar — "
+         "geralmente um tempo-limite ou reinício do servidor. Tente reenviar o lote."),
+    11: ("Falha interna no processamento",
+         "O Agente 1 encerrou de forma anormal (falha de segmentação) ao ler "
+         "algum PDF. Avise o suporte técnico com o número do lote."),
+}
+
+
+def _explicar_codigo_saida(rc: int) -> str:
+    """
+    [v2] Devolve uma frase clara para o procurador a partir do returncode do
+    Agente 1. rc negativo = morto por sinal (|rc| = número do sinal).
+    """
+    if rc >= 0:
+        # Saída normal com código de erro (não por sinal).
+        return (f"O Agente 1 terminou com erro (código {rc}). "
+                f"Consulte o log do lote para o detalhe técnico.")
+    sinal = -rc
+    titulo, detalhe = _SINAIS_CONHECIDOS.get(
+        sinal,
+        (f"Processamento interrompido (sinal {sinal})",
+         "O Agente 1 foi encerrado pelo sistema operacional. "
+         "Consulte o log do lote ou avise o suporte técnico."),
+    )
+    return f"{titulo}. {detalhe}"
+
 
 async def _executar(cmd: list, ambiente: dict, lote: dict, etapa: str) -> int:
     lote["etapa"] = etapa
@@ -547,27 +612,33 @@ async def _processar_lote(lote: dict):
     try:
         # ── Agente 1 — pastas isoladas deste lote ──
         rc = await _executar(
-            [sys.executable, "promptV7.1.py"],
+            [sys.executable, "agente1.py"],
             {
                 "PASTA_ENTRADA"   : str(entrada),
                 "PASTA_JSON"      : str(saida_json),
                 "PASTA_RESULTADOS": str(saida_result),
             },
             lote,
-            "Agente 1 — extração, OCR e classificação",
+            # v8.0: o Agente 1 só extrai (não emite mais APTO/NÃO APTO).
+            "Agente 1 — extração e OCR",
         )
         if rc != 0:
-            raise RuntimeError(f"Agente 1 encerrou com código {rc}")
+            # [v2] Mensagem legível para o procurador em vez do cru "código -9".
+            raise RuntimeError(_explicar_codigo_saida(rc))
 
-        traspasse = saida_json / "resultados_procesosV7_1_agente2.json"
-        if not traspasse.exists():
-            raise RuntimeError("O Agente 1 não gerou o JSON de traspasse")
+        traspasse = _achar_json_agente1(saida_json)
+        if not traspasse or not traspasse.exists():
+            raise RuntimeError("O Agente 1 não gerou o JSON de traspasse (saida_agente1_*.json)")
         # ── [V7.2] Auditoria — anexa as classificações do lote ao histórico compartilhado ──
         # O Agente 1 grava um JSONL na sua pasta ISOLADA (saida_json); aqui anexamos
         # ao arquivo COMPARTILHADO (PASTA_JSON), que acumula TODAS as decisões —
         # inclusive NÃO APTO — entre lotes. Append-only. Falha aqui não derruba o lote.
         try:
-            audit_lote = saida_json / "historial_classificacoes.jsonl"
+            # agente1.py v8.0 renomeou o arquivo de auditoria para
+            # 'historico_extracoes.jsonl' (antes 'historial_classificacoes.jsonl').
+            # O acumulador COMPARTILHADO abaixo mantém o nome antigo, para não
+            # quebrar buscar_processo.py nem os dados já acumulados.
+            audit_lote = saida_json / "historico_extracoes.jsonl"
             if audit_lote.exists():
                 PASTA_JSON.mkdir(parents=True, exist_ok=True)
                 destino = PASTA_JSON / "historial_classificacoes.jsonl"
@@ -579,7 +650,7 @@ async def _processar_lote(lote: dict):
                 )
             else:
                 lote["log"].append(
-                    f"{_agora()}  AVISO: Agente 1 não gerou historial_classificacoes.jsonl"
+                    f"{_agora()}  AVISO: Agente 1 não gerou historico_extracoes.jsonl"
                 )
         except Exception as e:
             lote["log"].append(f"{_agora()}  ERRO ao anexar auditoria: {e}")
@@ -764,9 +835,11 @@ class TriagemAgente1(BaseModel):
     entidades      : EntidadesProcesso | None = None
     decisao_agente1: str | None = Field(
         None,
-        description="APTO ou NÃO APTO. Na prática vem sempre APTO: o processo "
-                    "reprovado na triagem não entra no resultado.",
-        examples=["APTO"],
+        description="LEGADO. A partir do Agente 1 v8.0 este campo não é mais "
+                    "preenchido (o Agente 1 deixou de emitir APTO/NÃO APTO e passou "
+                    "a apenas extrair). Fica como null em lotes novos; pode conter "
+                    "'APTO' em registros gerados por versões anteriores.",
+        examples=[None],
     )
     motivo_agente1     : str | None = None
     status_citacao     : str | None = None
