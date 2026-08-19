@@ -6,12 +6,12 @@ Lê os arquivos JSON da pasta JSON/ e mostra as informações de um processo
 específico, buscando pelo número do processo (CNJ).
 
 Procura em TRÊS fontes:
-  1. JSON do Agente 1  → resultados_*_agente2.json     (dados extraídos + decisão — SÓ APTO)
-  2. Histórico Agente 2 → historial_agente2.jsonl       (análise e priorização — SÓ APTO)
-  3. Auditoria (V7.2)  → historial_classificacoes.jsonl (TODAS as decisões, inclusive NÃO APTO)
+  1. JSON do Agente 1  → resultados_*_agente2.json     (dados extraídos — TODOS os processos)
+  2. Histórico Agente 2 → historial_agente2.jsonl       (análise e priorização — TODOS os processos)
+  3. Auditoria (V7.2)  → historial_classificacoes.jsonl (registro de extração/classificação)
 
-  A fonte 3 é a que faz um processo NÃO APTO aparecer nesta consulta. As fontes
-  1 e 2 só contêm processos APTO, por desenho do pipeline.
+  A partir da v8.0 não há triagem APTO/NÃO APTO: as fontes 1 e 2 contêm todos
+  os processos do lote. A fonte 3 permanece como trilha de auditoria.
 
 Uso:
     # Modo interativo — pergunta o número e mostra
@@ -299,9 +299,6 @@ def _mostrar_auditoria(rec: dict, historico=None):
 
 def _mostrar_agente2(rec: dict):
     an = rec.get("analise", {}) or {}
-    print(_titulo("\n┌─ AGENTE 2 — Análise jurídico-fiscal"))
-    print(_dim(f"│  fonte: {rec.get('_origem_arquivo','?')}"))
-    print("│")
 
     total = rec.get("_total_analises")
     if total and total > 1:
@@ -318,12 +315,6 @@ def _mostrar_agente2(rec: dict):
         print("│")
 
     # [7.x] NÃO APTO: mostrar a triagem do Agente 1, não uma priorização.
-    status_triagem = an.get("status_triagem")
-    if status_triagem and status_triagem.upper() != "APTO":
-        print(_linha("Triagem Agente 1", _cor(status_triagem, "1;33")))
-        print(_dim("│  (processo NÃO APTO na triagem — sem análise jurídico-fiscal no Agente 2)"))
-        print("│")
-
     prioridade = an.get("prioridade", "")
     prio_fmt = {
         "ALTA":  _alerta("ALTA"),
@@ -462,7 +453,8 @@ def main():
 
     print(_ok(f"\n═══ Processo {numero} encontrado ═══"))
 
-    # Agente 1 — dados extraídos (só existe para APTO, ou reconstruído do histórico do A2)
+    # Agente 1 — dados extraídos (v8.0: contém TODOS os processos; pode faltar
+    # se o JSON foi sobrescrito, aí reconstrói-se do snapshot do histórico do A2)
     if proc_a1:
         _mostrar_agente1(proc_a1)
     else:
@@ -473,20 +465,17 @@ def main():
             print(_dim("\n(sem registro no JSON do Agente 1)"))
 
     # [v2] Auditoria — é aqui que o NÃO APTO fica visível
-    if auditoria:
-        _mostrar_auditoria(auditoria, auditoria_hist)
 
-    # Agente 2 — análise jurídico-fiscal (só para APTO)
+    # Agente 2 — análise jurídico-fiscal (agora roda para TODOS os processos)
     if rec_a2:
         _mostrar_agente2(rec_a2)
     else:
-        dec = (auditoria or {}).get("decisao", "").upper()
-        if dec and "APTO" in dec and "NÃO" not in dec and "NAO" not in dec:
-            print(_dim("\n(sem análise do Agente 2 — o Agente 2 ainda não processou este processo)"))
-        elif dec:
-            print(_dim("\n(sem análise do Agente 2 — processo não é APTO na triagem, comportamento esperado)"))
-        else:
-            print(_dim("\n(sem análise do Agente 2)"))
+        # v0.3: sem triagem APTO/NÃO APTO. Todo processo do Agente 1 deveria
+        # receber análise do Agente 2. Se não há registro no historial, o
+        # Agente 2 simplesmente ainda não processou este lote — ou o
+        # historial_agente2.jsonl não está na pasta consultada.
+        print(_dim("\n(sem análise do Agente 2 — este processo ainda não foi processado"))
+        print(_dim(f" pelo Agente 2, ou o {HISTORIAL_A2} não está em {args.pasta})"))
 
     print()
 

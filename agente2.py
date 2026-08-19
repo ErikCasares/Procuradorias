@@ -3,8 +3,9 @@ AGENTE 2 — Raciocínio Jurídico-Fiscal
 HERA Tecnologia / PGMS — Contrato nº 01/2026
 
 Responsabilidade:
-    Recebe os processos APTO do Agente 1 via JSON e executa análise
+    Recebe TODOS os processos do Agente 1 via JSON e executa análise
     jurídico-fiscal para priorização de cobrança.
+    (v0.3: sem triagem APTO/NÃO APTO — a análise roda sobre todos.)
 
 Modo de operação:
     File watcher — monitora a pasta de saída do Agente 1 e processa
@@ -77,7 +78,7 @@ INTERVALO_WATCH   = 10                          # segundos entre chequeos del wa
 LIMIAR_PRIORIDADE_ALTA  = float(os.environ.get("LIMIAR_PRIORIDADE_ALTA",  "5000"))
 LIMIAR_PRIORIDADE_MEDIA = float(os.environ.get("LIMIAR_PRIORIDADE_MEDIA", "1000"))
 
-VERSION_AGENTE2 = "0.2-placeholder"
+VERSION_AGENTE2 = "0.3-placeholder"
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -106,7 +107,6 @@ def _ruta_historial(pasta: str) -> str:
     os.makedirs(PASTA_JSON, exist_ok=True)
     return os.path.join(PASTA_JSON, HISTORIAL_JSONL)
 
-
 def _cargar_processos_registrados(path_jsonl: str) -> dict:
     """
     Lee el historial JSONL y devuelve un dict {numero_processo: número_de_línea}.
@@ -129,7 +129,6 @@ def _cargar_processos_registrados(path_jsonl: str) -> dict:
             except json.JSONDecodeError:
                 log.warning(f"Línea {i} corrupta en historial — ignorada")
     return registrados
-
 
 def _escribir_historial(path_jsonl: str, resultados: list, origen: str):
     """
@@ -260,60 +259,46 @@ def _ultimo_estado_por_processo(path_jsonl: str) -> list:
 
 def analisar_processo(processo: dict) -> dict:
     """
-    Analiza un proceso APTO y devuelve recomendaciones jurídico-fiscales.
+    Analisa um processo do Agente 1 e devolve recomendações jurídico-fiscais.
 
-    Input  — dict con la estructura del JSON del Agente 1.
-    Output — dict con análisis, prioridad, acción recomendada y alertas.
+    A partir da v0.3 roda sobre TODOS os processos do Agente 1 — não há mais
+    triagem APTO/NÃO APTO. O esquema de entrada não traz decisao_agente1 nem
+    motivo_agente1; os sinais de estratégia vêm dos próprios campos do
+    processo (status_citacao, resultado_penhora, sinais_processuais).
+
+    Input  — dict com a estrutura do JSON do Agente 1.
+    Output — dict com análise, prioridade, ação recomendada e alertas.
 
     [GEMINI PLACEHOLDER]
     El bloque marcado abajo será reemplazado por la llamada a Gemini
     cuando lleguen las credenciales de SEMIT. La estructura de retorno
     no cambia.
     """
-    ent = processo.get("entidades", {})
+    ent  = processo.get("entidades", {})
+    tipo = processo.get("tipo_processo", {})
+    ocr  = processo.get("ocr", {})
 
-    decisao = (processo.get("decisao_agente1") or "").strip()
-    motivo  = processo.get("motivo_agente1") or ""
+    # OCR: no esquema novo a confiança vem aninhada em ocr.confianca_media
+    # (antes era top-level confianca_ocr_media). Fallback por compatibilidade.
+    confianca_ocr = processo.get("confianca_ocr_media")
+    if confianca_ocr is None:
+        confianca_ocr = ocr.get("confianca_media")
 
     # Snapshot dos dados do Agente 1 — arrastado ao historial para que a
     # busca mostre a triagem/entidades mesmo se o JSON do Agente 1 já tiver
     # sido sobrescrito por uma corrida posterior.
     snapshot_a1 = {
-        "decisao_agente1"    : decisao,
-        "motivo_agente1"     : motivo or None,
+        "tipo_processo"      : tipo or None,
         "status_citacao"     : processo.get("status_citacao"),
         "resultado_penhora"  : processo.get("resultado_penhora"),
+        "sinais_processuais" : processo.get("sinais_processuais", {}),
         "ultima_movimentacao": processo.get("ultima_movimentacao"),
-        "confianca_ocr_media": processo.get("confianca_ocr_media"),
+        "dias_desde_ultima_movimentacao": processo.get("dias_desde_ultima_movimentacao"),
+        "confianca_ocr_media": confianca_ocr,
         "entidades"          : ent,
     }
 
-    # [7.x] Só processos APTO recebem análise jurídico-fiscal completa.
-    #       NÃO APTO / Informação insuficiente / FORA DE ESCOPO: registra-se
-    #       apenas a triagem do Agente 1, SEM rodar priorização/penhora —
-    #       não faz sentido recomendar cobrança sobre processo não apto.
-    if decisao.upper() != "APTO":
-        return {
-            "id_lote"         : processo.get("id_lote"),
-            "numero_processo" : ent.get("numero_processo"),
-            "nome_executado"  : ent.get("nome_executado"),
-            "agente1"         : snapshot_a1,
-            "analise": {
-                "status_triagem"    : decisao or "SEM DECISÃO",
-                "prioridade"        : None,
-                "acao_recomendada"  : None,
-                "justificativa"     : (
-                    f"Sem análise no Agente 2 — processo "
-                    f"'{decisao or 'SEM DECISÃO'}' na triagem do Agente 1"
-                    + (f": {motivo}" if motivo else "")
-                ),
-                "alerta_prescricao" : False,
-                "observacoes"       : [],
-            },
-            "processado_em": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
-        }
-
-    # ── APTO → análise jurídico-fiscal completa ──────────────────────
+    # Análise jurídico-fiscal — roda para TODOS os processos.
     prioridad    = _calcular_prioridad(processo)
     accion       = _recomendar_accion(processo)
     alerta_presc = _verificar_prescricao(processo)
@@ -335,7 +320,7 @@ def analisar_processo(processo: dict) -> dict:
 
     return {
         "id_lote"          : processo.get("id_lote"),
-        "numero_processo"  : ent.get("numero_processo"),
+        "numero_processo"  : ent.get("numero_processo") or processo.get("numero_processo"),
         "nome_executado"   : ent.get("nome_executado"),
         "agente1"          : snapshot_a1,
         "analise": {
@@ -417,16 +402,33 @@ def _calcular_prioridad(processo: dict) -> str:
 
 
 def _recomendar_accion(processo: dict) -> str:
-    """Acción recomendada según estado de citação y motivo del Agente 1."""
-    citacao = (processo.get("status_citacao") or "").upper()
-    motivo  = (processo.get("motivo_agente1") or "").lower()
+    """
+    Ação recomendada a partir dos sinais do PRÓPRIO processo.
+    Já não depende de motivo_agente1 (removido junto com a triagem APTO):
+    usa status_citacao, resultado_penhora e sinais_processuais.
+    """
+    citacao         = (processo.get("status_citacao") or "").upper()
+    penhora         = (processo.get("resultado_penhora") or "").lower()
+    citacao_efetiva = processo.get("data_citacao_efetiva")
+    sinais          = processo.get("sinais_processuais") or {}
 
-    if "não houve citação" in citacao or "citação ausente" in motivo:
+    # Sinais que mudam a estratégia antes de qualquer coisa.
+    if sinais.get("extincao"):
+        return "Sinal de extinção — verificar sentença e arquivar/baixar se transitado em julgado"
+    if sinais.get("parcelamento"):
+        return "Parcelamento identificado — suspender cobrança e acompanhar adimplemento das parcelas"
+    if sinais.get("suspensao_art40_lef"):
+        return "Suspenso pelo art. 40 da LEF — controlar prazo da prescrição intercorrente (Súmula 314 STJ)"
+
+    # Citação não efetivada → nova tentativa.
+    if not citacao_efetiva and ("NÃO HOUVE" in citacao or "FALHA" in citacao or "AUSENTE" in citacao):
         return "Realizar nova tentativa de citação — verificar endereços alternativos (SISBAJUD, RENAJUD, edital)"
-    elif "ausência de penhora" in motivo:
+
+    # Penhora não localizada → penhora online.
+    if "não" in penhora or "nao" in penhora:
         return "Requerer penhora online via SISBAJUD / RENAJUD"
-    else:
-        return "Analisar histórico completo e definir estratégia de cobrança"
+
+    return "Analisar histórico completo e definir estratégia de cobrança"
 
 
 def _verificar_prescricao(processo: dict) -> bool:
@@ -467,6 +469,8 @@ def _generar_observacoes(processo: dict) -> list:
         obs.append("Valor atualizado não disponível — solicitar cálculo atualizado à PGMS")
 
     conf_ocr = processo.get("confianca_ocr_media")
+    if conf_ocr is None:
+        conf_ocr = (processo.get("ocr") or {}).get("confianca_media")
     if conf_ocr is not None and conf_ocr < 50:
         obs.append(f"Qualidade de OCR baixa ({conf_ocr}%) — dados podem conter erros")
 
@@ -480,10 +484,13 @@ def _generar_observacoes(processo: dict) -> list:
 
 
 def _justificativa(prioridad: str, processo: dict) -> str:
-    ent   = processo.get("entidades", {})
-    valor = ent.get("valor_atualizado") or ent.get("valor_original") or "não informado"
-    motivo = processo.get("motivo_agente1") or ""
-    return f"Prioridade {prioridad} — valor da dívida: {valor}. Agente 1: {motivo}."
+    ent    = processo.get("entidades", {})
+    tipo   = processo.get("tipo_processo", {})
+    valor  = ent.get("valor_atualizado") or ent.get("valor_original") or "não informado"
+    classe = tipo.get("classe_assunto") or "—"
+    # Mantém o trecho "valor da dívida: {valor}" — o Excel o extrai por regex
+    # para ordenar por valor (ver gerar_reporte_xlsx).
+    return f"Prioridade {prioridad} — valor da dívida: {valor}. Classe/assunto: {classe}."
 
 
 # ════════════════════════════════════════════════════════════════════
