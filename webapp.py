@@ -559,7 +559,7 @@ async def _processar_lote(lote: dict):
         if rc != 0:
             raise RuntimeError(f"Agente 1 encerrou com código {rc}")
 
-        traspasse = saida_json / "resultados_procesosV8.json"
+        traspasse = saida_json / "saida_agente1_V8.json"
         if not traspasse.exists():
             raise RuntimeError("O Agente 1 não gerou o JSON de traspasse")
         # ── [V7.2] Auditoria — anexa as classificações do lote ao histórico compartilhado ──
@@ -567,10 +567,10 @@ async def _processar_lote(lote: dict):
         # ao arquivo COMPARTILHADO (PASTA_JSON), que acumula TODAS as decisões —
         # inclusive NÃO APTO — entre lotes. Append-only. Falha aqui não derruba o lote.
         try:
-            audit_lote = saida_json / "historial_classificacoes.jsonl"
+            audit_lote = saida_json / "historico_extracoes.jsonl"
             if audit_lote.exists():
                 PASTA_JSON.mkdir(parents=True, exist_ok=True)
-                destino = PASTA_JSON / "historial_classificacoes.jsonl"
+                destino = PASTA_JSON / "historico_extracoes.jsonl"
                 with open(audit_lote, encoding="utf-8") as _src, \
                      open(destino, "a", encoding="utf-8") as _dst:
                     _dst.write(_src.read())
@@ -579,7 +579,7 @@ async def _processar_lote(lote: dict):
                 )
             else:
                 lote["log"].append(
-                    f"{_agora()}  AVISO: Agente 1 não gerou historial_classificacoes.jsonl"
+                    f"{_agora()}  AVISO: Agente 1 não gerou historico_extracoes.jsonl"
                 )
         except Exception as e:
             lote["log"].append(f"{_agora()}  ERRO ao anexar auditoria: {e}")
@@ -782,7 +782,7 @@ class TriagemAgente1(BaseModel):
 
 class ClassificacaoAuditoria(BaseModel):
     """
-    Uma classificação registrada na auditoria (historial_classificacoes.jsonl).
+    Uma classificação registrada na auditoria (historico_extracoes.jsonl).
     Diferente de agente1/agente2, cobre TODAS as decisões — inclusive NÃO APTO.
     Registro plano: sem 'entidades' aninhadas.
     """
