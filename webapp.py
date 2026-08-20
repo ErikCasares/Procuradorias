@@ -547,7 +547,7 @@ async def _processar_lote(lote: dict):
     try:
         # ── Agente 1 — pastas isoladas deste lote ──
         rc = await _executar(
-            [sys.executable, "promptV7.1.py"],
+            [sys.executable, "agente1.py"],
             {
                 "PASTA_ENTRADA"   : str(entrada),
                 "PASTA_JSON"      : str(saida_json),
