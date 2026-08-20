@@ -410,7 +410,7 @@ def _arquivos_do_lote(lote: dict) -> dict:
         if p.exists():
             mapa["agente1_planilha"] = (p, f"lote_{lid}_agente1.xlsx", _XLSX)
 
-    p = d / "json" / "resultados_procesosV7_1_agente2.json"
+    p = d / "json" / "resultados_procesosV8.json"
     if p.exists():
         mapa["agente1_json"] = (p, f"lote_{lid}_agente1.json", "application/json")
 
@@ -559,7 +559,7 @@ async def _processar_lote(lote: dict):
         if rc != 0:
             raise RuntimeError(f"Agente 1 encerrou com código {rc}")
 
-        traspasse = saida_json / "resultados_procesosV7_1_agente2.json"
+        traspasse = saida_json / "resultados_procesosV8.json"
         if not traspasse.exists():
             raise RuntimeError("O Agente 1 não gerou o JSON de traspasse")
         # ── [V7.2] Auditoria — anexa as classificações do lote ao histórico compartilhado ──

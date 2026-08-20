@@ -1803,7 +1803,7 @@ if __name__ == "__main__":
     _timestamp = datetime.now().strftime("%Y-%m-%d_%Hh%M")
     output_file_resumo    = os.path.join(PASTA_JSON, f"resumo_sinais_V8_{_timestamp}.txt")
     output_file_excel     = os.path.join(PASTA_RESULTADOS, f"resultados_V8_{_timestamp}.xlsx")
-    output_file_json      = os.path.join(PASTA_JSON, f"saida_agente1_V8_{_timestamp}.json")
+    output_file_json      = os.path.join(PASTA_JSON, f"saida_agente1_V8.json")
     output_file_historico = os.path.join(PASTA_JSON, "historico_extracoes.jsonl")  # append-only
 
     prompts = generate_prompts(input_directory)
