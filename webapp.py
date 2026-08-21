@@ -1484,77 +1484,49 @@ async def consultar_processo(
     consumidor: str = Depends(autenticar_api),
 ):
     """
-    Tudo o que os dois agentes sabem sobre **um** processo, sem precisar do `lote_id`.
+    Executa o buscar_processo.py como script (não só a função buscar_dados) e
+    devolve a saída formatada completa que o main() imprime — a mesma visão do
+    CLI (Agente 1, Agente 2 e auditoria), já em texto puro.
 
-    Serve para quando a pergunta parte do processo, não do lote: o SIAP tem o número
-    em mãos e quer a triagem do Agente 1 (dados extraídos e classificação) junto da
-    priorização do Agente 2 (prioridade, ação recomendada, alerta de prescrição).
-
-    A busca cobre **todos** os lotes, de todos os consumidores (esta consulta é
-    visível a todos — a auth continua exigida, o recorte por origem não). Cada
-    bloco vem nulo quando aquela fonte não tem o processo — veja `encontrado_em`:
-
-    - só `agente1`: o Agente 2 ainda não analisou, ou outro lote reanalisou o
-      mesmo processo depois (o histórico do Agente 2 guarda uma linha por número)
-    - só `agente2`: a análise ficou no histórico acumulado, mas o JSON do lote que
-      a gerou já não está na pasta
-    - `auditoria` presente: a triagem do processo (TODAS as decisões). É a única
-      fonte que mostra um processo **NÃO APTO**, que não entra em agente1/agente2.
-
-    Responde `404` só quando o número não aparece em fonte nenhuma. Um processo
-    **NÃO APTO** NÃO dá mais 404: ele aparece no bloco `auditoria` (desde que o
-    lote tenha sido processado com a auditoria ligada).
+    A auth continua exigida; a consulta é visível a todos, sem recorte por
+    consumidor. 404 quando o processo não aparece em fonte nenhuma.
     """
-    # Em thread: a varredura lê os JSON da pasta inteira, e travar o event loop
-    # aqui atrasaria o polling de todos os outros lotes.
-    #
-    # SEM filtro por consumidor: esta consulta é visível a todos (decisão de
-    # negócio). A auth já rodou em Depends(autenticar_api); `consumidor` fica
-    # só como prova de token válido, não recorta o resultado.
-    dados = await asyncio.to_thread(
-        buscar_dados, numero, str(PASTA_JSON)
+    script = BASE_DIR / "buscar_processo.py"
+
+    # Mesmo padrão dos agentes: subprocess isolado.
+    #  - caminho ABSOLUTO (BASE_DIR/…): evita o "código 2" de arquivo não achado.
+    #  - stdin=DEVNULL: se por acaso cair no modo interativo, não trava no input().
+    #  - stdout piped → sys.stdout.isatty() é False lá dentro, então _cor() já
+    #    devolve texto SEM códigos ANSI. A saída chega limpa.
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable, str(script),
+        "--pasta", str(PASTA_JSON),
+        numero,
+        cwd=str(BASE_DIR),
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
     )
+    bruto_out, bruto_err = await proc.communicate()
+    saida = bruto_out.decode("utf-8", errors="replace")
+    erro  = bruto_err.decode("utf-8", errors="replace")
 
-    a1 = _com_lote_id(dados["agente1"])
-    a2 = _com_lote_id(dados["agente2"])
-
-    # Auditoria — TODAS as decisões, inclusive NÃO APTO. Registro plano: só
-    # limpamos as chaves internas '_...'; não há mapeamento de lote_id aqui.
-    aud_atual = dados.get("auditoria")
-    aud_hist  = dados.get("auditoria_historico") or []
-    auditoria = None
-    if aud_atual:
-        auditoria = {
-            "atual"    : _sem_internos(aud_atual),
-            "historico": [_sem_internos(h) for h in aud_hist],
-            "total"    : aud_atual.get("_total_classificacoes") or len(aud_hist) or 1,
-        }
-
-    # 404 só quando NENHUMA fonte tem o processo. O NÃO APTO cai em `auditoria`,
-    # então deixa de dar 404 — era exatamente o bug.
-    if not a1 and not a2 and not auditoria:
+    if proc.returncode != 0:
+        # Ex.: 2 = Python não achou buscar_processo.py; outros = exceção no script.
         raise HTTPException(
-            404,
-            "Processo não encontrado. Confira o número. Se o lote foi processado "
-            "antes de a auditoria ser ligada, a classificação pode não ter sido registrada.",
+            500,
+            f"Falha ao executar buscar_processo.py (código {proc.returncode}): "
+            f"{erro.strip() or saida.strip() or 'sem saída'}",
         )
 
-    fontes = [
-        nome for nome, achado in (("agente1", a1), ("agente2", a2), ("auditoria", auditoria))
-        if achado
-    ]
+    # main() imprime "Processo não encontrado" e sai com 0 — o returncode não
+    # distingue esse caso, então detectamos pelo texto para manter o 404.
+    if "não encontrado" in saida.lower() or "nao encontrado" in saida.lower():
+        raise HTTPException(404, saida.strip())
 
     return {
-        "numero_processo": (
-            ((a1 or {}).get("entidades") or {}).get("numero_processo")
-            or (a2 or {}).get("numero_processo")
-            or ((auditoria or {}).get("atual") or {}).get("numero_processo")
-            or numero
-        ),
-        "encontrado_em": fontes,
-        "agente1": a1,
-        "agente2": a2,
-        "auditoria": auditoria,
+        "numero_processo": numero,
+        "saida": saida,
     }
 
 
