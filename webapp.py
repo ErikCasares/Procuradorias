@@ -52,13 +52,13 @@ from fastapi import (
     Query, Security, UploadFile,
 )
 from fastapi.openapi.docs import get_swagger_ui_html
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, Field
 
-# Mesma busca da linha de comando (`python buscar_processo.py <numero>`), para a
-# API e o terminal nunca divergirem sobre onde o processo está.
-from buscar_processo import buscar_dados
+# A rota /api/v1/processos executa `buscar_processo.py` como subprocess (Opção A):
+# roda o arquivo inteiro e devolve a saída formatada do main(), para a API e o
+# terminal nunca divergirem. Por isso não importamos mais buscar_dados aqui.
 
 logging.basicConfig(
     level=logging.INFO,
@@ -1467,7 +1467,7 @@ def _com_lote_id(achado: dict | None) -> dict | None:
     "/api/v1/processos",
     tags=["Processos"],
     summary="Consultar um processo pelo número",
-    response_model=ProcessoConsultado,
+    response_class=PlainTextResponse,
     responses={
         404: {"model": Erro, "description": "Nenhum processo com esse número nos lotes deste consumidor"},
         **_ERROS_AUTH,
@@ -1484,39 +1484,52 @@ async def consultar_processo(
     consumidor: str = Depends(autenticar_api),
 ):
     """
-    Executa o buscar_processo.py como script (não só a função buscar_dados) e
-    devolve a saída formatada completa que o main() imprime — a mesma visão do
-    CLI (Agente 1, Agente 2 e auditoria), já em texto puro.
+    Executa o `buscar_processo.py` como script (não apenas a função `buscar_dados`)
+    e devolve a saída formatada COMPLETA do `main()` em texto puro — a mesma visão
+    do CLI: Agente 1 (dados extraídos), Agente 2 (priorização) e auditoria.
 
-    A auth continua exigida; a consulta é visível a todos, sem recorte por
-    consumidor. 404 quando o processo não aparece em fonte nenhuma.
+    A busca cobre **todos** os lotes, de todos os consumidores (esta consulta é
+    visível a todos — a auth continua exigida, o recorte por origem não). A auth
+    já rodou em Depends(autenticar_api); `consumidor` fica só como prova de token.
+
+    Responde `404` quando o número não aparece em fonte nenhuma, e `500` se o
+    próprio `buscar_processo.py` falhar ao executar.
     """
     script = BASE_DIR / "buscar_processo.py"
 
-    # Mesmo padrão dos agentes: subprocess isolado.
+    # Subprocess isolado, mesmo padrão dos agentes:
     #  - caminho ABSOLUTO (BASE_DIR/…): evita o "código 2" de arquivo não achado.
-    #  - stdin=DEVNULL: se por acaso cair no modo interativo, não trava no input().
-    #  - stdout piped → sys.stdout.isatty() é False lá dentro, então _cor() já
-    #    devolve texto SEM códigos ANSI. A saída chega limpa.
-    proc = await asyncio.create_subprocess_exec(
-        sys.executable, str(script),
-        "--pasta", str(PASTA_JSON),
-        numero,
-        cwd=str(BASE_DIR),
-        stdin=asyncio.subprocess.DEVNULL,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    bruto_out, bruto_err = await proc.communicate()
+    #  - stdin=DEVNULL: se cair no modo interativo (número vazio), não trava no input().
+    #  - stdout piped → sys.stdout.isatty() é False lá dentro, então _cor() devolve
+    #    texto SEM códigos ANSI. A saída chega limpa.
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, str(script),
+            "--pasta", str(PASTA_JSON),
+            numero,
+            cwd=str(BASE_DIR),
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        bruto_out, bruto_err = await proc.communicate()
+    except Exception as e:
+        log.exception("Falha ao lançar buscar_processo.py")
+        raise HTTPException(500, f"Não foi possível executar buscar_processo.py: {e!r}")
+
     saida = bruto_out.decode("utf-8", errors="replace")
     erro  = bruto_err.decode("utf-8", errors="replace")
 
     if proc.returncode != 0:
         # Ex.: 2 = Python não achou buscar_processo.py; outros = exceção no script.
+        log.error(
+            "buscar_processo.py saiu com código %s\nSTDERR:\n%s\nSTDOUT:\n%s",
+            proc.returncode, erro, saida,
+        )
         raise HTTPException(
             500,
-            f"Falha ao executar buscar_processo.py (código {proc.returncode}): "
-            f"{erro.strip() or saida.strip() or 'sem saída'}",
+            f"buscar_processo.py falhou (código {proc.returncode}): "
+            f"{(erro or saida).strip() or 'sem saída'}",
         )
 
     # main() imprime "Processo não encontrado" e sai com 0 — o returncode não
@@ -1524,10 +1537,7 @@ async def consultar_processo(
     if "não encontrado" in saida.lower() or "nao encontrado" in saida.lower():
         raise HTTPException(404, saida.strip())
 
-    return {
-        "numero_processo": numero,
-        "saida": saida,
-    }
+    return PlainTextResponse(saida)
 
 
 # ════════════════════════════════════════════════════════════════
