@@ -241,12 +241,100 @@ def _fmt_prioridade(prioridade: str):
     }.get(prioridade, prioridade or "")
 
 
+def _valor_hist(v):
+    """
+    Normaliza um valor para comparação/exibição no histórico.
+    Devolve None para vazios (para não poluir a linha do tempo) e converte
+    booleanos em texto ('SIM'/'não'), que é como o procurador lê.
+    """
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return "SIM" if v else "não"
+    s = str(v).strip()
+    return s or None
+
+
+def _mostrar_evolucao(historico, campos, key_tempo, headline=None, indent="      "):
+    """
+    Imprime, em ordem cronológica, o que MUDOU entre um ponto e o anterior —
+    a ideia é dar ao procurador "o que aconteceu nesse tempo" sem ruído.
+
+    historico : lista de registros (dicts) do mesmo processo
+    campos    : lista de (label, extrator(rec) -> valor) — os dados a acompanhar
+    key_tempo : extrator(rec) -> str usado para ordenar e rotular cada ponto
+    headline  : opcional, extrator(rec) -> texto já colorido, mostrado ao lado
+                da data (ex.: a decisão/prioridade daquele ponto)
+
+    Semântica de "último valor conhecido": se um registro NÃO traz um campo
+    (ex.: uma corrida que só registrou erro), esse campo é tratado como
+    inalterado — mantém-se o último valor visto. Só se reporta mudança quando
+    chega um valor novo, não-vazio, diferente do anterior. Isso evita falsos
+    "sumiu e voltou" e mostra a evolução real do processo.
+
+    Regras:
+      • um campo só entra se tiver valor em ALGUM ponto (evita parede de "—");
+      • o 1º ponto mostra o estado inicial (campos preenchidos);
+      • os pontos seguintes mostram só os campos que mudaram de fato.
+    """
+    ordenado = sorted(historico, key=lambda r: key_tempo(r) or "")
+
+    # descarta campos que nunca têm valor em nenhum registro
+    campos_uteis = [
+        (label, ext) for label, ext in campos
+        if any(_valor_hist(ext(r)) is not None for r in ordenado)
+    ]
+
+    conhecido = {}      # último valor NÃO-vazio visto por campo
+    primeiro  = True
+    for r in ordenado:
+        quando = key_tempo(r) or "—"
+        cabeca = (headline(r) if headline else "") or ""
+        bullet = indent[:-2] + "• "
+        atual  = {label: _valor_hist(ext(r)) for label, ext in campos_uteis}
+
+        if primeiro:
+            print(f"{bullet}{_dim(quando)}  {cabeca}  {_dim('(estado inicial)')}".rstrip())
+            for label, _ in campos_uteis:
+                if atual[label] is not None:
+                    print(f"{indent}{_label(label + ':')} {atual[label]}")
+                    conhecido[label] = atual[label]
+            primeiro = False
+            continue
+
+        print(f"{bullet}{_dim(quando)}  {cabeca}".rstrip())
+        mudou = False
+        for label, _ in campos_uteis:
+            novo = atual[label]
+            if novo is None:            # ausente neste registro → mantém o conhecido
+                continue
+            antigo = conhecido.get(label)
+            if novo != antigo:
+                de_txt = antigo if antigo is not None else _dim("—")
+                print(f"{indent}{_label(label + ':')} {de_txt} {_dim('→')} {novo}")
+                conhecido[label] = novo
+                mudou = True
+        if not mudou:
+            print(f"{indent}{_dim('sem mudanças nos campos acompanhados')}")
+
+
+def _a1_snapshot(rec, campo):
+    """
+    Lê um campo do snapshot do Agente 1 arrastado para o registro do Agente 2.
+    Procura primeiro em 'entidades' (onde ficam valores/CDA etc.) e depois no
+    topo do snapshot (onde ficam status_citacao/penhora/movimentação).
+    """
+    a1  = rec.get("agente1") or {}
+    ent = a1.get("entidades") or {}
+    return ent.get(campo) if ent.get(campo) is not None else a1.get(campo)
+
+
 def _mostrar_agente1(proc: dict):
     ent = proc.get("entidades", {})
     print(_titulo("\n┌─ AGENTE 1 — Triagem e dados extraídos"))
     print(_dim(f"│  fonte: {proc.get('_origem_arquivo','?')}"))
     print("│")
-    print(_linha("Arquivo",  proc.get("arquivo")))    
+    print(_linha("Arquivo",  ent.get("arquivo")))    
     print(_linha("Nº do processo",  ent.get("numero_processo")))
     print(_linha("Executado",       ent.get("nome_executado")))
     print(_linha("Exequente",       ent.get("nome_exequente")))
@@ -317,13 +405,24 @@ def _mostrar_auditoria(rec: dict, historico=None):
     if historico and total and total > 1:
         print("│")
         print(f"  {_label('Histórico de classificações:')} {_dim(f'({total} registros)')}")
-        # do mais antigo ao mais recente, para ler a evolução da decisão
-        for h in sorted(historico, key=lambda r: r.get("classificado_em") or ""):
-            quando = h.get("classificado_em") or "—"
-            dec    = h.get("decisao") or "—"
-            mot    = h.get("motivo") or ""
-            sufixo = f"  —  {mot}" if mot else ""
-            print(f"    • {_dim(quando)}  {_fmt_decisao(dec)}{sufixo}")
+        print(_dim("  (cada ponto mostra o que mudou desde o anterior)"))
+        # campos que costumam evoluir entre lotes — o que interessa ao procurador
+        campos = [
+            ("Motivo",              lambda r: r.get("motivo")),
+            ("Status citação",      lambda r: r.get("status_citacao")),
+            ("Resultado penhora",   lambda r: r.get("resultado_penhora")),
+            ("Última movimentação", lambda r: r.get("ultima_movimentacao")),
+            ("Sinal extinção",      lambda r: r.get("extincao")),
+            ("Sinal parcelamento",  lambda r: r.get("parcelamento")),
+            ("Sinal art.40 LEF",    lambda r: r.get("suspensao_art40_lef")),
+            ("Lote (origem)",       lambda r: r.get("id_lote")),
+        ]
+        _mostrar_evolucao(
+            historico,
+            campos,
+            key_tempo=lambda r: r.get("classificado_em") or r.get("extraido_em"),
+            headline=lambda r: _fmt_decisao(r.get("decisao")) if r.get("decisao") else "",
+        )
 
 
 def _mostrar_agente2(rec: dict, historico=None):
@@ -358,23 +457,31 @@ def _mostrar_agente2(rec: dict, historico=None):
     print(_linha("Origem (lote)",    rec.get("origem_lote")))
 
     # [hist] Histórico de análises (append-only): quando o processo foi
-    #        analisado mais de uma vez, mostra a evolução da priorização —
-    #        mesmo espírito do "Histórico de classificações" da auditoria.
+    #        analisado mais de uma vez, mostra a EVOLUÇÃO — não só a prioridade,
+    #        mas os dados que mudaram (citação, penhora, movimentação, valores),
+    #        para o procurador enxergar o que aconteceu entre um lote e outro.
     if historico and total and total > 1:
         print("│")
         print(f"  {_label('Histórico de análises:')} {_dim(f'({total} registros)')}")
-        # do mais antigo ao mais recente, para ler a evolução da priorização
-        for h in sorted(historico, key=lambda r: r.get("processado_em") or ""):
-            quando = h.get("processado_em") or "—"
-            if h.get("erro"):
-                estado  = _alerta("FALHA NA ANÁLISE")
-                detalhe = h.get("erro") or ""
-            else:
-                an_h    = h.get("analise") or {}
-                estado  = _fmt_prioridade(an_h.get("prioridade") or "—")
-                detalhe = an_h.get("acao_recomendada") or ""
-            sufixo = f"  —  {detalhe}" if detalhe else ""
-            print(f"    • {_dim(quando)}  {estado}{sufixo}")
+        print(_dim("  (cada ponto mostra o que mudou desde o anterior)"))
+        campos = [
+            ("Ação recomendada",    lambda r: (r.get("analise") or {}).get("acao_recomendada")),
+            ("Justificativa",       lambda r: (r.get("analise") or {}).get("justificativa")),
+            ("Alerta prescrição",   lambda r: (r.get("analise") or {}).get("alerta_prescricao")),
+            # dados do processo (snapshot do Agente 1) que evoluem no tempo:
+            ("Valor atualizado",    lambda r: _a1_snapshot(r, "valor_atualizado")),
+            ("Status citação",      lambda r: _a1_snapshot(r, "status_citacao")),
+            ("Resultado penhora",   lambda r: _a1_snapshot(r, "resultado_penhora")),
+            ("Última movimentação", lambda r: _a1_snapshot(r, "ultima_movimentacao")),
+            ("Origem (lote)",       lambda r: r.get("origem_lote")),
+        ]
+        _mostrar_evolucao(
+            historico,
+            campos,
+            key_tempo=lambda r: r.get("processado_em"),
+            headline=lambda r: (_alerta("FALHA NA ANÁLISE") if r.get("erro")
+                                else _fmt_prioridade((r.get("analise") or {}).get("prioridade") or "—")),
+        )
 
 
 # ── Fluxo principal ───────────────────────────────────────────────
