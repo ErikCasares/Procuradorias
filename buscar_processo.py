@@ -111,11 +111,18 @@ def _buscar_em_json_agente1(pasta: str, numero_norm: str):
 def _buscar_em_historial_agente2(pasta: str, numero_norm: str):
     """
     Procura o processo no historial_agente2.jsonl do Agente 2.
-    Retorna o dict do registro (com análise) ou None.
+
+    APPEND-ONLY: um processo pode ter várias linhas (foi reanalisado entre
+    lotes). Devolve uma tupla:
+        (registro_escolhido | None, historico_completo: list)
+
+    O 'escolhido' é o estado vigente para exibição em destaque; o histórico
+    completo são TODAS as linhas do processo (na ordem lida), para mostrar a
+    evolução das análises — mesmo padrão de _buscar_em_historial_classificacoes.
     """
     caminho = os.path.join(pasta, HISTORIAL_A2)
     if not os.path.exists(caminho):
-        return None
+        return None, []
 
     # [FIX] O historial é APPEND-ONLY: um processo pode ter várias linhas.
     #       Ficar com o registro MAIS RECENTE que tenha análise; se nenhuma
@@ -124,6 +131,7 @@ def _buscar_em_historial_agente2(pasta: str, numero_norm: str):
     com_analise    = None   # último registro COM analise não-vazia (preferido)
     ultimo_qualquer = None  # último registro do processo (fallback p/ mostrar erro)
     total_analises = 0
+    historico      = []     # [hist] todas as linhas do processo, em ordem de leitura
     with open(caminho, encoding="utf-8") as f:
         for linha in f:
             linha = linha.strip()
@@ -137,6 +145,7 @@ def _buscar_em_historial_agente2(pasta: str, numero_norm: str):
             if np and _normalizar_numero(np) == numero_norm:
                 total_analises += 1
                 ultimo_qualquer = rec
+                historico.append(rec)           # [hist]
                 if rec.get("analise"):          # dict não-vazio
                     com_analise = rec
 
@@ -144,8 +153,8 @@ def _buscar_em_historial_agente2(pasta: str, numero_norm: str):
     if escolhido is not None:
         escolhido["_origem_arquivo"] = HISTORIAL_A2
         escolhido["_total_analises"] = total_analises
-        return escolhido
-    return None
+        return escolhido, historico
+    return None, []
 
 
 def _buscar_em_historial_classificacoes(pasta: str, numero_norm: str):
@@ -223,12 +232,21 @@ def _fmt_decisao(decisao: str):
     return _cor(decisao, "1;33")   # amarelo: INFORMAÇÃO INSUFICIENTE / FORA DE ESCOPO
 
 
+def _fmt_prioridade(prioridade: str):
+    """Colore a prioridade: ALTA vermelho, MÉDIA amarelo, BAIXA verde."""
+    return {
+        "ALTA":  _alerta("ALTA"),
+        "MEDIA": _cor("MÉDIA", "1;33"),
+        "BAIXA": _ok("BAIXA"),
+    }.get(prioridade, prioridade or "")
+
+
 def _mostrar_agente1(proc: dict):
     ent = proc.get("entidades", {})
     print(_titulo("\n┌─ AGENTE 1 — Triagem e dados extraídos"))
     print(_dim(f"│  fonte: {proc.get('_origem_arquivo','?')}"))
     print("│")
-    print(_linha("Arquivo",  ent.get("arquivo")))    
+    print(_linha("Arquivo",  proc.get("arquivo")))    
     print(_linha("Nº do processo",  ent.get("numero_processo")))
     print(_linha("Executado",       ent.get("nome_executado")))
     print(_linha("Exequente",       ent.get("nome_exequente")))
@@ -308,7 +326,7 @@ def _mostrar_auditoria(rec: dict, historico=None):
             print(f"    • {_dim(quando)}  {_fmt_decisao(dec)}{sufixo}")
 
 
-def _mostrar_agente2(rec: dict):
+def _mostrar_agente2(rec: dict, historico=None):
     an = rec.get("analise", {}) or {}
 
     total = rec.get("_total_analises")
@@ -326,13 +344,7 @@ def _mostrar_agente2(rec: dict):
         print("│")
 
     # [7.x] NÃO APTO: mostrar a triagem do Agente 1, não uma priorização.
-    prioridade = an.get("prioridade", "")
-    prio_fmt = {
-        "ALTA":  _alerta("ALTA"),
-        "MEDIA": _cor("MÉDIA", "1;33"),
-        "BAIXA": _ok("BAIXA"),
-    }.get(prioridade, prioridade)
-    print(_linha("Prioridade",       prio_fmt))
+    print(_linha("Prioridade",       _fmt_prioridade(an.get("prioridade", ""))))
     print(_linha("Ação recomendada", an.get("acao_recomendada")))
     print(_linha("Justificativa",    an.get("justificativa")))
     alerta = an.get("alerta_prescricao")
@@ -344,6 +356,25 @@ def _mostrar_agente2(rec: dict):
             print(f"    • {o}")
     print(_linha("Processado em",    rec.get("processado_em")))
     print(_linha("Origem (lote)",    rec.get("origem_lote")))
+
+    # [hist] Histórico de análises (append-only): quando o processo foi
+    #        analisado mais de uma vez, mostra a evolução da priorização —
+    #        mesmo espírito do "Histórico de classificações" da auditoria.
+    if historico and total and total > 1:
+        print("│")
+        print(f"  {_label('Histórico de análises:')} {_dim(f'({total} registros)')}")
+        # do mais antigo ao mais recente, para ler a evolução da priorização
+        for h in sorted(historico, key=lambda r: r.get("processado_em") or ""):
+            quando = h.get("processado_em") or "—"
+            if h.get("erro"):
+                estado  = _alerta("FALHA NA ANÁLISE")
+                detalhe = h.get("erro") or ""
+            else:
+                an_h    = h.get("analise") or {}
+                estado  = _fmt_prioridade(an_h.get("prioridade") or "—")
+                detalhe = an_h.get("acao_recomendada") or ""
+            sufixo = f"  —  {detalhe}" if detalhe else ""
+            print(f"    • {_dim(quando)}  {estado}{sufixo}")
 
 
 # ── Fluxo principal ───────────────────────────────────────────────
@@ -367,6 +398,7 @@ def buscar_dados(
         {
             "agente1": <registro o None>,
             "agente2": <registro o None>,
+            "agente2_historico": <lista de registros>,      # [hist] evolución
             "auditoria": <registro más reciente o None>,   # [v2]
             "auditoria_historico": <lista de registros>,    # [v2]
         }
@@ -386,21 +418,24 @@ def buscar_dados(
     # El filtro se aplica aquí, cuando es posible, para mantener compatible
     # la interfaz usada por webapp.py.
     proc_a1 = _buscar_em_json_agente1(pasta, numero_norm)
-    rec_a2  = _buscar_em_historial_agente2(pasta, numero_norm)
+    rec_a2, hist_a2 = _buscar_em_historial_agente2(pasta, numero_norm)
     audit_recente, audit_historico = _buscar_em_historial_classificacoes(pasta, numero_norm)
 
     if filtro is not None:
         proc_a1       = _aplicar_filtro(proc_a1, filtro)
         rec_a2        = _aplicar_filtro(rec_a2, filtro)
         audit_recente = _aplicar_filtro(audit_recente, filtro)
-        # Se o filtro rejeitou o registro mais recente, some com o histórico
-        # também — todas as linhas são do mesmo processo/consumidor.
+        # Se o filtro rejeitou o registro vigente, some com o histórico também —
+        # todas as linhas são do mesmo processo/consumidor.
+        if rec_a2 is None:
+            hist_a2 = []
         if audit_recente is None:
             audit_historico = []
 
     return {
         "agente1": proc_a1,
         "agente2": rec_a2,
+        "agente2_historico": hist_a2,        # [hist] evolução das análises
         "auditoria": audit_recente,
         "auditoria_historico": audit_historico,
     }
@@ -488,11 +523,14 @@ def main():
         elif not auditoria:
             print(_dim("\n(sem registro no JSON do Agente 1)"))
 
-    # [v2] Auditoria — é aqui que o NÃO APTO fica visível
+    # [v2] Auditoria — é aqui que o NÃO APTO fica visível e, com o histórico,
+    #      é onde sai a EVOLUÇÃO das classificações entre lotes.
+    if auditoria:
+        _mostrar_auditoria(auditoria, auditoria_hist)
 
     # Agente 2 — análise jurídico-fiscal (agora roda para TODOS os processos)
     if rec_a2:
-        _mostrar_agente2(rec_a2)
+        _mostrar_agente2(rec_a2, dados.get("agente2_historico"))
     else:
         # v0.3: sem triagem APTO/NÃO APTO. Todo processo do Agente 1 deveria
         # receber análise do Agente 2. Se não há registro no historial, o

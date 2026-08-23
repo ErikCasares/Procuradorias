@@ -1880,7 +1880,7 @@ def exportar_json_agente2(prompts, output_json):
         conf_media = round(sum(conf_dict.values()) / len(conf_dict), 1) if conf_dict else None
 
         processos.append({
-            "id_lote"                       : pdf_file,
+            "arquivo"                       : pdf_file,
             "numero_processo"               : _nulo(ent.get("numero_processo")),
             "tipo_processo": {
                 "es_execucao_fiscal"        : tp.get("es_execucao_fiscal"),
