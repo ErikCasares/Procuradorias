@@ -2003,14 +2003,10 @@ if __name__ == "__main__":
     os.makedirs(PASTA_RESULTADOS, exist_ok=True)
 
     _timestamp = datetime.now().strftime("%Y-%m-%d_%Hh%M")
-    output_file_resumo    = os.path.join(PASTA_JSON, f"resumo_sinais_V8_{_timestamp}.txt")
-    output_file_excel     = os.path.join(PASTA_RESULTADOS, f"resultados_V8_{_timestamp}.xlsx")
-    # [v8.3] Nome de saída alinhado ao que o Agente 2 e o buscar_processo esperam:
-    #        eles fazem glob("*_agente2.json"). Antes saía como
-    #        "saida_agente1_V8_<ts>.json" e NÃO era encontrado — a cadeia toda
-    #        ficava sem dados. O sufixo "_agente2.json" é o contrato entre etapas.
-    output_file_json      = os.path.join(PASTA_JSON, f"saida_agente1_V8_{_timestamp}_agente2.json")
-    output_file_historico = os.path.join(PASTA_JSON, "historico_extracoes.jsonl")  # append-only
+    output_file_resumo    = os.path.join(PASTA_JSON, f"resumo_sinais_V8.txt")
+    output_file_excel     = os.path.join(PASTA_RESULTADOS, f"resultados_V8.xlsx")
+    output_file_json      = os.path.join(PASTA_JSON, f"saida_agente1_V8.json")
+    output_file_historico = os.path.join(PASTA_JSON, "historico_extracoes.jsonl")  
 
     prompts = generate_prompts(input_directory)
     save_prompts_to_file(prompts, output_file_resumo)
