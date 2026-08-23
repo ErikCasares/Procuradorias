@@ -444,11 +444,22 @@ def main():
     auditoria_hist = dados.get("auditoria_historico", [])
 
     if not proc_a1 and not rec_a2 and not auditoria:
-        print(_alerta(f"\nProcesso não encontrado: {numero}"))
-        print(_dim("Possíveis motivos:"))
-        print(_dim("  • O número está errado ou com dígitos faltando"))
-        print(_dim("  • O lote foi processado antes da V7.2 (sem historial_classificacoes.jsonl)"))
-        print(_dim("  • Os agentes ainda não foram executados sobre esse lote"))
+        # Estrutura no mesmo formato da API, para exibição amigável (e reuso).
+        nao_encontrado = {
+            "mensagem": f"Não encontramos nenhum processo com o número {numero}.",
+            "possiveis_motivos": [
+                "O número pode estar incompleto ou ter algum dígito trocado",
+                "O lote pode ter sido processado antes da versão 7.2",
+                "Os agentes ainda não foram executados sobre esse lote",
+            ],
+            "sugestao": "Verifique o número e tente novamente.",
+        }
+
+        print(_alerta(f"\n{nao_encontrado['mensagem']}"))
+        print(_dim("\nIsso pode acontecer por alguns motivos:"))
+        for motivo in nao_encontrado["possiveis_motivos"]:
+            print(_dim(f"  • {motivo}"))
+        print(_dim(f"\n{nao_encontrado['sugestao']}"))
         return
 
     print(_ok(f"\n═══ Processo {numero} encontrado ═══"))

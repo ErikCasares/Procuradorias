@@ -978,37 +978,136 @@ def extract_extincao(text):
 # EXTRACCIÓN DE ENTIDADES (datos estructurados del processo)
 # ===========================================================================
 
-def _extrair_cpf_cnpj(text):
-    """Extrae CPF/CNPJ del executado (prioriza CNPJ). Devuelve str o None."""
-    _PATRON_CNPJ = r"\d{2}[\.\s]?\d{3}[\.\s]?\d{3}[\/\s]?\d{4}[\-\s]?\d{2}"
-    _PATRON_CPF  = r"\d{3}[\.\s]?\d{3}[\.\s]?\d{3}[\-\s]?\d{2}"
 
-    contextos_executado = [
-        r"executad[oa][:\s]+[^\n]{0,200}",
-        r"r[eé]u[:\s]+[^\n]{0,200}",
-        r"contribuinte[:\s]+[^\n]{0,200}",
-        r"cpf[\/]?cnpj[:\s]+[^\n]{0,100}",
-        r"cnpj[\/]?cpf[:\s]+[^\n]{0,100}",
-        r"inscri[cç][aã]o[:\s]+[^\n]{0,100}",
-    ]
-    text_norm = normalizar(text)
-    for ctx_pat in contextos_executado:
-        for ctx_match in re.finditer(ctx_pat, text_norm):
-            fragmento = ctx_match.group(0)
-            m = re.search(_PATRON_CNPJ, fragmento)
-            if m:
-                raw = re.sub(r"[\s]", "", m.group(0))
-                digitos = re.sub(r"\D", "", raw)
-                if len(digitos) == 14:
-                    return f"{digitos[:2]}.{digitos[2:5]}.{digitos[5:8]}/{digitos[8:12]}-{digitos[12:]}"
-            m = re.search(_PATRON_CPF, fragmento)
-            if m:
-                raw = re.sub(r"[\s]", "", m.group(0))
-                digitos = re.sub(r"\D", "", raw)
-                if len(digitos) == 11:
-                    return f"{digitos[:3]}.{digitos[3:6]}.{digitos[6:9]}-{digitos[9:]}"
+def _so_digitos(s):
+    return re.sub(r"\D", "", s or "")
+ 
+ 
+def validar_cpf(cpf):
+    """True se `cpf` (com ou sem máscara) tem 11 dígitos e DVs válidos."""
+    cpf = _so_digitos(cpf)
+    if len(cpf) != 11 or cpf == cpf[0] * 11:
+        return False
+    for fim in (9, 10):
+        soma = sum(int(cpf[i]) * (fim + 1 - i) for i in range(fim))
+        dv = (soma * 10) % 11
+        if dv == 10:
+            dv = 0
+        if dv != int(cpf[fim]):
+            return False
+    return True
+ 
+ 
+def validar_cnpj(cnpj):
+    """True se `cnpj` (com ou sem máscara) tem 14 dígitos e DVs válidos."""
+    cnpj = _so_digitos(cnpj)
+    if len(cnpj) != 14 or cnpj == cnpj[0] * 14:
+        return False
+    pesos = [6, 5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2]
+    for fim in (12, 13):
+        w = pesos[1:] if fim == 12 else pesos
+        r = sum(int(cnpj[i]) * w[i] for i in range(fim)) % 11
+        dv = 0 if r < 2 else 11 - r
+        if dv != int(cnpj[fim]):
+            return False
+    return True
+ 
+ 
+def _fmt_cpf(d):
+    return f"{d[:3]}.{d[3:6]}.{d[6:9]}-{d[9:]}"
+ 
+ 
+def _fmt_cnpj(d):
+    return f"{d[:2]}.{d[2:5]}.{d[5:8]}/{d[8:12]}-{d[12:]}"
+ 
+ 
+# Rótulos que indicam que o número pertence ao EXECUTADO / contribuinte / sócio.
+_CTX_FORTE_EXECUTADO = (
+    "executad", "contra ", "devedor", "reu", "contribuinte", "cpf/cnpj",
+    "cnpj/cpf", "cpf do responsavel", "nome do responsavel", "socio",
+    "responsavel", "cpf:", "cnpj:", "cpf ", "cnpj ",
+)
+# Rótulos que indicam EXEQUENTE / assinante / procurador -> NÃO é o executado.
+_CTX_REJEITAR = (
+    "cnpj/mf", "exequente", "credor",
+    "municipio do salvador", "municipio de salvador",
+    "signed by", "assinado por", "procurador ", "oab",
+)
+ 
+# Token candidato: começa e termina em dígito, só admite . - / no meio
+# (não cruza espaços, para não fundir "CEP 40230731 - 713", telefone, etc.).
+_RE_CANDIDATO = re.compile(r"\d[\d./-]{9,16}\d")
+_CTX_JANELA = 80  # nº de caracteres de contexto anterior analisados
+ 
+ 
+def _rotulo_mais_proximo(ctx):
+    """
+    Decide pelo rótulo MAIS PRÓXIMO do número (maior posição em `ctx`):
+    'rejeitar' se o rótulo colado ao número é de exequente/assinatura;
+    'forte' se é de executado/contribuinte/sócio; None se não há rótulo.
+    Evita rejeitar um CPF legítimo só porque um 'cnpj/mf' de outra entidade
+    aparece longe, mas dentro da janela.
+    """
+    pos_forte = max((ctx.rfind(k) for k in _CTX_FORTE_EXECUTADO), default=-1)
+    pos_rej = max((ctx.rfind(k) for k in _CTX_REJEITAR), default=-1)
+    if pos_rej > pos_forte:
+        return "rejeitar"
+    if pos_forte > -1:
+        return "forte"
     return None
-
+ 
+ 
+def _extrair_cpf_cnpj(text):
+    """
+    Extrai o CPF/CNPJ do EXECUTADO (prioriza CNPJ). Devolve str formatado ou None.
+    Robustez V8.1: valida DV, aceita CNPJ sem zero à esquerda/sem pontos, aceita
+    CPF cru só com rótulo forte, e rejeita por contexto exequente/assinaturas.
+    """
+    if not text:
+        return None
+    tn = normalizar(text)  # normalizar() já existe no agente1
+    melhor = None  # (chave_ordenacao, tipo, digitos)
+ 
+    for m in _RE_CANDIDATO.finditer(tn):
+        token = m.group(0)
+        dig = _so_digitos(token)
+        formatado = any(c in token for c in "./-")
+ 
+        # Classifica CPF vs CNPJ com validação de DV.
+        tipo = None
+        if len(dig) == 14 and validar_cnpj(dig):
+            tipo = "cnpj"
+        elif len(dig) == 13 and validar_cnpj("0" + dig):  # zero à esquerda perdido
+            tipo, dig = "cnpj", "0" + dig
+        elif len(dig) == 11 and validar_cpf(dig):
+            tipo = "cpf"
+        if not tipo:
+            continue
+ 
+        ctx = tn[max(0, m.start() - _CTX_JANELA): m.start()]
+        rotulo = _rotulo_mais_proximo(ctx)
+        if rotulo == "rejeitar":
+            continue
+        forte = (rotulo == "forte")
+ 
+        # Número CRU (sem máscara) sem rótulo forte é arriscado (telefone/
+        # registro que passe o DV por acaso) -> descarta.
+        if not formatado and not forte:
+            continue
+ 
+        chave = (
+            (10 if forte else 0) + (3 if formatado else 0),  # 1º: rótulo/forma
+            1 if tipo == "cnpj" else 0,                       # 2º: CNPJ > CPF
+            -m.start(),                                       # 3º: 1ª ocorrência
+        )
+        if melhor is None or chave > melhor[0]:
+            melhor = (chave, tipo, dig)
+ 
+    if melhor is None:
+        return None
+    _, tipo, dig = melhor
+    return _fmt_cnpj(dig) if tipo == "cnpj" else _fmt_cpf(dig)
+ 
 
 def _extrair_nome_executado(text):
     """Extrae el nombre/razón social del executado."""
@@ -1044,42 +1143,142 @@ def _extrair_nome_exequente(text):
     return None
 
 
+
+def _brl_to_float(s):
+    """'1.143,74' -> 1143.74. Tolerante a lixo de OCR; nunca lança."""
+    s = (s or "").strip().rstrip(".").rstrip(",")
+    if not s:
+        return 0.0
+    s = s.replace(".", "").replace(",", ".")
+    try:
+        return float(s)
+    except ValueError:
+        return 0.0
+ 
+ 
+def _float_to_brl(v):
+    """1143.74 -> '1.143,74'."""
+    return f"{v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+ 
+ 
+_RE_CDA_EXERCICIO   = re.compile(r"certidao de debito n\.?\s*\d{2}\.(\d{4})\.")
+_RE_EXERCICIO_LABEL = re.compile(r"exercicio\s+(\d{4})")
+_RE_DATA_INSCR      = re.compile(r"data de inscricao\s*:?\s*(\d{2}/\d{2}/\d{4})")
+_RE_TOTAL_CDA       = re.compile(r"\btotal\s+r\$\s*([\d.,]+)")
+_RE_ORIGINARIO      = re.compile(r"valor originari[oa]\s*r\$?\s*([\d.,]+)")
+ 
+ 
+def _parse_data(s):
+    try:
+        return datetime.strptime(s, "%d/%m/%Y")
+    except (ValueError, TypeError):
+        return None
+ 
+ 
+def _coletar_cdas(tn):
+    """
+    Divide o texto normalizado em blocos de Certidão de Débito e extrai por
+    bloco: exercício, Data de Inscrição, Valor Originário e Total.
+    Só retorna blocos que tenham ao menos um dos valores.
+    """
+    marcadores = [m.start() for m in re.finditer(r"certidao de debito", tn)]
+    if not marcadores:
+        return []
+    marcadores.append(len(tn))
+ 
+    cdas = []
+    for i in range(len(marcadores) - 1):
+        bloco = tn[marcadores[i]:marcadores[i + 1]]
+        m_ex = _RE_CDA_EXERCICIO.search(bloco) or _RE_EXERCICIO_LABEL.search(bloco)
+        exercicio = m_ex.group(1) if m_ex else None
+        m_dt  = _RE_DATA_INSCR.search(bloco)
+        m_tot = _RE_TOTAL_CDA.search(bloco)
+        m_ori = _RE_ORIGINARIO.search(bloco)
+        if not m_tot and not m_ori:
+            continue
+        cdas.append({
+            # blocos sem exercício NÃO se fundem entre si (chave única por bloco)
+            "chave"         : exercicio or f"_bloco{i}",
+            "data_inscricao": _parse_data(m_dt.group(1)) if m_dt else None,
+            "total"         : _brl_to_float(m_tot.group(1)) if m_tot else None,
+            "originario"    : _brl_to_float(m_ori.group(1)) if m_ori else None,
+        })
+    return cdas
+ 
+ 
+def _dedup_por_exercicio(cdas):
+    """
+    Mantém 1 CDA por exercício: a de Data de Inscrição mais recente (a vigente).
+    Sem data perde para quem tem data; entre iguais, fica a última vista.
+    """
+    vigentes = {}
+    for c in cdas:
+        k = c["chave"]
+        atual = vigentes.get(k)
+        if atual is None:
+            vigentes[k] = c
+            continue
+        d_novo, d_atual = c["data_inscricao"], atual["data_inscricao"]
+        if d_atual is None and d_novo is not None:
+            vigentes[k] = c
+        elif d_novo is not None and d_atual is not None and d_novo >= d_atual:
+            vigentes[k] = c
+        elif d_atual is None and d_novo is None:
+            vigentes[k] = c
+    return list(vigentes.values())
+ 
+ 
 def _extrair_valor(text):
-    """Devuelve (valor_original, valor_atualizado) como 'R$ X.XXX,XX' o None."""
-    text_norm = normalizar(text)
-
-    valor_original   = None
+    """
+    Devuelve (valor_original, valor_atualizado) como 'R$ X.XXX,XX' o None.
+    Ver cabeçalho do bloco para a regra de soma/dedup por exercício.
+    """
+    if not text:
+        return None, None
+    tn = normalizar(text)  # normalizar() já existe no agente1
+ 
+    valor_original = None
     valor_atualizado = None
-
-    for pat in [
-        r"valor origin[aá]ri[oa]\s*[r\$:\s]+([\d.,]+)",
-        r"valor original\s*[r\$:\s]+([\d.,]+)",
-        r"vl\.?\s*original\s*[r\$:\s]+([\d.,]+)",
-    ]:
-        m = re.search(pat, text_norm)
+ 
+    # --- Fonte primária: Certidões de Débito, 1 por exercício (a vigente) ---
+    cdas = _dedup_por_exercicio(_coletar_cdas(tn))
+    if cdas:
+        totais = [c["total"] for c in cdas if c["total"] is not None]
+        origs  = [c["originario"] for c in cdas if c["originario"] is not None]
+        if totais:
+            valor_atualizado = f"R$ {_float_to_brl(sum(totais))}"
+        if origs:  # [SUPOSIÇÃO A REVISAR] remova estas 2 linhas p/ voltar ao 1º só
+            valor_original = f"R$ {_float_to_brl(sum(origs))}"
+ 
+    # --- Fallbacks para documentos SEM certidões (outros formatos) ---
+    if valor_original is None:
+        for pat in [r"valor origin[aá]ri[oa]\s*[r\$:\s]+([\d.,]+)",
+                    r"valor original\s*[r\$:\s]+([\d.,]+)",
+                    r"vl\.?\s*original\s*[r\$:\s]+([\d.,]+)"]:
+            m = re.search(pat, tn)
+            if m:
+                valor_original = f"R$ {m.group(1).strip()}"
+                break
+ 
+    if valor_atualizado is None:
+        for pat in [r"valor total da divida parcelada\s*[:\s]*([\d.,]+)",
+                    r"total a pagar\s*[:\s]*([\d.,]+)",
+                    r"valor atualizado\s*[:\s]*([\d.,]+)",
+                    r"valor atual\s*[:\s]*([\d.,]+)",
+                    r"total em r\$\s*[:\s]*([\d.,]+)",
+                    r"vl\.?\s*corrigido\s*[:\s]*([\d.,]+)",
+                    r"total\s*geral\s*[-:>\s]*([\d.,]+)"]:
+            m = re.search(pat, tn)
+            if m:
+                valor_atualizado = f"R$ {m.group(1).strip()}"
+                break
+ 
+    if valor_original is None:
+        m = re.search(r"r\$\s*([\d.,]+)", tn)
         if m:
             valor_original = f"R$ {m.group(1).strip()}"
-            break
-
-    for pat in [
-        r"total em r\$\s*[:\s]*([\d.,]+)",
-        r"total a pagar\s*[:\s]*([\d.,]+)",
-        r"valor atual\s*[:\s]*([\d.,]+)",
-        r"valor atualizado\s*[:\s]*([\d.,]+)",
-        r"vl\.?\s*corrigido\s*[:\s]*([\d.,]+)",
-    ]:
-        m = re.search(pat, text_norm)
-        if m:
-            valor_atualizado = f"R$ {m.group(1).strip()}"
-            break
-
-    if not valor_original:
-        m = re.search(r"r\$\s*([\d.,]+)", text_norm)
-        if m:
-            valor_original = f"R$ {m.group(1).strip()}"
-
+ 
     return valor_original, valor_atualizado
-
 
 def _extrair_tipo_tributo(text):
     """Extrae el tipo de tributo de la CDA o del Classe-Assunto."""
@@ -1705,6 +1904,9 @@ def exportar_json_agente2(prompts, output_json):
                 "confianca_media"           : conf_media,
             },
             "entidades": {
+                # numero_processo também dentro de 'entidades' (além do nível
+                # superior) — é onde buscar_processo.py e o Agente 2 procuram.
+                "numero_processo"           : _nulo(ent.get("numero_processo")),
                 "cpf_cnpj"                  : _nulo(ent.get("cpf_cnpj")),
                 "nome_executado"            : _nulo(ent.get("nome_executado")),
                 "nome_exequente"            : _nulo(ent.get("nome_exequente")),
@@ -1771,7 +1973,7 @@ def exportar_historial_classificacoes(prompts, output_jsonl):
 
                 registro = {
                     "extraido_em"        : hoy.strftime("%Y-%m-%dT%H:%M:%S"),
-                    "id_lote"            : pdf_file,
+                    "arquivo"            : pdf_file,
                     "numero_processo"    : _nulo(ent.get("numero_processo")),
                     "es_execucao_fiscal" : tp.get("es_execucao_fiscal"),
                     "ultima_movimentacao": fecha_reciente.strftime("%Y-%m-%d") if fecha_reciente else None,
@@ -1801,9 +2003,13 @@ if __name__ == "__main__":
     os.makedirs(PASTA_RESULTADOS, exist_ok=True)
 
     _timestamp = datetime.now().strftime("%Y-%m-%d_%Hh%M")
-    output_file_resumo    = os.path.join(PASTA_JSON, f"resumo_sinais_V8.txt")
-    output_file_excel     = os.path.join(PASTA_RESULTADOS, f"resultados_V8.xlsx")
-    output_file_json      = os.path.join(PASTA_JSON, f"saida_agente1_V8.json")
+    output_file_resumo    = os.path.join(PASTA_JSON, f"resumo_sinais_V8_{_timestamp}.txt")
+    output_file_excel     = os.path.join(PASTA_RESULTADOS, f"resultados_V8_{_timestamp}.xlsx")
+    # [v8.3] Nome de saída alinhado ao que o Agente 2 e o buscar_processo esperam:
+    #        eles fazem glob("*_agente2.json"). Antes saía como
+    #        "saida_agente1_V8_<ts>.json" e NÃO era encontrado — a cadeia toda
+    #        ficava sem dados. O sufixo "_agente2.json" é o contrato entre etapas.
+    output_file_json      = os.path.join(PASTA_JSON, f"saida_agente1_V8_{_timestamp}_agente2.json")
     output_file_historico = os.path.join(PASTA_JSON, "historico_extracoes.jsonl")  # append-only
 
     prompts = generate_prompts(input_directory)
