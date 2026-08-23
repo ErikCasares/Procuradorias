@@ -51,6 +51,16 @@ SUFIJO_A1         = "_agente2.json"                  # JSON do Agente 1 (não co
 HISTORIAL_A2      = "historial_agente2.jsonl"
 HISTORIAL_CLASSIF = "historial_classificacoes.jsonl"  # [v2] auditoria V7.2 — TODAS as decisões
 
+# [v3] Contrato de saída (código de retorno) — consumido por webapp.py.
+#   0 = processo encontrado (relatório vai no stdout)
+#   EXIT_NAO_ENCONTRADO = número válido, mas ausente em TODAS as fontes
+#   qualquer outro código = falha real do script (a API traduz em 500)
+# Antes a API inferia "não encontrado" farejando a prosa do stdout; isso colidia
+# com valores de dado como "Citação não encontrado"/"Penhora não encontrado" e
+# devolvia relatório de sucesso com HTTP 404. O código de saída é inequívoco e
+# não depende do texto (nem carrega dado do contribuinte na decisão).
+EXIT_NAO_ENCONTRADO = 3
+
 
 # ── Utilidades ────────────────────────────────────────────────────
 
@@ -461,7 +471,9 @@ def main():
         for motivo in nao_encontrado["possiveis_motivos"]:
             print(_dim(f"  • {motivo}"))
         print(_dim(f"\n{nao_encontrado['sugestao']}"))
-        return
+        # [v3] Sinaliza ausência pelo código de saída — a API depende disto para
+        #      responder 404 sem farejar o texto (ver EXIT_NAO_ENCONTRADO).
+        sys.exit(EXIT_NAO_ENCONTRADO)
 
     print(_ok(f"\n═══ Processo {numero} encontrado ═══"))
 

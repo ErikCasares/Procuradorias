@@ -1520,6 +1520,19 @@ async def consultar_processo(
     saida = bruto_out.decode("utf-8", errors="replace")
     erro  = bruto_err.decode("utf-8", errors="replace")
 
+    # [v2] Contrato de saída do buscar_processo.py (ver EXIT_NAO_ENCONTRADO lá):
+    #   0 = encontrado   3 = não encontrado   qualquer outro = falha real → 500
+    #
+    # ANTES a decisão vinha de farejar o stdout ('não encontrado' in saida). Isso
+    # colidia com valores de dado do próprio processo — "Citação não encontrado",
+    # "Penhora não encontrado" — e devolvia o relatório de SUCESSO com HTTP 404.
+    # O código de saída é inequívoco e não olha o conteúdo (nem o dado sensível).
+    EXIT_NAO_ENCONTRADO = 3
+
+    if proc.returncode == EXIT_NAO_ENCONTRADO:
+        log.info("Processo não encontrado — numero=%s consumidor=%s", numero, consumidor)
+        raise HTTPException(404, saida.strip() or f"Nenhum processo com o número {numero}.")
+
     if proc.returncode != 0:
         # Ex.: 2 = Python não achou buscar_processo.py; outros = exceção no script.
         log.error(
@@ -1531,11 +1544,6 @@ async def consultar_processo(
             f"buscar_processo.py falhou (código {proc.returncode}): "
             f"{(erro or saida).strip() or 'sem saída'}",
         )
-
-    # main() imprime "Processo não encontrado" e sai com 0 — o returncode não
-    # distingue esse caso, então detectamos pelo texto para manter o 404.
-    if "não encontrado" in saida.lower() or "nao encontrado" in saida.lower():
-        raise HTTPException(404, saida.strip())
 
     return PlainTextResponse(saida)
 
