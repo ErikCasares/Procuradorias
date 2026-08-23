@@ -334,7 +334,7 @@ def _mostrar_agente1(proc: dict):
     print(_titulo("\n┌─ AGENTE 1 — Triagem e dados extraídos"))
     print(_dim(f"│  fonte: {proc.get('_origem_arquivo','?')}"))
     print("│")
-    print(_linha("Arquivo",  ent.get("arquivo")))    
+    print(_linha("Arquivo",  proc.get("arquivo")))    
     print(_linha("Nº do processo",  ent.get("numero_processo")))
     print(_linha("Executado",       ent.get("nome_executado")))
     print(_linha("Exequente",       ent.get("nome_exequente")))
