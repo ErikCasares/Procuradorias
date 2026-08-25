@@ -2,7 +2,8 @@
 # para que o container reproduza o comportamento já validado localmente.
 
 # Agentes
-openai==2.28.0
+# A OpenAI saiu na v8.0 do Agente 1: a extração passou a ser 100% determinística
+# (regex + OCR), sem chamada a modelo. Nenhum módulo importa 'openai'.
 pandas==2.3.3
 pdfplumber==0.11.7
 pdf2image==1.17.0

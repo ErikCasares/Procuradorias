@@ -8,7 +8,7 @@ específico, buscando pelo número do processo (CNJ).
 Procura em TRÊS fontes:
   1. JSON do Agente 1  → resultados_*_agente2.json     (dados extraídos — TODOS os processos)
   2. Histórico Agente 2 → historial_agente2.jsonl       (análise e priorização — TODOS os processos)
-  3. Auditoria (V7.2)  → historial_classificacoes.jsonl (registro de extração/classificação)
+  3. Auditoria         → historico_extracoes.jsonl      (registro de extração — TODOS os processos)
 
   A partir da v8.0 não há triagem APTO/NÃO APTO: as fontes 1 e 2 contêm todos
   os processos do lote. A fonte 3 permanece como trilha de auditoria.
@@ -49,7 +49,9 @@ CURRENT_DIR       = os.path.dirname(os.path.abspath(__file__))
 PASTA_JSON        = os.path.join(CURRENT_DIR, "JSON")
 SUFIJO_A1         = "_agente2.json"                  # JSON do Agente 1 (não confundir com _resultado)
 HISTORIAL_A2      = "historial_agente2.jsonl"
-HISTORIAL_CLASSIF = "historial_classificacoes.jsonl"  # [v2] auditoria V7.2 — TODAS as decisões
+HISTORICO_EXTRACOES = "historico_extracoes.jsonl"   # auditoria — TODAS as extrações do Agente 1
+# Nome usado até a v7.2. Mantido só para ler históricos antigos já em disco.
+HISTORICO_EXTRACOES_LEGADO = "historial_classificacoes.jsonl"
 
 # [v3] Contrato de saída (código de retorno) — consumido por webapp.py.
 #   0 = processo encontrado (relatório vai no stdout)
@@ -89,15 +91,23 @@ def _buscar_em_json_agente1(pasta: str, numero_norm: str):
     Procura o processo nos arquivos *_agente2.json do Agente 1.
     Retorna o dict do processo (com decisão e entidades) ou None.
     """
-    # Todos os *_agente2.json, EXCETO os *_agente2_resultado.json (que são do Agente 2)
+    # Todos os *_agente2.json, EXCETO os *_agente2_resultado.json (do Agente 2).
+    #
+    # Da mais NOVA para a mais velha. O nome do lote começa com a data, então a
+    # ordem alfabética é cronológica; percorrendo ao contrário, o primeiro achado
+    # é o mais recente. Antes o laço ia do mais antigo e devolvia a cópia velha —
+    # o relatório mostrava a extração de meses atrás ao lado da priorização de
+    # hoje, que vem do histórico e é sempre a mais recente.
     padrao = os.path.join(pasta, f"*{SUFIJO_A1}")
-    for caminho in sorted(glob.glob(padrao)):
+    for caminho in sorted(glob.glob(padrao), reverse=True):
         if caminho.endswith("_resultado.json"):
             continue
         try:
             with open(caminho, encoding="utf-8") as f:
                 payload = json.load(f)
         except (json.JSONDecodeError, OSError):
+            # Arquivo corrompido ou ilegível: pula. Um byte ruim num lote não
+            # pode derrubar a consulta de todos os outros processos.
             continue
 
         for proc in payload.get("processos", []):
@@ -118,7 +128,7 @@ def _buscar_em_historial_agente2(pasta: str, numero_norm: str):
 
     O 'escolhido' é o estado vigente para exibição em destaque; o histórico
     completo são TODAS as linhas do processo (na ordem lida), para mostrar a
-    evolução das análises — mesmo padrão de _buscar_em_historial_classificacoes.
+    evolução das análises — mesmo padrão de _buscar_em_historico_extracoes.
     """
     caminho = os.path.join(pasta, HISTORIAL_A2)
     if not os.path.exists(caminho):
@@ -157,42 +167,47 @@ def _buscar_em_historial_agente2(pasta: str, numero_norm: str):
     return None, []
 
 
-def _buscar_em_historial_classificacoes(pasta: str, numero_norm: str):
+def _buscar_em_historico_extracoes(pasta: str, numero_norm: str):
     """
-    [v2] Procura no historial_classificacoes.jsonl (auditoria V7.2 — TODAS as
-    decisões, inclusive NÃO APTO). É esta fonte que faz o NÃO APTO aparecer.
+    Procura no historico_extracoes.jsonl — a trilha de auditoria que o Agente 1
+    grava para TODOS os processos, tenham eles entrado ou não no resultado.
 
-    APPEND-ONLY: um processo pode ter várias linhas (foi reclassificado entre
+    Lê também o nome antigo (historial_classificacoes.jsonl) para que um
+    histórico já gravado por uma versão anterior continue aparecendo.
+
+    APPEND-ONLY: um processo pode ter várias linhas (foi reprocessado entre
     lotes). Devolve uma tupla:
         (registro_mais_recente | None, historico_completo: list)
     O 'mais recente' representa o estado vigente; o histórico completo é o que
-    dá valor de auditoria (mostra a evolução da decisão).
+    dá valor de auditoria (mostra a evolução do processo entre lotes).
     """
-    caminho = os.path.join(pasta, HISTORIAL_CLASSIF)
-    if not os.path.exists(caminho):
-        return None, []
-
     historico = []
-    with open(caminho, encoding="utf-8") as f:
-        for linha in f:
-            linha = linha.strip()
-            if not linha:
-                continue
-            try:
-                rec = json.loads(linha)
-            except json.JSONDecodeError:
-                # Linha corrompida no histórico — pula, não derruba a busca
-                continue
-            if _normalizar_numero(rec.get("numero_processo")) == numero_norm:
-                historico.append(rec)
+    lido_de = None
+    for nome in (HISTORICO_EXTRACOES, HISTORICO_EXTRACOES_LEGADO):
+        caminho = os.path.join(pasta, nome)
+        if not os.path.exists(caminho):
+            continue
+        with open(caminho, encoding="utf-8") as f:
+            for linha in f:
+                linha = linha.strip()
+                if not linha:
+                    continue
+                try:
+                    rec = json.loads(linha)
+                except json.JSONDecodeError:
+                    # Linha corrompida no histórico — pula, não derruba a busca
+                    continue
+                if _normalizar_numero(rec.get("numero_processo")) == numero_norm:
+                    historico.append(rec)
+                    lido_de = lido_de or nome
 
     if not historico:
         return None, []
 
-    # "estado atual" = registro mais recente. v8.0 grava 'extraido_em' (extração);
-    # versões antigas gravavam 'classificado_em' (classificação). Usa os dois.
+    # "estado atual" = registro mais recente. A v8.0 grava 'extraido_em';
+    # versões antigas gravavam 'classificado_em'. Usa os dois.
     recente = max(historico, key=lambda r: r.get("classificado_em") or r.get("extraido_em") or "")
-    recente["_origem_arquivo"] = HISTORIAL_CLASSIF
+    recente["_origem_arquivo"] = lido_de or HISTORICO_EXTRACOES
     recente["_total_classificacoes"] = len(historico)
     return recente, historico
 
@@ -526,7 +541,7 @@ def buscar_dados(
     # la interfaz usada por webapp.py.
     proc_a1 = _buscar_em_json_agente1(pasta, numero_norm)
     rec_a2, hist_a2 = _buscar_em_historial_agente2(pasta, numero_norm)
-    audit_recente, audit_historico = _buscar_em_historial_classificacoes(pasta, numero_norm)
+    audit_recente, audit_historico = _buscar_em_historico_extracoes(pasta, numero_norm)
 
     if filtro is not None:
         proc_a1       = _aplicar_filtro(proc_a1, filtro)

@@ -21,6 +21,7 @@
 
 import os
 import re
+import tempfile
 import unicodedata
 from datetime import datetime
 import logging
@@ -76,18 +77,38 @@ PASTA_JSON       = os.environ.get("PASTA_JSON")       or os.path.join(CURRENT_DI
 PASTA_RESULTADOS = os.environ.get("PASTA_RESULTADOS") or os.path.join(CURRENT_DIR, "resultados")
 
 
-# --- Configuración de OCR (fallback para páginas escaneadas) ---
-OCR_DPI = 300
-# [AJUSTABLE] DPI más bajo = OCR más rápido. Medido: 300dpi≈1.27s/página,
-# 200dpi≈0.73s/página, 150dpi≈0.52s/página. Antes de bajarlo en producción,
-# comparar la "Confiança OCR (%)" del Excel contra una muestra real escaneada.
-OCR_MIN_CHARS = 20      # umbral empírico — ajustable según casos reales
-OCR_IDIOMA = 'por'
+# --- Configuração do OCR (usado só nas páginas digitalizadas) ---
+#
+# Tudo ajustável por variável de ambiente: é isto que o operador precisa mexer
+# quando falta memória no container, e recompilar a imagem para trocar uma
+# constante não é opção em produção.
+#
+# Custo medido por página: 300dpi≈1,27s · 200dpi≈0,73s · 150dpi≈0,52s. Antes de
+# baixar o DPI, compare a "Confiança OCR (%)" da planilha contra uma amostra
+# real digitalizada.
+def _env_int(nome, padrao, minimo=1):
+    bruto = os.environ.get(nome)
+    if bruto is None or str(bruto).strip() == "":
+        return padrao
+    try:
+        return max(minimo, int(str(bruto).strip()))
+    except ValueError:
+        logging.warning(f"{nome}={bruto!r} não é um número — usando o padrão {padrao}")
+        return padrao
 
-# Agrupamiento de páginas OCR en lotes, para reducir llamadas a Poppler.
-OCR_CLUSTER_GAP = 5     # páginas separadas por <= N páginas se fusionan en un lote
-OCR_MAX_LOTE = 40       # tamaño máximo de un lote
-OCR_MAX_WORKERS = 4     # lotes procesados en paralelo
+
+OCR_DPI       = _env_int("OCR_DPI", 200)
+OCR_MIN_CHARS = _env_int("OCR_MIN_CHARS", 20)
+OCR_IDIOMA    = os.environ.get("OCR_IDIOMA") or "por"
+
+# Agrupamento das páginas de OCR em lotes, para reduzir chamadas ao Poppler.
+OCR_CLUSTER_GAP = _env_int("OCR_CLUSTER_GAP", 5)
+
+# Lote e paralelismo governam o PICO DE MEMÓRIA. Uma página A4 a 200 DPI ocupa
+# ~12 MB descomprimida; o padrão anterior (40 páginas × 4 workers) chegava a
+# vários GB e era morto pelo OOM num container de 1-2 GB.
+OCR_MAX_LOTE    = _env_int("OCR_MAX_LOTE", 10)
+OCR_MAX_WORKERS = _env_int("OCR_MAX_WORKERS", 2)
 
 
 def _pagina_necesita_ocr(texto_pagina, min_chars=OCR_MIN_CHARS):
@@ -129,16 +150,22 @@ def _agrupar_paginas_en_lotes(paginas_ocr, gap_maximo=OCR_CLUSTER_GAP, max_lote=
 
 def _ocr_lote(pdf_path, inicio, fin, paginas_necesarias, dpi=OCR_DPI, idioma=OCR_IDIOMA):
     """
-    Renderiza el rango [inicio, fin] en UNA sola llamada a Poppler y aplica OCR
-    solo a las páginas de `paginas_necesarias` dentro de ese rango.
-    Devuelve {numero_pagina: (texto_extraido, confianza_0_a_100)}.
+    Renderiza o intervalo [inicio, fin] numa única chamada ao Poppler e aplica
+    OCR apenas nas páginas de `paginas_necesarias` dentro desse intervalo.
+    Devolve {numero_pagina: (texto_extraido, confianca_0_a_100)}.
+
+    As páginas são renderizadas para ARQUIVOS num diretório temporário e
+    abertas UMA POR VEZ. A versão anterior recebia a lista de imagens do lote
+    inteiro na memória: 40 páginas a 300 DPI ≈ 1 GB por lote, multiplicado
+    pelos lotes em paralelo — era o que matava o container em PDF grande.
     """
-    # Import lazy + falla visible si falta OCR: no interrumpe el lote entero,
-    # devuelve texto vacío para esas páginas y registra el motivo en el log.
+    # Import preguiçoso, e falha visível: a ausência de OCR não derruba o lote
+    # inteiro — devolve texto vazio para essas páginas e registra o motivo.
     try:
         import pytesseract
         from pytesseract import Output
         from pdf2image import convert_from_path
+        from PIL import Image
     except ImportError as e:
         logging.error(
             f"Dependência de OCR ausente ({e}). Página(s) {sorted(paginas_necesarias)} "
@@ -149,32 +176,56 @@ def _ocr_lote(pdf_path, inicio, fin, paginas_necesarias, dpi=OCR_DPI, idioma=OCR
         return {p: ("", 0.0) for p in paginas_necesarias}
 
     resultados = {}
-    try:
-        imagenes = convert_from_path(pdf_path, dpi=dpi, first_page=inicio, last_page=fin)
-    except Exception as e:
-        logging.error(f"Error renderizando lote {inicio}-{fin} de {pdf_path}: {e}", exc_info=True)
-        for p in paginas_necesarias:
-            resultados[p] = ("", 0.0)
-        return resultados
+    nome_pdf = os.path.basename(pdf_path)
 
-    for offset, imagen in enumerate(imagenes):
-        numero_pagina = inicio + offset
-        if numero_pagina not in paginas_necesarias:
-            continue  # esta página del rango ya tenía texto digital
+    with tempfile.TemporaryDirectory(prefix="ocr-") as tmp:
         try:
-            datos = pytesseract.image_to_data(imagen, lang=idioma, output_type=Output.DICT)
-            palabras, confianzas = [], []
-            for texto, conf in zip(datos['text'], datos['conf']):
-                if texto.strip():
-                    palabras.append(texto)
-                    if int(conf) >= 0:   # tesseract usa -1 cuando no calcula confianza
-                        confianzas.append(int(conf))
-            texto_final = ' '.join(palabras)
-            confianza = sum(confianzas) / len(confianzas) if confianzas else 0.0
-            resultados[numero_pagina] = (texto_final, confianza)
+            caminhos = convert_from_path(
+                pdf_path, dpi=dpi, first_page=inicio, last_page=fin,
+                output_folder=tmp, paths_only=True, fmt="png",
+            )
         except Exception as e:
-            logging.error(f"Error OCR en página {numero_pagina} de {pdf_path}: {e}", exc_info=True)
-            resultados[numero_pagina] = ("", 0.0)
+            logging.error(
+                f"Erro ao renderizar as páginas {inicio}-{fin} de {nome_pdf}: {e}",
+                exc_info=True,
+            )
+            return {p: ("", 0.0) for p in paginas_necesarias}
+
+        for offset, caminho_img in enumerate(caminhos):
+            numero_pagina = inicio + offset
+            if numero_pagina not in paginas_necesarias:
+                continue          # esta página do intervalo já tinha texto digital
+            try:
+                with Image.open(caminho_img) as imagem:
+                    dados = pytesseract.image_to_data(
+                        imagem, lang=idioma, output_type=Output.DICT
+                    )
+                palavras, confiancas = [], []
+                for texto, conf in zip(dados["text"], dados["conf"]):
+                    if not (texto or "").strip():
+                        continue
+                    palavras.append(texto)
+                    try:
+                        valor = float(conf)
+                    except (TypeError, ValueError):
+                        continue
+                    if valor >= 0:    # o tesseract usa -1 quando não calcula
+                        confiancas.append(valor)
+                resultados[numero_pagina] = (
+                    " ".join(palavras),
+                    sum(confiancas) / len(confiancas) if confiancas else 0.0,
+                )
+            except Exception as e:
+                logging.error(
+                    f"Erro de OCR na página {numero_pagina} de {nome_pdf}: {e}",
+                    exc_info=True,
+                )
+                resultados[numero_pagina] = ("", 0.0)
+
+    # Página que o Poppler nem chegou a entregar entra como vazia, para o
+    # chamador nunca receber um dicionário incompleto.
+    for pagina in paginas_necesarias:
+        resultados.setdefault(pagina, ("", 0.0))
     return resultados
 
 
@@ -303,9 +354,16 @@ def extract_text_by_page(pdf_path):
             texto = page.extract_text()
             if _pagina_necesita_ocr(texto):
                 paginas_que_necesitan_ocr.append(i)
-                textos[i] = None  # se completa en la fase de OCR
+                textos[i] = None  # completado na fase de OCR
             else:
                 textos[i] = texto
+            # O pdfplumber guarda o parse de cada página lida. Sem liberar,
+            # um PDF de mil páginas retém vários GB antes mesmo do OCR — era
+            # metade do estouro de memória nos processos grandes.
+            page.flush_cache()
+            limpar = getattr(getattr(page, "get_textmap", None), "cache_clear", None)
+            if limpar:
+                limpar()
 
     metadata = {"paginas_ocr": [], "confianza_ocr": {}}
 
@@ -317,7 +375,7 @@ def extract_text_by_page(pdf_path):
         }
         logging.info(
             f"  {os.path.basename(pdf_path)}: {len(paginas_que_necesitan_ocr)} página(s) "
-            f"necesitam OCR, agrupadas em {len(lotes)} lote(s) (até {OCR_MAX_WORKERS} em paralelo)"
+            f"precisam de OCR, agrupadas em {len(lotes)} lote(s) (até {OCR_MAX_WORKERS} em paralelo)"
         )
         with ThreadPoolExecutor(max_workers=OCR_MAX_WORKERS) as executor:
             futuros = {
@@ -1649,20 +1707,26 @@ def generate_prompts(input_dir):
             if ocr_metadata["paginas_ocr"]:
                 n = len(ocr_metadata["paginas_ocr"])
                 conf_prom = sum(ocr_metadata["confianza_ocr"].values()) / n
-                logging.info(f"  {pdf_file}: {n} página(s) vía OCR, confianza media {conf_prom:.1f}%")
+                logging.info(f"  {pdf_file}: {n} página(s) por OCR, confiança média {conf_prom:.1f}%")
 
             if not full_text.strip():
                 logging.warning(f"PDF sin texto extraíble: {pdf_file}")
+                print(f"EXTRACAO FALHOU: {pdf_file} — PDF sem texto extraível")
                 prompts.append((pdf_file, None, None, None, None, None, None,
-                                "Erro - PDF sem texto", None, "", ocr_metadata, tipo_processo, None))
+                                "Erro - PDF sem texto",
+                                "PDF sem texto extraível — digitalização ilegível ou arquivo vazio",
+                                "", ocr_metadata, tipo_processo, None))
                 continue
 
             tipo_processo = detectar_tipo_processo(full_text)
             if (not tipo_processo["es_execucao_fiscal"]) and tipo_processo["confianza"] == "alta":
                 logging.warning(f"  {pdf_file}: FORA DE ESCOPO — {tipo_processo['motivo']}")
+                print(f"FORA DE ESCOPO: {pdf_file} — {tipo_processo['motivo']}")
                 prompts.append((
                     pdf_file, None, None, None, None, None, None,
-                    "Fora de escopo - não é execução fiscal", None, full_text, ocr_metadata, tipo_processo, None
+                    "Fora de escopo - não é execução fiscal",
+                    f"Fora de escopo — não é execução fiscal: {tipo_processo['motivo']}",
+                    full_text, ocr_metadata, tipo_processo, None
                 ))
                 continue
 
@@ -1696,8 +1760,11 @@ def generate_prompts(input_dir):
 
         except Exception as e:
             logging.error(f"Erro ao processar {pdf_file}: {e}", exc_info=True)
+            print(f"EXTRACAO FALHOU: {pdf_file} — {type(e).__name__}: {e}")
             prompts.append((
-                pdf_file, None, None, None, None, None, None, "Erro", None, full_text, ocr_metadata, tipo_processo, None
+                pdf_file, None, None, None, None, None, None, "Erro",
+                f"Falha ao ler o PDF ({type(e).__name__}): {e}",
+                full_text, ocr_metadata, tipo_processo, None
             ))
 
     return prompts
@@ -1740,6 +1807,10 @@ def process_prompts_to_excel(prompts, output_excel):
             # ── Identificação / tipo ──────────────────────────────────────
             "CASO"                          : pdf_file,
             "Número do processo"            : ent.get("numero_processo") or "",
+            # Vazio quando a extração correu bem. Preenchido, avisa o procurador
+            # de que a linha NÃO foi lida do PDF — antes ela saía vazia e era
+            # indistinguível de um processo lido sem dados.
+            "Erro na extração"              : respuesta_gpt or "",
             "É execução fiscal?"            : ("Sim" if tp.get("es_execucao_fiscal") else "Não") if tp else "",
             "Confiança tipo processo"       : tp.get("confianza", "") if tp else "",
             "Classe-Assunto (PJe)"          : (tp.get("classe_assunto") or "(não detectado)") if tp else "",
@@ -1879,11 +1950,19 @@ def exportar_json_agente2(prompts, output_json):
         conf_dict = ocr_meta.get("confianza_ocr", {})
         conf_media = round(sum(conf_dict.values()) / len(conf_dict), 1) if conf_dict else None
 
+        # 'respuesta_gpt' passou a carregar o motivo quando a extração não deu certo
+        # (PDF ilegível, sem texto ou fora de escopo). Sem este campo, um processo
+        # que nunca foi lido saía no JSON igual a um processo lido sem dados — e o
+        # Agente 2 ainda lhe atribuía prioridade.
+        erro_extracao = _nulo(respuesta_gpt)
+
         processos.append({
             "arquivo"                       : pdf_file,
             "numero_processo"               : _nulo(ent.get("numero_processo")),
+            "extracao_ok"                   : erro_extracao is None,
+            "erro_extracao"                 : erro_extracao,
             "tipo_processo": {
-                "es_execucao_fiscal"        : tp.get("es_execucao_fiscal"),
+                "e_execucao_fiscal"         : tp.get("es_execucao_fiscal"),
                 "confianca"                 : tp.get("confianza"),
                 "classe_assunto"            : _nulo(tp.get("classe_assunto")),
             },
@@ -1922,10 +2001,11 @@ def exportar_json_agente2(prompts, output_json):
 
     payload = {
         "metadata": {
-            "generado_em"     : hoy.strftime("%Y-%m-%dT%H:%M:%S"),
-            "total_procesados": len(prompts),
-            "version_agente1" : VERSION_AGENTE1,
-            "observacao"      : "Agente 1 faz apenas extração determinística; não emite juízo APTO/NÃO APTO.",
+            "gerado_em"        : hoy.strftime("%Y-%m-%dT%H:%M:%S"),
+            "total_processados": len(prompts),
+            "total_com_erro"   : sum(1 for pr in processos if not pr["extracao_ok"]),
+            "versao_agente1"   : VERSION_AGENTE1,
+            "observacao"       : "Agente 1 faz apenas extração determinística; não emite juízo APTO/NÃO APTO.",
         },
         "processos": processos,
     }
@@ -1934,7 +2014,10 @@ def exportar_json_agente2(prompts, output_json):
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
     print(f"JSON do Agente 1 gerado: {output_json}")
-    print(f"  {len(processos)} processo(s) exportado(s) (todos, sem filtro).")
+    com_erro = sum(1 for pr in processos if not pr["extracao_ok"])
+    print(f"  {len(processos) - com_erro} de {len(processos)} processo(s) extraído(s) com sucesso.")
+    if com_erro:
+        print(f"  {com_erro} processo(s) NÃO puderam ser extraídos — ver 'erro_extracao' no JSON.")
     return payload
 
 
@@ -1942,7 +2025,7 @@ def exportar_json_agente2(prompts, output_json):
 # 9.2 — HISTÓRICO DE EXTRAÇÕES (auditoria acumulativa — append-only)
 # ===========================================================================
 
-def exportar_historial_classificacoes(prompts, output_jsonl):
+def exportar_historico_extracoes(prompts, output_jsonl):
     """
     Registra TODOS os processos do lote num JSONL — uma linha por processo.
     APPEND-ONLY: nunca sobrescreve o rastro anterior. Cada processo vai em
@@ -1975,7 +2058,8 @@ def exportar_historial_classificacoes(prompts, output_jsonl):
                     "extraido_em"        : hoy.strftime("%Y-%m-%dT%H:%M:%S"),
                     "arquivo"            : pdf_file,
                     "numero_processo"    : _nulo(ent.get("numero_processo")),
-                    "es_execucao_fiscal" : tp.get("es_execucao_fiscal"),
+                    "e_execucao_fiscal"  : tp.get("es_execucao_fiscal"),
+                    "erro_extracao"      : _nulo(respuesta_gpt),
                     "ultima_movimentacao": fecha_reciente.strftime("%Y-%m-%d") if fecha_reciente else None,
                     "status_citacao"     : _nulo(citacion),
                     "resultado_penhora"  : _nulo(penhora),
@@ -2012,4 +2096,4 @@ if __name__ == "__main__":
     save_prompts_to_file(prompts, output_file_resumo)
     process_prompts_to_excel(prompts, output_file_excel)
     exportar_json_agente2(prompts, output_file_json)
-    exportar_historial_classificacoes(prompts, output_file_historico)
+    exportar_historico_extracoes(prompts, output_file_historico)

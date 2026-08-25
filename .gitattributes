@@ -1,0 +1,7 @@
+# O entrypoint roda dentro do container Linux. Com CRLF, o kernel não acha o
+# interpretador e o container morre no start com "no such file or directory" —
+# erro que não diz nada sobre a causa real. Trava em LF, mesmo quando o clone
+# é feito no Windows com core.autocrlf=true.
+*.sh text eol=lf
+Dockerfile text eol=lf
+entrypoint.sh text eol=lf

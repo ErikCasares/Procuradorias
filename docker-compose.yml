@@ -10,13 +10,35 @@ services:
     ports:
       - "${PORT:-3000}:3000"
     environment:
-      OPENAI_API_KEY: ${OPENAI_API_KEY:?defina OPENAI_API_KEY no arquivo .env}
       API_TOKENS: ${API_TOKENS:?rode 'python gerar_credencial.py api siap' e cole o hash no .env}
       SENHA_PAINEL_HASH: ${SENHA_PAINEL_HASH:?rode 'python gerar_credencial.py painel' e cole o hash no .env}
       COOKIE_SEGURO: ${COOKIE_SEGURO:-0}
       HORAS_SESSAO: ${HORAS_SESSAO:-12}
-      MAX_MB_LOTE: ${MAX_MB_LOTE:-200}
+      MAX_MB_LOTE: ${MAX_MB_LOTE:-500}
+      TIMEOUT_AGENTE_S: ${TIMEOUT_AGENTE_S:-3600}
+      # Retenção: os PDFs recebidos são o que enche o volume (100 MB cada).
+      # 0 desliga a limpeza.
+      RETENCAO_PDF_DIAS: ${RETENCAO_PDF_DIAS:-7}
+      RETENCAO_LOTE_DIAS: ${RETENCAO_LOTE_DIAS:-90}
       TZ: ${TZ:-America/Campo_Grande}
+      # ── OCR — só entram em ação nas páginas digitalizadas ──
+      # Governam o pico de memória. Se o container for morto por falta de
+      # memória (o log mostra "código -9"), baixe OCR_MAX_LOTE e OCR_MAX_WORKERS
+      # antes de mexer no DPI: o DPI afeta a qualidade do reconhecimento.
+      OCR_DPI: ${OCR_DPI:-200}
+      OCR_MAX_LOTE: ${OCR_MAX_LOTE:-10}
+      OCR_MAX_WORKERS: ${OCR_MAX_WORKERS:-2}
+      # ── Priorização do Agente 2 (R$) ──
+      # Ordena o trabalho do procurador; NÃO é critério de ajuizamento.
+      LIMIAR_PRIORIDADE_ALTA: ${LIMIAR_PRIORIDADE_ALTA:-5000}
+      LIMIAR_PRIORIDADE_MEDIA: ${LIMIAR_PRIORIDADE_MEDIA:-1000}
+    # O OCR é o que consome memória. Sem teto, um PDF grande derruba o host;
+    # com teto, o container morre sozinho e o lote é reportado como erro.
+    # Mínimo recomendado: 2 GB. Abaixo disso, reduza OCR_MAX_LOTE.
+    deploy:
+      resources:
+        limits:
+          memory: ${MEM_LIMITE:-2g}
     volumes:
       - "./processos pra analiser:/app/processos pra analiser"
       - "./JSON:/app/JSON"
@@ -26,7 +48,7 @@ services:
   # ── Agente 2 — watcher contínuo da pasta JSON/ ──────────────────
   # Opcional: a web já chama o Agente 2 ao fim de cada lote. Só é útil
   # se algum outro processo despejar JSON em JSON/ por fora da web.
-  # Uso: docker compose --profile watcher up -d
+  # Uso: docker compose --profile watcher up -d agente2
   agente2:
     build: .
     image: procuradorias:latest
@@ -34,22 +56,27 @@ services:
     restart: unless-stopped
     environment:
       TZ: ${TZ:-America/Campo_Grande}
+      LIMIAR_PRIORIDADE_ALTA: ${LIMIAR_PRIORIDADE_ALTA:-5000}
+      LIMIAR_PRIORIDADE_MEDIA: ${LIMIAR_PRIORIDADE_MEDIA:-1000}
     volumes:
       - "./JSON:/app/JSON"
       - "./resultados:/app/resultados"
     command: ["python", "agente2.py", "--watch"]
 
   # ── Agente 1 — lote pontual pela linha de comando ───────────────
-  # Uso: docker compose run --rm agente1
+  # Processa os PDFs que estiverem em "processos pra analiser/".
+  # Uso: docker compose --profile batch run --rm agente1
   agente1:
     build: .
     image: procuradorias:latest
     profiles: ["batch"]
     environment:
-      OPENAI_API_KEY: ${OPENAI_API_KEY:?defina OPENAI_API_KEY no arquivo .env}
       TZ: ${TZ:-America/Campo_Grande}
+      OCR_DPI: ${OCR_DPI:-200}
+      OCR_MAX_LOTE: ${OCR_MAX_LOTE:-10}
+      OCR_MAX_WORKERS: ${OCR_MAX_WORKERS:-2}
     volumes:
       - "./processos pra analiser:/app/processos pra analiser"
       - "./JSON:/app/JSON"
       - "./resultados:/app/resultados"
-    command: ["python", "promptV7.1.py"]
+    command: ["python", "agente1.py"]

@@ -78,7 +78,7 @@ INTERVALO_WATCH   = 10                          # segundos entre chequeos del wa
 LIMIAR_PRIORIDADE_ALTA  = float(os.environ.get("LIMIAR_PRIORIDADE_ALTA",  "5000"))
 LIMIAR_PRIORIDADE_MEDIA = float(os.environ.get("LIMIAR_PRIORIDADE_MEDIA", "1000"))
 
-VERSION_AGENTE2 = "0.3-placeholder"
+VERSION_AGENTE2 = "0.3"
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -127,7 +127,7 @@ def _cargar_processos_registrados(path_jsonl: str) -> dict:
                 if np:
                     registrados[np] = i
             except json.JSONDecodeError:
-                log.warning(f"Línea {i} corrupta en historial — ignorada")
+                log.warning(f"Linha {i} corrompida no histórico — ignorada")
     return registrados
 
 def _escribir_historial(path_jsonl: str, resultados: list, origen: str):
@@ -173,10 +173,10 @@ def _escribir_historial(path_jsonl: str, resultados: list, origen: str):
         np = (r.get("entidades") or {}).get("numero_processo") or r.get("numero_processo")
         if not np:
             log.warning(
-                f"  Processo sem numero_processo — agregado sem deduplicar: "
-                f"{r.get('id_lote','?')}"
+                f"  Processo sem número — agregado sem deduplicar: "
+                f"{r.get('id_lote') or '?'}"
             )
-            np = f"SIN_NP_{r.get('id_lote','desconocido')}"
+            np = f"SEM_NUMERO_{r.get('id_lote') or 'origem_desconhecida'}"
  
         vez = contador.get(np, 0) + 1
         contador[np] = vez
@@ -206,7 +206,7 @@ def _escribir_historial(path_jsonl: str, resultados: list, origen: str):
                 f.write("\n".join(linhas) + "\n")
         except OSError as e:
             # Falha VISÍVEL: loga claro e propaga. O caller decide.
-            log.error(f"_escribir_historial: FALHA ao gravar {path_jsonl}: {e}")
+            log.error(f"Falha ao gravar o histórico {path_jsonl}: {e}")
             raise
  
     return novos, reanalises
@@ -236,7 +236,7 @@ def _ultimo_estado_por_processo(path_jsonl: str) -> list:
             try:
                 rec = json.loads(line)
             except json.JSONDecodeError:
-                log.warning(f"_ultimo_estado_por_processo: linha {i} corrompida — ignorada")
+                log.warning(f"Histórico: linha {i} corrompida — ignorada")
                 continue
             np = rec.get("numero_processo")
             if not np:
@@ -319,7 +319,9 @@ def analisar_processo(processo: dict) -> dict:
     # ──────────────────────────────────────────────────────────────
 
     return {
-        "id_lote"          : processo.get("id_lote"),
+        # 'arquivo' é como o Agente 1 chama o PDF de origem; 'id_lote' era o
+        # nome antigo. Sem este fallback a procedência some do relatório.
+        "id_lote"          : processo.get("arquivo") or processo.get("id_lote"),
         "numero_processo"  : ent.get("numero_processo") or processo.get("numero_processo"),
         "nome_executado"   : ent.get("nome_executado"),
         "agente1"          : snapshot_a1,
@@ -502,13 +504,13 @@ def processar_lote(path_json: str):
     Lee un JSON del Agente 1, analiza cada proceso y escribe resultado.
     Devuelve la ruta del archivo de resultado, o None si hubo error.
     """
-    log.info(f"Procesando lote: {os.path.basename(path_json)}")
+    log.info(f"Processando lote: {os.path.basename(path_json)}")
 
     try:
         with open(path_json, encoding="utf-8") as f:
             payload = json.load(f)
     except Exception as e:
-        log.error(f"Error leyendo {path_json}: {e}")
+        log.error(f"Erro ao ler {path_json}: {e}")
         return None
 
     processos  = payload.get("processos", [])
@@ -528,9 +530,9 @@ def processar_lote(path_json: str):
                 f"{_acao[:55]}"
             )
         except Exception as e:
-            log.error(f"  Error en {proc.get('id_lote','?')}: {e}")
+            log.error(f"  Erro em {proc.get('arquivo') or proc.get('id_lote') or '?'}: {e}")
             resultados.append({
-                "id_lote"      : proc.get("id_lote"),
+                "id_lote"      : proc.get("arquivo") or proc.get("id_lote"),
                 "erro"         : str(e),
                 "processado_em": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
             })
@@ -544,16 +546,15 @@ def processar_lote(path_json: str):
 
     output_payload = {
         "metadata": {
-            "generado_em"      : datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
-            "version_agente2"  : VERSION_AGENTE2,
+            "gerado_em"        : datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+            "versao_agente2"   : VERSION_AGENTE2,
             "total_analisados" : len(resultados),
             "prioridades"      : prioridades,
             "origem_agente1"   : {
                 "arquivo"         : os.path.basename(path_json),
-                "generado_em"     : meta_a1.get("generado_em"),
-                "total_procesados": meta_a1.get("total_procesados"),
-                "total_aptos"     : meta_a1.get("total_aptos"),
-                "version_agente1" : meta_a1.get("version_agente1"),
+                "gerado_em"        : meta_a1.get("gerado_em") or meta_a1.get("generado_em"),
+                "total_processados": meta_a1.get("total_processados") or meta_a1.get("total_procesados"),
+                "versao_agente1"   : meta_a1.get("versao_agente1") or meta_a1.get("version_agente1"),
             }
         },
         "analises": resultados,
@@ -562,25 +563,41 @@ def processar_lote(path_json: str):
     # Asegurar que la carpeta resultados/ existe
     os.makedirs(PASTA_RESULTADOS, exist_ok=True)
 
-    # Resultado por lote → resultados/*_agente2_resultado.json
-    nombre_output = os.path.basename(path_json).replace(SUFIJO_INPUT, SUFIJO_OUTPUT)
-    path_output   = os.path.join(PASTA_JSON, nombre_output)
+    # Resultado por lote → *_agente2_resultado.json
+    #
+    # str.replace() não muda nada quando o sufixo não está no nome, e o
+    # resultado ia gravado EM CIMA do arquivo de entrada — destruindo o JSON do
+    # Agente 1 em qualquer chamada '--arquivo' com outro nome (o do próprio
+    # Agente 1, 'saida_agente1_V8.json', é justamente um desses).
+    base = os.path.basename(path_json)
+    if base.endswith(SUFIJO_INPUT):
+        nome_output = base[:-len(SUFIJO_INPUT)] + SUFIJO_OUTPUT
+    else:
+        nome_output = os.path.splitext(base)[0] + SUFIJO_OUTPUT
+    path_output = os.path.join(PASTA_JSON, nome_output)
+
+    if os.path.abspath(path_output) == os.path.abspath(path_json):
+        log.error(
+            f"O resultado sairia em cima da entrada ({base}) — abortando para "
+            "não destruir o JSON do Agente 1."
+        )
+        return None
 
     try:
         # Resultado por lote (JSON único por lote)
         with open(path_output, "w", encoding="utf-8") as f:
             json.dump(output_payload, f, ensure_ascii=False, indent=2)
-        log.info(f"  Resultado del lote: resultados/{os.path.basename(path_output)}")
+        log.info(f"  Resultado do lote: {os.path.basename(path_output)}")
 
         # Historial JSONL acumulativo → resultados/historial_agente2.jsonl
         pasta = os.path.dirname(os.path.abspath(path_json))
         path_jsonl = _ruta_historial(pasta)
-        nuevos, actualizados = _escribir_historial(
+        novos, atualizados = _escribir_historial(
             path_jsonl, resultados, os.path.basename(path_json)
         )
         log.info(
-            f"  Historial: {os.path.basename(path_jsonl)} — "
-            f"+{nuevos} nuevos, {actualizados} actualizados"
+            f"  Histórico: {os.path.basename(path_jsonl)} — "
+            f"{novos} novo(s), {atualizados} atualizado(s)"
         )
 
         # Generar reporte Excel acumulativo a partir del historial
@@ -595,7 +612,7 @@ def processar_lote(path_json: str):
         )
         return path_output
     except Exception as e:
-        log.error(f"Error escribiendo resultado: {e}")
+        log.error(f"Erro ao gravar o resultado: {e}")
         return None
 
 
@@ -614,81 +631,91 @@ def _valor_para_ordenar(valor_str):
         return 0.0
 
 
-def gerar_reporte_xlsx(path_jsonl: str, path_xlsx: str):
+def gerar_reporte_xlsx(path_jsonl: str, path_xlsx: str, origens=None):
     """
-    Genera un reporte Excel acumulativo a partir del historial JSONL.
+    Gera o relatório Excel de priorização a partir do histórico JSONL.
 
-    El reporte lee TODOS los procesos registrados en el historial (no solo
-    el último lote), los ordena por prioridade (ALTA → MEDIA → BAIXA) y
-    dentro de cada nivel por valor de deuda descendente, y aplica formato
-    para lectura rápida por el procurador.
+    Lê a vista DEDUPLICADA do histórico — uma linha por processo, com o estado
+    mais recente e a contagem de quantas vezes ele foi reanalisado. Antes lia o
+    JSONL append-only cru, e cada reprocessamento do mesmo processo virava uma
+    linha nova: o procurador via o mesmo devedor repetido várias vezes.
 
-    Requiere: pandas, openpyxl.
+    origens: conjunto de nomes de arquivo de origem (campo 'origem_lote').
+             Quando informado, só entram os processos vindos desses lotes — é
+             assim que a API entrega a cada consumidor um relatório com os
+             lotes DELE. None = todos, que é o relatório do procurador.
+
+    Ordena por prioridade (ALTA → MEDIA → BAIXA) e, dentro de cada nível, por
+    valor da dívida decrescente.
+
+    Requer: pandas, openpyxl.
     """
     try:
         import pandas as pd
         from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
         from openpyxl.utils import get_column_letter
     except ImportError as e:
-        log.error(f"Falta dependencia para el reporte Excel: {e}")
-        log.error("Instalar con: pip install pandas openpyxl")
+        log.error(f"Falta dependência para gerar o relatório Excel: {e}")
+        log.error("Instale com: pip install pandas openpyxl")
         return None
 
     if not os.path.exists(path_jsonl):
-        log.warning(f"No hay historial JSONL para generar el reporte: {path_jsonl}")
+        log.warning(f"Sem histórico JSONL para gerar o relatório: {path_jsonl}")
         return None
 
-    # ── Leer todos los procesos del historial ──
+    # ── Uma linha por processo: o estado mais recente ──
     filas = []
-    with open(path_jsonl, encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                rec = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-
-            analise = rec.get("analise", {})
-            filas.append({
-                "Prioridade"       : analise.get("prioridade", ""),
-                "Nº Processo"      : rec.get("numero_processo", ""),
-                "Executado"        : rec.get("nome_executado", ""),
-                "Ação Recomendada" : analise.get("acao_recomendada", ""),
-                "Alerta Prescrição": "SIM" if analise.get("alerta_prescricao") else "",
-                "Justificativa"    : analise.get("justificativa", ""),
-                "Observações"      : " | ".join(analise.get("observacoes", [])),
-                "Origem (lote)"    : rec.get("origem_lote", ""),
-                "Processado em"    : rec.get("processado_em", ""),
-                "id_lote"          : rec.get("id_lote", ""),
-            })
+    for rec in _ultimo_estado_por_processo(path_jsonl):
+        if origens is not None and rec.get("origem_lote") not in origens:
+            continue
+        analise = rec.get("analise", {})
+        filas.append({
+            "Prioridade"       : analise.get("prioridade", ""),
+            "Nº Processo"      : rec.get("numero_processo", ""),
+            "Executado"        : rec.get("nome_executado", ""),
+            "Ação Recomendada" : analise.get("acao_recomendada", ""),
+            "Alerta Prescrição": "SIM" if analise.get("alerta_prescricao") else "",
+            "Justificativa"    : analise.get("justificativa", ""),
+            "Observações"      : " | ".join(analise.get("observacoes", [])),
+            "Arquivo de origem": rec.get("id_lote", "") or "",
+            "Origem (lote)"    : rec.get("origem_lote", ""),
+            "Processado em"    : rec.get("processado_em", ""),
+            "Vezes analisado"  : rec.get("vez_analisada", 1),
+        })
 
     if not filas:
-        log.warning("Historial vacío — no se genera reporte Excel")
+        log.warning("Histórico vazio — o relatório Excel não foi gerado")
         return None
 
     df = pd.DataFrame(filas)
 
-    # ── Ordenar: prioridade (ALTA→MEDIA→BAIXA) y valor desc ──
-    # El valor no está en el JSONL directamente; extraerlo de la justificativa
-    _ORDEN_PRIORIDADE = {"ALTA": 0, "MEDIA": 1, "BAIXA": 2, "": 3}
-    df["_ord_prio"] = df["Prioridade"].map(lambda p: _ORDEN_PRIORIDADE.get(p, 3))
-    # Extraer valor de la justificativa ("valor da dívida: R$ X")
-    def _extraer_valor_justif(j):
+    # ── Ordenar: prioridade (ALTA→MEDIA→BAIXA) e valor decrescente ──
+    # O valor não está no JSONL como número; sai da justificativa, que o
+    # _justificar() escreve como "valor da dívida: R$ X".
+    _ORDEM_PRIORIDADE = {"ALTA": 0, "MEDIA": 1, "BAIXA": 2, "": 3}
+    df["_ord_prio"] = df["Prioridade"].map(lambda p: _ORDEM_PRIORIDADE.get(p, 3))
+
+    def _extrair_valor_justif(j):
         m = re.search(r"valor da d[ií]vida:\s*(R\$[\d.,]+)", str(j))
         return _valor_para_ordenar(m.group(1)) if m else 0.0
-    df["_ord_valor"] = df["Justificativa"].map(_extraer_valor_justif)
+    df["_ord_valor"] = df["Justificativa"].map(_extrair_valor_justif)
 
     df = df.sort_values(
         by=["_ord_prio", "_ord_valor"],
         ascending=[True, False]
     ).drop(columns=["_ord_prio", "_ord_valor"])
 
-    # ── Escribir con formato ──
-    os.makedirs(os.path.dirname(path_xlsx), exist_ok=True)
+    # ── Escrever com formato ──
+    # Grava num temporário e só então move por cima do arquivo final: o
+    # relatório é baixável pela web enquanto o Agente 2 roda, e escrever no
+    # lugar entregava um .xlsx truncado a quem baixasse no meio.
+    destino = os.path.dirname(os.path.abspath(path_xlsx))
+    os.makedirs(destino, exist_ok=True)
+    # O pandas valida a extensão do arquivo de saída, então o temporário
+    # também precisa terminar em .xlsx.
+    path_tmp = path_xlsx[:-5] + ".parcial.xlsx" if path_xlsx.endswith(".xlsx") else path_xlsx + ".parcial.xlsx"
 
-    with pd.ExcelWriter(path_xlsx, engine="openpyxl") as writer:
+    with pd.ExcelWriter(path_tmp, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="Priorização")
         ws = writer.sheets["Priorização"]
 
@@ -699,12 +726,12 @@ def gerar_reporte_xlsx(path_jsonl: str, path_xlsx: str):
         borde = Border(*[Side(style="thin", color="D0D0D0")] * 4)
 
         fills_prioridade = {
-            "ALTA" : PatternFill("solid", fgColor="F8CBAD"),   # rojo suave
-            "MEDIA": PatternFill("solid", fgColor="FFE699"),   # amarillo suave
+            "ALTA" : PatternFill("solid", fgColor="F8CBAD"),   # vermelho suave
+            "MEDIA": PatternFill("solid", fgColor="FFE699"),   # amarelo suave
             "BAIXA": PatternFill("solid", fgColor="C6E0B4"),   # verde suave
         }
 
-        # Header
+        # Cabeçalho
         for col_idx, col_name in enumerate(df.columns, start=1):
             c = ws.cell(row=1, column=col_idx)
             c.font = font_header
@@ -712,11 +739,11 @@ def gerar_reporte_xlsx(path_jsonl: str, path_xlsx: str):
             c.alignment = align_header
             c.border = borde
 
-        # Filas de datos
+        # Linhas de dados
         col_prioridade = list(df.columns).index("Prioridade") + 1
         for row_idx in range(2, len(df) + 2):
-            prioridade = ws.cell(row=row_idx, column=col_prioridade).value
-            fill = fills_prioridade.get(prioridade)
+            prio = ws.cell(row=row_idx, column=col_prioridade).value
+            fill = fills_prioridade.get(prio)
             for col_idx in range(1, len(df.columns) + 1):
                 c = ws.cell(row=row_idx, column=col_idx)
                 c.font = Font(name="Arial", size=10)
@@ -725,22 +752,22 @@ def gerar_reporte_xlsx(path_jsonl: str, path_xlsx: str):
                 if fill and col_idx == col_prioridade:
                     c.fill = fill
 
-        # Anchos de columna
-        anchos = {
+        # Largura das colunas
+        larguras = {
             "Prioridade": 11, "Nº Processo": 22, "Executado": 30,
-            "Ação Recomendada": 45, "Alerta Prescrição": 12,
-            "Justificativa": 40, "Observações": 45,
-            "Origem (lote)": 22, "Processado em": 20, "id_lote": 24,
+            "Ação Recomendada": 38, "Alerta Prescrição": 10,
+            "Justificativa": 50, "Observações": 40,
+            "Arquivo de origem": 26, "Origem (lote)": 26,
+            "Processado em": 20, "Vezes analisado": 10,
         }
         for col_idx, col_name in enumerate(df.columns, start=1):
-            letra = get_column_letter(col_idx)
-            ws.column_dimensions[letra].width = anchos.get(col_name, 18)
+            ws.column_dimensions[get_column_letter(col_idx)].width = larguras.get(col_name, 18)
 
-        # Congelar header y activar autofiltro
         ws.freeze_panes = "A2"
         ws.auto_filter.ref = f"A1:{get_column_letter(len(df.columns))}{len(df)+1}"
 
-    log.info(f"  Reporte Excel: resultados/{os.path.basename(path_xlsx)} ({len(df)} processos)")
+    os.replace(path_tmp, path_xlsx)
+    log.info(f"  Relatório Excel: {os.path.basename(path_xlsx)} ({len(df)} processo(s))")
     return path_xlsx
 
 
@@ -763,9 +790,9 @@ def watcher(pasta: str, intervalo: int = INTERVALO_WATCH):
     *_agente2.json nuevo o modificado. Termina con Ctrl+C.
     """
     log.info(f"=== Agente 2 iniciado — v{VERSION_AGENTE2} ===")
-    log.info(f"Monitoreando: {pasta}")
-    log.info(f"Sufijo buscado: *{SUFIJO_INPUT}")
-    log.info(f"Intervalo: {intervalo}s — Ctrl+C para detener\n")
+    log.info(f"Monitorando: {pasta}")
+    log.info(f"Sufixo procurado: *{SUFIJO_INPUT}")
+    log.info(f"Intervalo: {intervalo}s — Ctrl+C para parar\n")
 
     procesados = set()  # evitar reprocesar en el mismo ciclo
 
@@ -777,7 +804,7 @@ def watcher(pasta: str, intervalo: int = INTERVALO_WATCH):
                 path_str = str(path_json)
                 if not _ya_procesado(path_str):
                     if path_str not in procesados:
-                        log.info(f"Nuevo archivo detectado: {path_json.name}")
+                        log.info(f"Novo arquivo detectado: {path_json.name}")
                     processar_lote(path_str)
                     procesados.add(path_str)
                 elif path_str in procesados:
@@ -787,7 +814,7 @@ def watcher(pasta: str, intervalo: int = INTERVALO_WATCH):
             time.sleep(intervalo)
 
     except KeyboardInterrupt:
-        log.info("Agente 2 detenido.")
+        log.info("Agente 2 encerrado.")
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -822,7 +849,7 @@ def main():
         watcher(args.pasta, args.intervalo)
     else:
         if not os.path.exists(args.arquivo):
-            log.error(f"Archivo no encontrado: {args.arquivo}")
+            log.error(f"Arquivo não encontrado: {args.arquivo}")
             sys.exit(1)
         resultado = processar_lote(args.arquivo)
         sys.exit(0 if resultado else 1)

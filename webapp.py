@@ -37,6 +37,7 @@ import sys
 import json
 import shutil
 import hashlib
+import tempfile
 import secrets
 import asyncio
 import logging
@@ -49,7 +50,7 @@ from typing import Any
 
 from fastapi import (
     Cookie, Depends, FastAPI, File, Form, HTTPException,
-    Query, Security, UploadFile,
+    Query, Request, Security, UploadFile,
 )
 from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
@@ -83,10 +84,38 @@ PASTA_DADOS   = BASE_DIR / "dados"
 PASTA_LOTES   = PASTA_DADOS / "lotes"
 ARQ_REGISTRO  = PASTA_DADOS / "registro.json"
 
+# Planilhas recortadas por consumidor, montadas sob demanda. Não é histórico:
+# pode ser apagada a qualquer momento que a próxima chamada refaz.
+PASTA_RECORTES = PASTA_DADOS / "recortes"
+
+
 # Pasta de entrada do uso manual por linha de comando (compatibilidade)
 PASTA_ENTRADA_PADRAO = BASE_DIR / "processos pra analiser"
 
+# Prefixos que somem do log devolvido ao consumidor: ele não precisa da árvore
+# de diretórios do servidor, e mostrá-la só ajuda quem for atacar o serviço.
+# Os mais longos primeiro, para o prefixo maior casar antes do menor.
+_PREFIXOS_INTERNOS = tuple(sorted(
+    (str(PASTA_LOTES), str(PASTA_DADOS), str(PASTA_JSON), str(PASTA_RESULT),
+     str(PASTA_ENTRADA_PADRAO), str(BASE_DIR)),
+    key=len, reverse=True,
+))
+
 MAX_MB_LOTE    = int(os.getenv("MAX_MB_LOTE", "500"))
+
+# Teto por etapa (Agente 1, depois Agente 2). A fila é serial: sem teto, um
+# agente travado segura todos os lotes seguintes para sempre. Uma hora é folga
+# suficiente para um lote grande e ainda assim destrava o serviço sozinho.
+TIMEOUT_AGENTE_S = int(os.getenv("TIMEOUT_AGENTE_S", "3600"))
+
+# Retenção em disco. Os PDFs recebidos são o que pesa — o do cliente tem 100 MB
+# cada. Zero desliga a limpeza (mantém tudo, como era antes).
+RETENCAO_PDF_DIAS  = int(os.getenv("RETENCAO_PDF_DIAS", "7"))
+RETENCAO_LOTE_DIAS = int(os.getenv("RETENCAO_LOTE_DIAS", "90"))
+
+# Quantas linhas de log ficam GRAVADAS por lote. Em memória vale MAX_LINHAS_LOG;
+# no arquivo, menos: o registro é reserializado inteiro a cada salvamento.
+MAX_LINHAS_LOG_DISCO = 120
 MAX_LINHAS_LOG = 500
 HORAS_SESSAO   = int(os.getenv("HORAS_SESSAO", "12"))
 COOKIE_SEGURO  = os.getenv("COOKIE_SEGURO", "0") == "1"
@@ -237,7 +266,14 @@ def _senha_confere(enviada: str) -> bool:
 # ════════════════════════════════════════════════════════════════
 
 _sessoes = {}   # token de sessão → validade (datetime)
-_falhas_login = deque(maxlen=50)   # timestamps, para frear tentativa em massa
+
+# Falhas de login POR IP. Global e sem IP, dez senhas erradas de qualquer origem
+# trancavam o painel para todo mundo por cinco minutos — inclusive para o
+# procurador que sabe a senha. Num serviço publicado, isso é negação de serviço
+# de graça.
+_falhas_login = {}          # ip → deque de timestamps
+MAX_FALHAS_LOGIN = 10
+JANELA_FALHAS_MIN = 5
 
 # Declarado como esquema de segurança para o Swagger mostrar o botão Authorize —
 # o integrador cola o token uma vez e testa todas as rotas. auto_error=False
@@ -324,14 +360,88 @@ def _garantir_pastas():
 
 
 def _salvar_registro():
-    """Persiste o registro para os lotes sobreviverem a um restart."""
+    """
+    Persiste o registro para os lotes sobreviverem a um restart.
+
+    Grava uma projeção enxuta: o log vai aparado nas últimas
+    MAX_LINHAS_LOG_DISCO linhas. O registro é reserializado INTEIRO a cada
+    salvamento, então cada linha guardada é multiplicada pelo número de lotes —
+    com mil lotes, um log completo por lote vira dezenas de MB reescritos a cada
+    mudança de estado.
+    """
     try:
+        enxuto = {}
+        for lid, lote in _lotes.items():
+            copia = dict(lote)
+            registro_log = lote.get("log") or []
+            if len(registro_log) > MAX_LINHAS_LOG_DISCO:
+                copia["log"] = registro_log[-MAX_LINHAS_LOG_DISCO:]
+            enxuto[lid] = copia
+
         tmp = ARQ_REGISTRO.with_suffix(".tmp")
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(_lotes, f, ensure_ascii=False, indent=2)
+            json.dump(enxuto, f, ensure_ascii=False, indent=2)
         os.replace(tmp, ARQ_REGISTRO)
     except Exception as e:
         log.error(f"Não foi possível salvar o registro de lotes: {e}")
+
+
+async def _salvar_registro_async():
+    """
+    Mesmo salvamento, fora do event loop.
+
+    json.dump do registro inteiro é síncrono e, com muitos lotes, segura o
+    servidor por centenas de milissegundos — enquanto isso nenhuma outra
+    requisição é atendida.
+    """
+    await asyncio.to_thread(_salvar_registro)
+
+
+def _limpar_antigos() -> None:
+    """
+    Aplica a retenção: primeiro os PDFs recebidos, depois o lote inteiro.
+
+    Os PDFs são o volume: o original continua com quem enviou, e o que o serviço
+    produziu (planilha, JSON) fica até a retenção do lote. Sem isto, nada nunca
+    era apagado e o volume enchia em silêncio.
+    """
+    if not (RETENCAO_PDF_DIAS or RETENCAO_LOTE_DIAS):
+        return
+
+    agora = datetime.now()
+    pdfs_apagados = lotes_apagados = 0
+
+    for lote_id, lote in list(_lotes.items()):
+        if lote.get("status") in ("na_fila", "processando"):
+            continue
+        marca = lote.get("concluido_em") or lote.get("criado_em")
+        if not marca:
+            continue
+        try:
+            quando = datetime.strptime(marca, "%Y-%m-%d %H:%M:%S")
+        except (ValueError, TypeError):
+            continue
+        idade = (agora - quando).days
+
+        if RETENCAO_LOTE_DIAS and idade >= RETENCAO_LOTE_DIAS:
+            shutil.rmtree(_dir_lote(lote_id), ignore_errors=True)
+            _lotes.pop(lote_id, None)
+            lotes_apagados += 1
+            continue
+
+        if RETENCAO_PDF_DIAS and idade >= RETENCAO_PDF_DIAS:
+            entrada = _dir_lote(lote_id) / "entrada"
+            if entrada.exists():
+                shutil.rmtree(entrada, ignore_errors=True)
+                pdfs_apagados += 1
+
+    if pdfs_apagados or lotes_apagados:
+        log.info(
+            f"Retenção: PDFs de {pdfs_apagados} lote(s) apagados "
+            f"(> {RETENCAO_PDF_DIAS} dias), {lotes_apagados} lote(s) removidos "
+            f"(> {RETENCAO_LOTE_DIAS} dias)"
+        )
+        _salvar_registro()
 
 
 def _carregar_registro():
@@ -393,6 +503,10 @@ _XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 # regerado do histórico inteiro a cada lote, então traz também os lotes anteriores.
 _XLSX_AGENTE2 = "historial_agente2.xlsx"
 
+# Histórico acumulativo do Agente 2 (HISTORIAL_JSONL em agente2.py) — é a fonte
+# a partir da qual se monta o recorte de cada consumidor.
+_JSONL_AGENTE2 = "historial_agente2.jsonl"
+
 
 def _arquivos_do_lote(lote: dict) -> dict:
     """
@@ -410,7 +524,7 @@ def _arquivos_do_lote(lote: dict) -> dict:
         if p.exists():
             mapa["agente1_planilha"] = (p, f"lote_{lid}_agente1.xlsx", _XLSX)
 
-    p = d / "json" / "resultados_procesosV8.json"
+    p = d / "json" / "saida_agente1_V8.json"
     if p.exists():
         mapa["agente1_json"] = (p, f"lote_{lid}_agente1.json", "application/json")
 
@@ -430,8 +544,44 @@ DESCRICAO_ARQUIVO = {
     "agente1_json"    : "Extração e classificação do Agente 1 (JSON) — só deste lote",
     "agente2_json"    : "Priorização do Agente 2 (JSON) — só deste lote",
     "agente2_planilha": "Relatório de priorização do Agente 2 (Excel) — ACUMULADO: "
-                        "regerado do histórico inteiro, inclui os lotes anteriores",
+                        "todos os processos dos SEUS lotes, não só os deste",
 }
+
+
+def _origens_do_consumidor(consumidor: str) -> set:
+    """
+    Nomes de arquivo que o Agente 2 grava no campo 'origem_lote' dos lotes deste
+    consumidor. É a chave que recorta o histórico compartilhado.
+    """
+    return {
+        f"lote_{lote['id']}_agente2.json"
+        for lote in _lotes.values()
+        if lote.get("origem") == consumidor
+    }
+
+
+def _planilha_a2_recortada(consumidor: str):
+    """
+    Monta a planilha de priorização com APENAS os lotes deste consumidor e
+    devolve o caminho, ou None se ele ainda não tem processo no histórico.
+
+    Existe porque resultados/historial_agente2.xlsx é único, global e
+    acumulativo: entregá-lo direto a um consumidor da API vazaria nome,
+    CPF/CNPJ e valor de dívida dos processos de todos os outros.
+    """
+    historico = PASTA_JSON / _JSONL_AGENTE2
+    origens = _origens_do_consumidor(consumidor)
+    if not historico.exists() or not origens:
+        return None
+    try:
+        import agente2
+        PASTA_RECORTES.mkdir(parents=True, exist_ok=True)
+        destino = PASTA_RECORTES / f"priorizacao_{consumidor}.xlsx"
+        gerado = agente2.gerar_reporte_xlsx(str(historico), str(destino), origens=origens)
+        return Path(gerado) if gerado else None
+    except Exception:
+        log.exception(f"Falha ao montar a planilha do consumidor '{consumidor}'")
+        return None
 
 
 def _publico(lote: dict, incluir_log=False, incluir_analises=False) -> dict:
@@ -456,7 +606,9 @@ def _publico(lote: dict, incluir_log=False, incluir_analises=False) -> dict:
         "lotes_na_frente" : _lotes_na_frente(lote) if status == "na_fila" else None,
         # O que dá para baixar deste lote, para o consumidor não ter que
         # tentar cada rota e colecionar 404.
-        "downloads"       : sorted(_arquivos_do_lote(lote)) if status == "concluido" else [],
+        # Também em lote com erro: o Agente 1 pode ter concluído e deixado a
+        # planilha pronta antes de o Agente 2 falhar.
+        "downloads"       : sorted(_arquivos_do_lote(lote)) if status in ("concluido", "erro") else [],
         "resumo"       : lote.get("resumo"),
         "avisos"       : lote.get("avisos", []),
         "erro"         : lote.get("erro"),
@@ -473,38 +625,51 @@ def _publico(lote: dict, incluir_log=False, incluir_analises=False) -> dict:
 # DIAGNÓSTICO DO DESFECHO
 # ════════════════════════════════════════════════════════════════
 #
-# O promptV7.1.py trata OCR quebrado e erro de API internamente e ainda assim
-# encerra com código 0 — um lote pode "terminar bem" tendo classificado zero
-# processos. Sem isto o consumidor recebe status de sucesso e planilha vazia.
+# O Agente 1 trata OCR quebrado e PDF ilegível internamente e ainda assim encerra
+# com código 0 — um lote pode "terminar bem" tendo extraído zero processos. Sem
+# isto o consumidor recebe status de sucesso e planilha vazia.
 
-_RE_RESUMO = re.compile(r"(\d+)\s+processo\(s\)\s+APTO\(s\)\s+de\s+(\d+)\s+procesados")
+# Casa com a linha final do Agente 1: "  9 de 12 processo(s) extraído(s) com sucesso."
+_RE_RESUMO = re.compile(r"(\d+)\s+de\s+(\d+)\s+processo\(s\)\s+extra[íi]do\(s\)\s+com\s+sucesso")
 
 _SINTOMAS = (
-    (("poppler",),             "Poppler indisponível — o OCR não conseguiu renderizar as páginas escaneadas"),
-    (("tesseract",),           "Tesseract indisponível — o OCR não rodou"),
-    (("error code: 401", "invalid_api_key", "authenticationerror"),
-                               "OpenAI recusou a autenticação (401) — verifique a OPENAI_API_KEY"),
-    (("error code: 429", "ratelimiterror", "rate_limit_exceeded", "rate limit reached"),
-                               "OpenAI limitou as chamadas (429) — cota ou rate limit atingido"),
-    (("insufficient_quota",),  "Cota da OpenAI esgotada"),
-    (("sin texto extraíble",), "Algum PDF ficou sem texto extraível — confira a qualidade do digitalizado"),
-    (("memoryerror",),         "Memória insuficiente durante o OCR — reduza OCR_MAX_WORKERS ou OCR_DPI"),
+    (("poppler",),         "Poppler indisponível — o OCR não conseguiu renderizar as páginas escaneadas"),
+    (("tesseract",),       "Tesseract indisponível — o OCR não rodou"),
+    (("extracao falhou",), "Algum PDF não pôde ser lido — veja 'Erro na extração' na planilha do Agente 1"),
+    (("fora de escopo",),  "Algum arquivo não é uma execução fiscal — confira antes de usar o resultado"),
+    (("sem texto extraível", "sin texto extraíble"),
+                           "Algum PDF ficou sem texto extraível — confira a qualidade do digitalizado"),
+    (("memoryerror", "out of memory", "killed"),
+                           "Memória insuficiente durante o OCR — reduza OCR_MAX_WORKERS ou OCR_DPI"),
 )
 
 
 def _diagnosticar(linhas: list) -> tuple:
+    """
+    Lê o log dos agentes e responde duas perguntas que o status sozinho não
+    responde: quanto do lote saiu de fato, e o que deu errado no caminho.
+    """
     texto = "\n".join(linhas)
     baixo = texto.lower()
+
+    avisos = [msg for gatilhos, msg in _SINTOMAS
+              if any(g.lower() in baixo for g in gatilhos)]
 
     resumo = None
     m = _RE_RESUMO.search(texto)
     if m:
-        resumo = f"{m.group(1)} de {m.group(2)} processo(s) classificados como APTO"
-
-    avisos = [msg for gatilhos, msg in _SINTOMAS
-              if any(g.lower() in baixo for g in gatilhos)]
-    if m and m.group(1) == "0" and int(m.group(2)) > 0:
-        avisos.insert(0, "Nenhum processo foi classificado como APTO — o resultado sairá vazio")
+        ok, total = int(m.group(1)), int(m.group(2))
+        resumo = f"{ok} de {total} processo(s) extraído(s) com sucesso"
+        if total == 0:
+            avisos.insert(0, "Nenhum processo foi lido — o resultado sairá vazio")
+        elif ok == 0:
+            avisos.insert(0, "Nenhum processo pôde ser extraído — o resultado sairá vazio")
+        elif ok < total:
+            avisos.insert(0, f"{total - ok} de {total} processo(s) não puderam ser extraídos")
+    else:
+        # O Agente 1 sempre imprime essa linha ao terminar. A ausência dela
+        # significa que ele morreu antes de exportar — não que rodou bem.
+        avisos.insert(0, "O Agente 1 não chegou a exportar o resultado — trate como falha")
 
     return resumo, avisos
 
@@ -513,7 +678,69 @@ def _diagnosticar(linhas: list) -> tuple:
 # PIPELINE
 # ════════════════════════════════════════════════════════════════
 
+# Um erro de biblioteca despeja 10-15 linhas de traceback no log do lote, que
+# é devolvido ao consumidor e mostrado no painel. Medido: uma única falha de
+# OCR encheu 100 das 188 linhas do lote, empurrando o resto para fora do teto.
+# O que resta útil é a ÚLTIMA linha — o tipo e a mensagem da exceção.
+_INICIO_TRACEBACK = "Traceback (most recent call last)"
+_CONTINUA_TRACEBACK = (
+    "During handling of the above exception",
+    "The above exception was the direct cause",
+)
+
+
+def _encurtar_caminhos(linha: str) -> str:
+    """
+    Tira os prefixos das pastas do serviço, deixando o caminho relativo.
+
+    Só remove PREFIXO CONHECIDO. A versão anterior encurtava qualquer token
+    com barra, e comia dado do processo: o CNPJ "13.504.675/0001-10" saía
+    como "0001-10" no log do cliente.
+    """
+    for base in _PREFIXOS_INTERNOS:
+        if base in linha:
+            linha = linha.replace(base + "\\", "").replace(base + "/", "").replace(base, "")
+    return linha
+
+
+class _FiltroLog:
+    """
+    Transcreve a saída de um agente para o log do lote, colapsando cada
+    traceback na sua linha de exceção. Tem estado porque um traceback ocupa
+    várias linhas e só se sabe onde termina ao chegar nele.
+    """
+
+    def __init__(self):
+        self.no_traceback = False
+
+    def __call__(self, linha: str):
+        if not linha:
+            return None
+
+        if _INICIO_TRACEBACK in linha or any(m in linha for m in _CONTINUA_TRACEBACK):
+            self.no_traceback = True
+            return None
+
+        if self.no_traceback:
+            # Quadro do traceback (indentado) ou a costura entre dois deles:
+            # segue engolindo.
+            if linha.startswith((" ", "\t")) or any(m in linha for m in _CONTINUA_TRACEBACK):
+                return None
+            # Primeira linha não indentada: é a exceção. Guarda essa e sai
+            # do modo traceback.
+            self.no_traceback = False
+            return _encurtar_caminhos(linha)
+
+        return _encurtar_caminhos(linha)
+
 async def _executar(cmd: list, ambiente: dict, lote: dict, etapa: str) -> int:
+    """
+    Roda um agente e transcreve a saída dele para o log do lote.
+
+    Com teto de tempo: passado TIMEOUT_AGENTE_S o processo é morto e a etapa
+    falha. Sem isso, um agente travado segura a fila serial indefinidamente e
+    todo lote seguinte fica em 'na_fila' sem explicação nenhuma.
+    """
     lote["etapa"] = etapa
     lote["log"].append(f"{_agora()}  ── {etapa} ──")
 
@@ -522,16 +749,38 @@ async def _executar(cmd: list, ambiente: dict, lote: dict, etapa: str) -> int:
         cwd=str(BASE_DIR),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
-        env={**os.environ, "PYTHONUNBUFFERED": "1", **ambiente},
+        env={**os.environ, "PYTHONUNBUFFERED": "1",
+             "PYTHONIOENCODING": "utf-8", **ambiente},
     )
-    async for bruto in proc.stdout:
-        linha = bruto.decode("utf-8", errors="replace").rstrip()
-        if linha:
-            lote["log"].append(f"{_agora()}  {linha}")
-            if len(lote["log"]) > MAX_LINHAS_LOG:
-                del lote["log"][:-MAX_LINHAS_LOG]
-    return await proc.wait()
 
+    filtrar = _FiltroLog()
+
+    async def _transcrever():
+        async for bruto in proc.stdout:
+            linha = filtrar(bruto.decode("utf-8", errors="replace").rstrip())
+            if linha:
+                lote["log"].append(f"{_agora()}  {linha}")
+                if len(lote["log"]) > MAX_LINHAS_LOG:
+                    del lote["log"][:-MAX_LINHAS_LOG]
+        return await proc.wait()
+
+    try:
+        return await asyncio.wait_for(_transcrever(), timeout=TIMEOUT_AGENTE_S)
+    except asyncio.TimeoutError:
+        minutos = TIMEOUT_AGENTE_S // 60
+        lote["log"].append(
+            f"{_agora()}  TEMPO ESGOTADO: a etapa passou de {minutos} min e foi interrompida"
+        )
+        log.error(f"Lote {lote['id']}: '{etapa}' estourou {TIMEOUT_AGENTE_S}s — matando o processo")
+        try:
+            proc.kill()
+            await proc.wait()
+        except ProcessLookupError:
+            pass
+        raise RuntimeError(
+            f"A etapa '{etapa}' passou de {minutos} minutos e foi interrompida. "
+            "Reenvie o lote com menos processos, ou reduza OCR_MAX_LOTE/OCR_DPI."
+        )
 
 async def _processar_lote(lote: dict):
     lote_id = lote["id"]
@@ -626,12 +875,27 @@ async def _processar_lote(lote: dict):
         lote["log"].append(f"{_agora()}  ERRO: {e}")
         log.exception(f"Falha no lote {lote_id}")
 
+        # O que o Agente 1 já produziu continua valendo. Sem registrar a
+        # planilha aqui, uma falha do Agente 2 tornava inalcançável um Excel
+        # que está em disco e é útil — o procurador perdia a extração inteira
+        # por causa da etapa seguinte.
+        try:
+            resgatada = next(iter(sorted(saida_result.glob("*.xlsx"))), None)
+            if resgatada:
+                lote["planilha"] = resgatada.name
+                lote["log"].append(
+                    f"{_agora()}  A planilha do Agente 1 ficou pronta antes da falha "
+                    "e continua disponível para download"
+                )
+        except Exception:
+            log.exception(f"Lote {lote_id}: falha ao resgatar a planilha do Agente 1")
+
     finally:
         resumo, avisos = _diagnosticar(lote.get("log", []))
         lote["resumo"] = resumo
         lote["avisos"] = avisos
         lote["concluido_em"] = _agora()
-        _salvar_registro()
+        await _salvar_registro_async()
 
 
 async def _worker():
@@ -647,6 +911,12 @@ async def _worker():
             log.exception(f"Worker falhou no lote {lote_id}")
         finally:
             _fila.task_done()
+            # Depois de cada lote, e não num timer: é aqui que o disco acabou
+            # de crescer, e é o único momento em que a fila está livre.
+            try:
+                await asyncio.to_thread(_limpar_antigos)
+            except Exception:
+                log.exception("Falha na limpeza de lotes antigos")
 
 
 # ════════════════════════════════════════════════════════════════
@@ -704,8 +974,11 @@ class Analise(BaseModel):
 
     prioridade: str | None = Field(
         None,
-        description="ALTA (dívida ≥ R$ 10.000 ou parado ≥ 5 anos), "
-                    "MEDIA (R$ 1.000 a R$ 10.000) ou BAIXA",
+        description="Ordena o trabalho do procurador; NÃO é critério de ajuizamento. "
+                    "ALTA: dívida ≥ R$ 5.000, OU risco de prescrição (art. 174 CTN), "
+                    "OU 5 anos sem movimentação. MEDIA: R$ 1.000 a R$ 5.000. "
+                    "BAIXA: abaixo de R$ 1.000. Os limiares são provisórios e "
+                    "ajustáveis por LIMIAR_PRIORIDADE_ALTA / LIMIAR_PRIORIDADE_MEDIA.",
         examples=["ALTA"],
     )
     acao_recomendada : str | None = None
@@ -946,6 +1219,10 @@ async def lifespan(app: FastAPI):
     global _fila
     _garantir_pastas()
     _carregar_registro()
+    try:
+        _limpar_antigos()
+    except Exception:
+        log.exception("Falha na limpeza de lotes antigos — seguindo mesmo assim")
     _fila = asyncio.Queue()
     tarefa = asyncio.create_task(_worker())
 
@@ -1298,7 +1575,23 @@ def _lote_do_consumidor(lote_id: str, consumidor: str) -> dict:
     return lote
 
 
-def _resposta_arquivo(lote: dict, tipo: str) -> FileResponse:
+def _resposta_arquivo(lote: dict, tipo: str, consumidor: str | None = None) -> FileResponse:
+    """
+    consumidor=None significa painel: o procurador enxerga o acervo inteiro por
+    desenho. Com um consumidor, a planilha acumulada do Agente 2 é recortada aos
+    lotes dele — o arquivo em resultados/ é global e entregá-lo cru vazaria os
+    processos dos demais consumidores.
+    """
+    if tipo == "agente2_planilha" and consumidor is not None:
+        recorte = _planilha_a2_recortada(consumidor)
+        if not recorte:
+            raise HTTPException(
+                404,
+                "Ainda não há processos priorizados nos seus lotes. "
+                "Aguarde o lote concluir e tente de novo.",
+            )
+        return FileResponse(recorte, filename="priorizacao.xlsx", media_type=_XLSX)
+
     achado = _arquivos_do_lote(lote).get(tipo)
     if not achado:
         raise HTTPException(
@@ -1357,7 +1650,7 @@ async def baixar_arquivo_lote(
     consumidor: str = Depends(autenticar_api),
 ):
     """Download direto. O mesmo token Bearer das demais rotas."""
-    return _resposta_arquivo(_lote_do_consumidor(lote_id, consumidor), tipo.value)
+    return _resposta_arquivo(_lote_do_consumidor(lote_id, consumidor), tipo.value, consumidor)
 
 
 _RESPOSTAS_XLSX: dict[int | str, dict[str, Any]] = {
@@ -1381,7 +1674,7 @@ async def planilha_agente1(lote_id: str, consumidor: str = Depends(autenticar_ap
 
     **Só deste lote.** Sai da pasta isolada do lote.
     """
-    return _resposta_arquivo(_lote_do_consumidor(lote_id, consumidor), "agente1_planilha")
+    return _resposta_arquivo(_lote_do_consumidor(lote_id, consumidor), "agente1_planilha", consumidor)
 
 
 @app.get(
@@ -1404,21 +1697,24 @@ async def planilha_agente2(lote_id: str, consumidor: str = Depends(autenticar_ap
     Para o recorte exato deste lote, use `GET /api/v1/lotes/{lote_id}/resultado`
     (mesma priorização, em JSON) ou `/arquivos/agente2_json`.
     """
-    return _resposta_arquivo(_lote_do_consumidor(lote_id, consumidor), "agente2_planilha")
+    return _resposta_arquivo(_lote_do_consumidor(lote_id, consumidor), "agente2_planilha", consumidor)
 
 
 # ════════════════════════════════════════════════════════════════
 # CONSULTA POR NÚMERO DE PROCESSO
 # ════════════════════════════════════════════════════════════════
 #
-# A busca varre a pasta JSON/ compartilhada, que mistura os lotes de todos os
-# consumidores. DECISÃO DE NEGÓCIO: esta consulta por número é VISÍVEL A TODOS
-# os tokens válidos — não recorta por consumidor. Qualquer token autenticado
-# alcança qualquer processo (inclusive nome, CPF/CNPJ e valor da dívida) pelo
-# número CNJ. A autenticação (token) continua exigida; o recorte por origem,
-# não. As demais rotas (por lote_id) seguem isoladas por consumidor.
+# A pasta JSON/ é compartilhada: mistura os lotes de todos os consumidores e os
+# que o procurador subiu pelo painel. A consulta por número roda sobre uma cópia
+# recortada aos lotes de quem chamou, para ficar com o MESMO isolamento das
+# rotas por lote_id — o número CNJ é público e, sem o recorte, bastava informá-lo
+# para ler nome, CPF/CNPJ e valor da dívida de processo alheio.
 
 _RE_ARQUIVO_LOTE = re.compile(r"^lote_(.+)_agente2\.json$")
+
+# Número CNJ, com ou sem a pontuação. Serve de guarda contra o valor
+# começando com '-', que o argparse do buscar_processo.py leria como flag.
+_RE_NUMERO_CNJ = re.compile(r"[0-9][0-9.\-/]{0,40}")
 
 
 def _lote_da_origem(nome_arquivo: str) -> dict | None:
@@ -1463,12 +1759,63 @@ def _com_lote_id(achado: dict | None) -> dict | None:
     return limpo
 
 
+def _pasta_recortada(destino: Path, consumidor: str) -> None:
+    """
+    Preenche `destino` com os artefatos que o buscar_processo.py lê, contendo
+    apenas o que pertence a este consumidor:
+
+      • lote_<id>_agente2.json   → só os lotes com origem == consumidor
+      • historial_agente2.jsonl  → só as linhas cujo 'origem_lote' é de um deles
+      • historico_extracoes.jsonl→ só as linhas dos PDFs desses lotes
+
+    A pasta JSON/ real é compartilhada entre todos os consumidores e com o
+    painel. Apontar o script direto para ela entregava processo alheio a
+    qualquer token válido.
+    """
+    origens = _origens_do_consumidor(consumidor)
+    if not origens:
+        return
+
+    for nome in origens:
+        fonte = PASTA_JSON / nome
+        if fonte.exists():
+            shutil.copy2(fonte, destino / nome)
+
+    # Arquivos dos PDFs deste consumidor — chave do recorte da auditoria, que
+    # é um registro plano, sem campo de origem.
+    arquivos_meus = {
+        arq
+        for lote in _lotes.values()
+        if lote.get("origem") == consumidor
+        for arq in lote.get("arquivos", [])
+    }
+
+    for nome, chave in ((_JSONL_AGENTE2, "origem_lote"), ("historico_extracoes.jsonl", "arquivo")):
+        fonte = PASTA_JSON / nome
+        if not fonte.exists():
+            continue
+        permitido = origens if chave == "origem_lote" else arquivos_meus
+        with open(fonte, encoding="utf-8") as entrada, \
+             open(destino / nome, "w", encoding="utf-8") as saida:
+            for linha in entrada:
+                linha = linha.strip()
+                if not linha:
+                    continue
+                try:
+                    rec = json.loads(linha)
+                except json.JSONDecodeError:
+                    continue          # linha corrompida: não é deste nem de ninguém
+                if rec.get(chave) in permitido:
+                    saida.write(linha + "\n")
+
+
 @app.get(
     "/api/v1/processos",
     tags=["Processos"],
     summary="Consultar um processo pelo número",
     response_class=PlainTextResponse,
     responses={
+        400: {"model": Erro, "description": "Número fora do formato CNJ"},
         404: {"model": Erro, "description": "Nenhum processo com esse número nos lotes deste consumidor"},
         **_ERROS_AUTH,
     },
@@ -1488,13 +1835,24 @@ async def consultar_processo(
     e devolve a saída formatada COMPLETA do `main()` em texto puro — a mesma visão
     do CLI: Agente 1 (dados extraídos), Agente 2 (priorização) e auditoria.
 
-    A busca cobre **todos** os lotes, de todos os consumidores (esta consulta é
-    visível a todos — a auth continua exigida, o recorte por origem não). A auth
-    já rodou em Depends(autenticar_api); `consumidor` fica só como prova de token.
+    A busca cobre os lotes **deste consumidor** — o mesmo isolamento das rotas
+    por `lote_id`. Um processo enviado por outro consumidor responde `404`.
 
     Responde `404` quando o número não aparece em fonte nenhuma, e `500` se o
     próprio `buscar_processo.py` falhar ao executar.
     """
+    # O número vai como argv para o subprocess. Sem esta guarda, um valor
+    # começando com '-' é lido pelo argparse como FLAG, não como número:
+    # '-h' devolvia o help com HTTP 200, '--pasta=/x' redirecionava a busca
+    # para outra pasta do disco. Só dígitos e a pontuação do CNJ passam.
+    numero = numero.strip()
+    if not _RE_NUMERO_CNJ.fullmatch(numero):
+        raise HTTPException(
+            400,
+            "Número de processo inválido. Use o número CNJ — só dígitos, "
+            "pontos, hífens e barras. Ex.: 0752821-68.2013.8.05.0001",
+        )
+
     script = BASE_DIR / "buscar_processo.py"
 
     # Subprocess isolado, mesmo padrão dos agentes:
@@ -1502,20 +1860,33 @@ async def consultar_processo(
     #  - stdin=DEVNULL: se cair no modo interativo (número vazio), não trava no input().
     #  - stdout piped → sys.stdout.isatty() é False lá dentro, então _cor() devolve
     #    texto SEM códigos ANSI. A saída chega limpa.
+    # A pasta JSON/ é compartilhada por todos os consumidores e pelo painel.
+    # O script é apontado para uma cópia recortada aos lotes de quem pediu —
+    # sem isso, qualquer token lia processo alheio informando o número CNJ,
+    # que é público.
     try:
-        proc = await asyncio.create_subprocess_exec(
-            sys.executable, str(script),
-            "--pasta", str(PASTA_JSON),
-            numero,
-            cwd=str(BASE_DIR),
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        bruto_out, bruto_err = await proc.communicate()
+        with tempfile.TemporaryDirectory(prefix="consulta-") as tmp:
+            recorte = Path(tmp)
+            await asyncio.to_thread(_pasta_recortada, recorte, consumidor)
+
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable, str(script),
+                "--pasta", str(recorte),
+                "--",              # encerra as opções: o que vem depois é posicional
+                numero,
+                cwd=str(BASE_DIR),
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                # O relatório usa acento e caractere de caixa. Sem isto, uma
+                # locale não-UTF-8 derruba o script no print e a consulta
+                # devolve 500 tendo encontrado o processo.
+                env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+            )
+            bruto_out, bruto_err = await proc.communicate()
     except Exception as e:
         log.exception("Falha ao lançar buscar_processo.py")
-        raise HTTPException(500, f"Não foi possível executar buscar_processo.py: {e!r}")
+        raise HTTPException(500, "Não foi possível consultar o processo agora. Tente de novo.")
 
     saida = bruto_out.decode("utf-8", errors="replace")
     erro  = bruto_err.decode("utf-8", errors="replace")
@@ -1539,10 +1910,12 @@ async def consultar_processo(
             "buscar_processo.py saiu com código %s\nSTDERR:\n%s\nSTDOUT:\n%s",
             proc.returncode, erro, saida,
         )
+        # O stderr traz caminho interno e traceback. Vai para o log do serviço,
+        # que é de quem opera; ao consumidor vai só o que ele pode agir.
         raise HTTPException(
             500,
-            f"buscar_processo.py falhou (código {proc.returncode}): "
-            f"{(erro or saida).strip() or 'sem saída'}",
+            "A consulta falhou no servidor. Avise o suporte informando o "
+            f"número {numero} e o horário.",
         )
 
     return PlainTextResponse(saida)
@@ -1553,19 +1926,33 @@ async def consultar_processo(
 # ════════════════════════════════════════════════════════════════
 
 @app.post("/painel/login", include_in_schema=False, summary="Abrir sessão no painel")
-async def login(senha: str = Form(...)):
+async def login(request: Request, senha: str = Form(...)):
     if not PAINEL_ATIVO:
         raise HTTPException(503, "Painel sem senha configurada")
 
-    # Freia tentativa em massa sem travar o uso legítimo
-    recentes = [t for t in _falhas_login if datetime.now() - t < timedelta(minutes=5)]
-    if len(recentes) >= 10:
+    ip = request.client.host if request.client else "desconhecido"
+    corte = datetime.now() - timedelta(minutes=JANELA_FALHAS_MIN)
+
+    # Só as falhas DESTE IP contam. Quem erra a senha em outro lugar não tranca
+    # o painel do procurador.
+    recentes = _falhas_login.setdefault(ip, deque(maxlen=MAX_FALHAS_LOGIN * 2))
+    while recentes and recentes[0] < corte:
+        recentes.popleft()
+
+    if len(recentes) >= MAX_FALHAS_LOGIN:
         raise HTTPException(429, "Tentativas demais. Aguarde alguns minutos.")
 
     if not _senha_confere(senha):
-        _falhas_login.append(datetime.now())
+        recentes.append(datetime.now())
+        log.warning(f"Senha incorreta no painel (origem {ip})")
         await asyncio.sleep(1)
         raise HTTPException(401, "Senha incorreta")
+
+    # Acertou: zera o contador deste IP e limpa quem já saiu da janela, para o
+    # dicionário não crescer sem limite.
+    _falhas_login.pop(ip, None)
+    for outro in [k for k, v in _falhas_login.items() if not v or v[-1] < corte]:
+        _falhas_login.pop(outro, None)
 
     token = secrets.token_urlsafe(32)
     _sessoes[token] = datetime.now() + timedelta(hours=HORAS_SESSAO)
@@ -1843,6 +2230,77 @@ const tamanho = b => b >= 1048576
 const escapar = s => String(s).replace(/[&<>"]/g,
   c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 
+// ── Envio do lote ────────────────────────────────────────────────
+//
+// XMLHttpRequest em vez de fetch por um motivo só: fetch não informa o
+// progresso do UPLOAD. Num lote de 100 MB a tela ficava muda por minutos e
+// quem estava esperando não distinguia "enviando" de "travou".
+//
+// Devolve sempre {ok, status, dados, erro} — nunca lança. Todo caminho de
+// falha tem mensagem que diz o que fazer.
+function enviarLote(url, arquivos, cabecalhos, aoProgresso) {
+  return new Promise(resolve => {
+    const fd = new FormData();
+    for (const f of arquivos) fd.append('arquivos', f);
+
+    const req = new XMLHttpRequest();
+    req.open('POST', url);
+    for (const [k, v] of Object.entries(cabecalhos || {})) req.setRequestHeader(k, v);
+
+    if (aoProgresso) {
+      req.upload.onprogress = e => {
+        if (e.lengthComputable) aoProgresso(e.loaded, e.total);
+      };
+    }
+
+    req.onload = () => {
+      let dados = null;
+      try { dados = JSON.parse(req.responseText); } catch (_) { /* não é JSON */ }
+
+      if (req.status >= 200 && req.status < 300) {
+        return resolve(dados
+          ? {ok: true, status: req.status, dados}
+          : {ok: false, status: req.status,
+             erro: 'O servidor respondeu num formato inesperado.'});
+      }
+
+      // O 413 quase sempre vem do proxy à frente do serviço, não daqui: ele
+      // corta o corpo antes de a requisição chegar. Dizer isso poupa horas.
+      if (req.status === 413) {
+        return resolve({ok: false, status: 413, erro:
+          'O envio foi recusado por ser grande demais. Se o limite mostrado ' +
+          'acima não foi atingido, quem recusou foi o servidor de entrada ' +
+          '(proxy) — peça a quem administra para aumentar o tamanho máximo ' +
+          'de requisição, ou envie os PDFs em lotes menores.'});
+      }
+      if (req.status === 401 || req.status === 403) {
+        return resolve({ok: false, status: req.status, erro:
+          'Sessão expirada ou token inválido. Entre de novo e repita o envio.'});
+      }
+      if (req.status === 502 || req.status === 503 || req.status === 504) {
+        return resolve({ok: false, status: req.status, erro:
+          'O serviço não respondeu. Aguarde um instante e tente de novo.'});
+      }
+      resolve({ok: false, status: req.status,
+               erro: (dados && dados.detail) || ('Falha no envio (HTTP ' + req.status + ').')});
+    };
+
+    req.onerror   = () => resolve({ok: false, status: 0, erro:
+      'Não foi possível falar com o servidor. Verifique a conexão e tente de novo.'});
+    req.ontimeout = () => resolve({ok: false, status: 0, erro:
+      'O envio demorou demais e foi interrompido. Tente com menos arquivos.'});
+    req.onabort   = () => resolve({ok: false, status: 0, erro: 'Envio cancelado.'});
+
+    req.send(fd);
+  });
+}
+
+// "42 MB de 100 MB (42%)" — o que quem espera precisa ver.
+function textoProgresso(enviado, total) {
+  const pct = total ? Math.round(enviado / total * 100) : 0;
+  return `Enviando… ${tamanho(enviado)} de ${tamanho(total)} (${pct}%)`;
+}
+
 // Rótulos dos artefatos. O Excel do Agente 2 é acumulativo — dizer isso no
 // botão evita que alguém o mande para o cartório achando que é só deste lote.
 const ROTULO_ARQUIVO = {
@@ -2032,26 +2490,33 @@ const MAX_MB = __MAX_MB__;
     acompanhando = setInterval(passo, 3000);
   }
 
+  let enviando = false;
+
   q('#hera-enviar').onclick = async () => {
+    if (enviando) return;                  // trava contra o duplo clique
     const cab = autorizacao();
     if (!cab) { estado.innerHTML = '<span class="ruim">Informe o token do consumidor.</span>'; return; }
-    const fd = new FormData();
-    for (const f of Arquivos.itens) fd.append('arquivos', f);
+
     const quantos = Arquivos.itens.length;
+    enviando = true;
     q('#hera-enviar').disabled = true;
-    estado.textContent = `Enviando ${quantos} PDF(s)...`;
+    estado.textContent = `Enviando ${quantos} PDF(s)…`;
+
     try {
-      const r = await fetch('/api/v1/lotes', {method:'POST', headers: cab, body: fd});
-      const j = await r.json();
+      const r = await enviarLote('/api/v1/lotes', Arquivos.itens, cab,
+                                 (env, tot) => { estado.textContent = textoProgresso(env, tot); });
       if (!r.ok) {
-        estado.innerHTML = `<span class="ruim">${r.status} — ${escapar(j.detail || 'falha no envio')}</span>`;
+        // Antes, um 413 do proxy (que responde HTML) fazia o r.json() estourar
+        // e a tela mostrava "Falha de rede: Unexpected token '<'".
+        estado.innerHTML = `<span class="ruim">${escapar(r.erro)}</span>`;
         return;
       }
       Arquivos.limpar(); desenhar();
-      acompanhar(j.lote_id);
-    } catch (e) {
-      estado.innerHTML = `<span class="ruim">Falha de rede: ${escapar(e.message)}</span>`;
-    } finally { q('#hera-enviar').disabled = !Arquivos.itens.length; }
+      acompanhar(r.dados.lote_id);
+    } finally {
+      enviando = false;
+      q('#hera-enviar').disabled = !Arquivos.itens.length;
+    }
   };
 
   desenhar();
@@ -2231,26 +2696,37 @@ solta.addEventListener('drop', async e => {
   desenharSelecao();
 });
 
+let enviando = false;
+
 $('#btn-up').onclick = async () => {
+  if (enviando) return;                    // trava contra o duplo clique
   if (!Arquivos.itens.length) { $('#up-msg').textContent = 'Selecione ao menos um PDF.'; return; }
-  const fd = new FormData();
-  for (const f of Arquivos.itens) fd.append('arquivos', f);
+
   const quantos = Arquivos.itens.length;
+  enviando = true;
   $('#btn-up').disabled = true;
-  $('#up-msg').textContent = `Enviando ${quantos} PDF(s)...`;
+  $('#up-msg').textContent = `Enviando ${quantos} PDF(s)…`;
+
+  // enviarLote nunca lança: o try/finally aqui é só para o estado do botão.
+  // Antes não havia catch nenhum, e uma falha de rede deixava a tela parada
+  // em "Enviando…" com o botão reabilitado — dois cliques, dois lotes iguais.
   try {
-    const r = await fetch('/painel/lotes', {method:'POST', body:fd});
-    const j = await r.json();
+    const r = await enviarLote('/painel/lotes', Arquivos.itens, null,
+                               (env, tot) => { $('#up-msg').textContent = textoProgresso(env, tot); });
     if (r.ok) {
       $('#up-msg').textContent =
-        `Lote ${j.lote_id} criado com ${j.arquivos.length} PDF(s) — acompanhe abaixo.`;
+        `Lote ${r.dados.lote_id} criado com ${r.dados.arquivos.length} PDF(s) — acompanhe abaixo.`;
       Arquivos.limpar();
     } else {
-      $('#up-msg').textContent = 'Falha: ' + (j.detail || 'erro desconhecido');
+      $('#up-msg').textContent = r.erro;
+      if (r.status === 401) setTimeout(() => location.reload(), 1500);
     }
     desenharSelecao();
     carregar();
-  } finally { $('#btn-up').disabled = !Arquivos.itens.length; }
+  } finally {
+    enviando = false;
+    $('#btn-up').disabled = !Arquivos.itens.length;
+  }
 };
 
 // "há 3 min" diz mais do que "iniciado 14:31:02" para quem está esperando.

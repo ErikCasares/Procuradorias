@@ -8,6 +8,12 @@ Dockerfile
 docker-compose.yml
 README.md
 
+# Testes e metadados — não fazem parte do que roda em produção
+tests/
+.gitattributes
+RESPOSTA-PGMS.md
+.pytest_cache/
+
 # Dados e saídas — vêm por volume, nunca embutidos na imagem
 processos pra analiser/
 JSON/
