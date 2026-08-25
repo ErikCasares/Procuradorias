@@ -304,9 +304,98 @@ caminho de OCR nunca é exercitado no desenvolvimento. Se a **Confiança OCR (%)
 `0,0%` numa página que visivelmente tem texto, o OCR não rodou — e o sintoma seria um
 lote concluindo com texto vazio, sem erro aparente.
 
+## Recebendo a imagem pronta (sem build)
+
+Para instalar em um servidor próprio a partir do arquivo `procuradorias-<versão>.tar.gz`,
+sem construir a imagem nem clonar o repositório. **Pré-requisito:** Docker instalado. Não
+é preciso acesso à internet no servidor.
+
+### 1. Carregar a imagem
+
+```bash
+docker load < procuradorias-1.0.tar.gz
+docker images | grep procuradorias      # confirma que entrou
+```
+
+### 2. Gerar as credenciais
+
+Sem elas o serviço sobe recusando tudo — é proposital, ver **Autenticação**. Rode uma vez,
+em qualquer máquina com Python:
+
+```bash
+python gerar_credencial.py api pgms      # token para o sistema que vai integrar
+python gerar_credencial.py painel        # senha do painel do procurador
+```
+
+Guarde os **segredos** (aparecem uma única vez) e use os **hashes** no passo seguinte.
+
+### 3. Subir
+
+```bash
+docker run -d --name procuradorias \
+  --restart unless-stopped \
+  -p 3000:3000 \
+  --memory 2g \
+  -e API_TOKENS='pgms:sha256:<hash>' \
+  -e SENHA_PAINEL_HASH='<hash scrypt>' \
+  -e COOKIE_SEGURO=0 \
+  -e TZ=America/Campo_Grande \
+  -v /opt/procuradorias/JSON:/app/JSON \
+  -v /opt/procuradorias/resultados:/app/resultados \
+  -v /opt/procuradorias/dados:/app/dados \
+  procuradorias:1.0
+```
+
+Ajuste os caminhos da esquerda dos `-v` para onde os dados devem ficar no servidor. **Os
+três volumes são obrigatórios**: sem eles, recriar o container apaga o histórico e todos
+os lotes processados.
+
+`COOKIE_SEGURO=1` apenas se o serviço for publicado por HTTPS. Em `1` sem HTTPS, o painel
+não consegue abrir sessão.
+
+Os demais ajustes (OCR, prioridade, retenção, timeout) têm padrão embutido e só precisam
+ser informados para mudar o comportamento — a lista completa está em **Ajustes de
+ambiente**.
+
+### 4. Conferir
+
+```bash
+docker logs procuradorias | head -20
+curl -s http://localhost:3000/health
+```
+
+No log deve aparecer `[entrypoint] Pastas prontas. Iniciando como 'hera' (sem
+privilégio).` e o `/health` deve responder `{"status":"ok","api_ativa":true,...}`. Se
+`api_ativa` vier `false`, o `API_TOKENS` não foi aceito.
+
+O painel fica em `http://SERVIDOR:3000` e a documentação da API em
+`http://SERVIDOR:3000/api/docs`.
+
+### 5. Se houver proxy à frente
+
+Publicando por Nginx ou Apache, **aumente o limite de corpo da requisição** para pelo
+menos 500 MB — é o que permite o envio de PDFs grandes:
+
+```nginx
+client_max_body_size 500m;
+```
+
+E acrescente `-e COOKIE_SEGURO=1` ao `docker run` se o proxy servir HTTPS.
+
+### Atualizar para uma versão nova
+
+```bash
+docker load < procuradorias-1.1.tar.gz
+docker stop procuradorias && docker rm procuradorias
+# repita o docker run do passo 3, trocando a tag para 1.1
+```
+
+Os dados ficam nos volumes, fora do container — trocar de versão não perde nada.
+
 ## Rodando com Docker (local e linha de comando)
 
 **Pré-requisito:** Docker Desktop instalado e em execução. Para produção no Easypanel,
+veja a seção **Implantação no Easypanel**; para instalar a partir do arquivo `.tar.gz`,
 veja a seção anterior.
 
 ### 1. Configurar as credenciais
