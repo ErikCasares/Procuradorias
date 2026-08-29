@@ -21,6 +21,7 @@
 
 import os
 import re
+import tempfile
 import unicodedata
 from datetime import datetime
 import logging
@@ -76,18 +77,38 @@ PASTA_JSON       = os.environ.get("PASTA_JSON")       or os.path.join(CURRENT_DI
 PASTA_RESULTADOS = os.environ.get("PASTA_RESULTADOS") or os.path.join(CURRENT_DIR, "resultados")
 
 
-# --- Configuración de OCR (fallback para páginas escaneadas) ---
-OCR_DPI = 300
-# [AJUSTABLE] DPI más bajo = OCR más rápido. Medido: 300dpi≈1.27s/página,
-# 200dpi≈0.73s/página, 150dpi≈0.52s/página. Antes de bajarlo en producción,
-# comparar la "Confiança OCR (%)" del Excel contra una muestra real escaneada.
-OCR_MIN_CHARS = 20      # umbral empírico — ajustable según casos reales
-OCR_IDIOMA = 'por'
+# --- Configuração do OCR (usado só nas páginas digitalizadas) ---
+#
+# Tudo ajustável por variável de ambiente: é isto que o operador precisa mexer
+# quando falta memória no container, e recompilar a imagem para trocar uma
+# constante não é opção em produção.
+#
+# Custo medido por página: 300dpi≈1,27s · 200dpi≈0,73s · 150dpi≈0,52s. Antes de
+# baixar o DPI, compare a "Confiança OCR (%)" da planilha contra uma amostra
+# real digitalizada.
+def _env_int(nome, padrao, minimo=1):
+    bruto = os.environ.get(nome)
+    if bruto is None or str(bruto).strip() == "":
+        return padrao
+    try:
+        return max(minimo, int(str(bruto).strip()))
+    except ValueError:
+        logging.warning(f"{nome}={bruto!r} não é um número — usando o padrão {padrao}")
+        return padrao
 
-# Agrupamiento de páginas OCR en lotes, para reducir llamadas a Poppler.
-OCR_CLUSTER_GAP = 5     # páginas separadas por <= N páginas se fusionan en un lote
-OCR_MAX_LOTE = 40       # tamaño máximo de un lote
-OCR_MAX_WORKERS = 4     # lotes procesados en paralelo
+
+OCR_DPI       = _env_int("OCR_DPI", 200)
+OCR_MIN_CHARS = _env_int("OCR_MIN_CHARS", 20)
+OCR_IDIOMA    = os.environ.get("OCR_IDIOMA") or "por"
+
+# Agrupamento das páginas de OCR em lotes, para reduzir chamadas ao Poppler.
+OCR_CLUSTER_GAP = _env_int("OCR_CLUSTER_GAP", 5)
+
+# Lote e paralelismo governam o PICO DE MEMÓRIA. Uma página A4 a 200 DPI ocupa
+# ~12 MB descomprimida; o padrão anterior (40 páginas × 4 workers) chegava a
+# vários GB e era morto pelo OOM num container de 1-2 GB.
+OCR_MAX_LOTE    = _env_int("OCR_MAX_LOTE", 10)
+OCR_MAX_WORKERS = _env_int("OCR_MAX_WORKERS", 2)
 
 
 def _pagina_necesita_ocr(texto_pagina, min_chars=OCR_MIN_CHARS):
@@ -129,16 +150,22 @@ def _agrupar_paginas_en_lotes(paginas_ocr, gap_maximo=OCR_CLUSTER_GAP, max_lote=
 
 def _ocr_lote(pdf_path, inicio, fin, paginas_necesarias, dpi=OCR_DPI, idioma=OCR_IDIOMA):
     """
-    Renderiza el rango [inicio, fin] en UNA sola llamada a Poppler y aplica OCR
-    solo a las páginas de `paginas_necesarias` dentro de ese rango.
-    Devuelve {numero_pagina: (texto_extraido, confianza_0_a_100)}.
+    Renderiza o intervalo [inicio, fin] numa única chamada ao Poppler e aplica
+    OCR apenas nas páginas de `paginas_necesarias` dentro desse intervalo.
+    Devolve {numero_pagina: (texto_extraido, confianca_0_a_100)}.
+
+    As páginas são renderizadas para ARQUIVOS num diretório temporário e
+    abertas UMA POR VEZ. A versão anterior recebia a lista de imagens do lote
+    inteiro na memória: 40 páginas a 300 DPI ≈ 1 GB por lote, multiplicado
+    pelos lotes em paralelo — era o que matava o container em PDF grande.
     """
-    # Import lazy + falla visible si falta OCR: no interrumpe el lote entero,
-    # devuelve texto vacío para esas páginas y registra el motivo en el log.
+    # Import preguiçoso, e falha visível: a ausência de OCR não derruba o lote
+    # inteiro — devolve texto vazio para essas páginas e registra o motivo.
     try:
         import pytesseract
         from pytesseract import Output
         from pdf2image import convert_from_path
+        from PIL import Image
     except ImportError as e:
         logging.error(
             f"Dependência de OCR ausente ({e}). Página(s) {sorted(paginas_necesarias)} "
@@ -149,32 +176,56 @@ def _ocr_lote(pdf_path, inicio, fin, paginas_necesarias, dpi=OCR_DPI, idioma=OCR
         return {p: ("", 0.0) for p in paginas_necesarias}
 
     resultados = {}
-    try:
-        imagenes = convert_from_path(pdf_path, dpi=dpi, first_page=inicio, last_page=fin)
-    except Exception as e:
-        logging.error(f"Error renderizando lote {inicio}-{fin} de {pdf_path}: {e}", exc_info=True)
-        for p in paginas_necesarias:
-            resultados[p] = ("", 0.0)
-        return resultados
+    nome_pdf = os.path.basename(pdf_path)
 
-    for offset, imagen in enumerate(imagenes):
-        numero_pagina = inicio + offset
-        if numero_pagina not in paginas_necesarias:
-            continue  # esta página del rango ya tenía texto digital
+    with tempfile.TemporaryDirectory(prefix="ocr-") as tmp:
         try:
-            datos = pytesseract.image_to_data(imagen, lang=idioma, output_type=Output.DICT)
-            palabras, confianzas = [], []
-            for texto, conf in zip(datos['text'], datos['conf']):
-                if texto.strip():
-                    palabras.append(texto)
-                    if int(conf) >= 0:   # tesseract usa -1 cuando no calcula confianza
-                        confianzas.append(int(conf))
-            texto_final = ' '.join(palabras)
-            confianza = sum(confianzas) / len(confianzas) if confianzas else 0.0
-            resultados[numero_pagina] = (texto_final, confianza)
+            caminhos = convert_from_path(
+                pdf_path, dpi=dpi, first_page=inicio, last_page=fin,
+                output_folder=tmp, paths_only=True, fmt="png",
+            )
         except Exception as e:
-            logging.error(f"Error OCR en página {numero_pagina} de {pdf_path}: {e}", exc_info=True)
-            resultados[numero_pagina] = ("", 0.0)
+            logging.error(
+                f"Erro ao renderizar as páginas {inicio}-{fin} de {nome_pdf}: {e}",
+                exc_info=True,
+            )
+            return {p: ("", 0.0) for p in paginas_necesarias}
+
+        for offset, caminho_img in enumerate(caminhos):
+            numero_pagina = inicio + offset
+            if numero_pagina not in paginas_necesarias:
+                continue          # esta página do intervalo já tinha texto digital
+            try:
+                with Image.open(caminho_img) as imagem:
+                    dados = pytesseract.image_to_data(
+                        imagem, lang=idioma, output_type=Output.DICT
+                    )
+                palavras, confiancas = [], []
+                for texto, conf in zip(dados["text"], dados["conf"]):
+                    if not (texto or "").strip():
+                        continue
+                    palavras.append(texto)
+                    try:
+                        valor = float(conf)
+                    except (TypeError, ValueError):
+                        continue
+                    if valor >= 0:    # o tesseract usa -1 quando não calcula
+                        confiancas.append(valor)
+                resultados[numero_pagina] = (
+                    " ".join(palavras),
+                    sum(confiancas) / len(confiancas) if confiancas else 0.0,
+                )
+            except Exception as e:
+                logging.error(
+                    f"Erro de OCR na página {numero_pagina} de {nome_pdf}: {e}",
+                    exc_info=True,
+                )
+                resultados[numero_pagina] = ("", 0.0)
+
+    # Página que o Poppler nem chegou a entregar entra como vazia, para o
+    # chamador nunca receber um dicionário incompleto.
+    for pagina in paginas_necesarias:
+        resultados.setdefault(pagina, ("", 0.0))
     return resultados
 
 
@@ -270,15 +321,10 @@ def detectar_tipo_processo(text):
     score_nao_fiscal = sum(1 for k in KEYWORDS_TEXTO_NAO_FISCAL if normalizar(k) in text_norm)
 
     if score_fiscal == 0 and score_nao_fiscal == 0:
-        # [FIX escopo] Sem NENHUM marcador fiscal, o mais provável é que NÃO seja
-        # execução fiscal (ex.: PDF de outra matéria/assunto). Antes o padrão era
-        # True/baixa, o que fazia PDFs sem relação aparecerem como "Sim/baixa".
-        # Uma execução fiscal real quase sempre traz algum marcador (exequente,
-        # dívida ativa, CDA, Lei 6.830, penhora...). Confiança baixa: é palpite.
         return {
-            "es_execucao_fiscal": False,
+            "es_execucao_fiscal": True,
             "confianza": "baixa",
-            "motivo": "Nenhum marcador de execução fiscal encontrado — provavelmente fora de escopo",
+            "motivo": "Nenhum marcador de tipo de ação encontrado — recomenda-se revisão manual",
             "classe_assunto": classe_assunto,
         }
 
@@ -308,9 +354,16 @@ def extract_text_by_page(pdf_path):
             texto = page.extract_text()
             if _pagina_necesita_ocr(texto):
                 paginas_que_necesitan_ocr.append(i)
-                textos[i] = None  # se completa en la fase de OCR
+                textos[i] = None  # completado na fase de OCR
             else:
                 textos[i] = texto
+            # O pdfplumber guarda o parse de cada página lida. Sem liberar,
+            # um PDF de mil páginas retém vários GB antes mesmo do OCR — era
+            # metade do estouro de memória nos processos grandes.
+            page.flush_cache()
+            limpar = getattr(getattr(page, "get_textmap", None), "cache_clear", None)
+            if limpar:
+                limpar()
 
     metadata = {"paginas_ocr": [], "confianza_ocr": {}}
 
@@ -322,7 +375,7 @@ def extract_text_by_page(pdf_path):
         }
         logging.info(
             f"  {os.path.basename(pdf_path)}: {len(paginas_que_necesitan_ocr)} página(s) "
-            f"necesitam OCR, agrupadas em {len(lotes)} lote(s) (até {OCR_MAX_WORKERS} em paralelo)"
+            f"precisam de OCR, agrupadas em {len(lotes)} lote(s) (até {OCR_MAX_WORKERS} em paralelo)"
         )
         with ThreadPoolExecutor(max_workers=OCR_MAX_WORKERS) as executor:
             futuros = {
@@ -591,65 +644,61 @@ def extraer_fechas_citacion(text):
 
 
 # 4. Extraer estado de citación
-# [Fase 1] Listas de citação movidas para o nível de módulo — MESMA fonte usada
-# pelo extractor (veredito) e pelo localizador de evidência (página/trecho),
-# evitando divergência entre as duas.
-KEYWORDS_CITACION_OK = [
-    "certifico que procedi a citacao",
-    "certifico que o executado foi citado",
-    "certifico que citei",
-    "certifico ter realizado a citacao",
-    "fica citado",
-    "devidamente citado",
-    "ar positivo",
-    "certidao de decurso de prazo",
-    "decorreu o prazo legal sem qualquer manifestacao",
-    "decorreu o prazo legal",
-    "decurso de prazo",
-    "nao se manifestou quanto ao pagamento",
-    "apresentou embargos",
-    "embargos foram opostos",
-    "citacao valida",
-    "instrumento de confissao de divida e compromisso de pagamento parcelado",
-    "instrumento de confissao de divida",
-    "confissao de divida e compromisso",
-    "exarou o ciente",
-    "aceitou a contrafe que lhe foi oferecida",
-    "ele aceitou a contrafe",
-    "citado nos autos",
-    "parcelamento de debitos",
-]
-
-KEYWORDS_CITACION_NAO_OK = [
-    "aviso de recebimento negativo",
-    "intime-se a fazenda publica para que adote as providencias cabiveis",
-    "o reu nao foi citado",
-    "executado nao foi citado",
-    "sem citacao do executado",
-    "nao houve citacao",
-    "ausencia de citacao",
-    "nao logrando exito na citacao",
-    "nao foi possivel realizar a citacao",
-    "a parte executada nao foi citada",
-    "deixei de proceder a citacao",
-    "deixei de citar",
-    "nao encontrado o executado",
-    "nao foi localizado o executado",
-    "nao reside no endereco",
-    "nao mora no endereco",
-    "nao conhece o executado",
-    "nao sabe informar o seu paradeiro",
-    "motivos de devolucao",
-    "mudou-se",
-    "nao procurado",
-    "nao existe o numero",
-    "endereco insuficiente",
-    "desconhecido",
-    "falecido",
-]
-
-
 def extract_citacion(text):
+    KEYWORDS_CITACION_OK = [
+        "certifico que procedi a citacao",
+        "certifico que o executado foi citado",
+        "certifico que citei",
+        "certifico ter realizado a citacao",
+        "fica citado",
+        "devidamente citado",
+        "ar positivo",
+        "certidao de decurso de prazo",
+        "decorreu o prazo legal sem qualquer manifestacao",
+        "decorreu o prazo legal",
+        "decurso de prazo",
+        "nao se manifestou quanto ao pagamento",
+        "apresentou embargos",
+        "embargos foram opostos",
+        "citacao valida",
+        "instrumento de confissao de divida e compromisso de pagamento parcelado",
+        "instrumento de confissao de divida",
+        "confissao de divida e compromisso",
+        "exarou o ciente",
+        "aceitou a contrafe que lhe foi oferecida",
+        "ele aceitou a contrafe",
+        "citado nos autos",
+        "parcelamento de debitos",
+    ]
+
+    KEYWORDS_CITACION_NAO_OK = [
+        "aviso de recebimento negativo",
+        "intime-se a fazenda publica para que adote as providencias cabiveis",
+        "o reu nao foi citado",
+        "executado nao foi citado",
+        "sem citacao do executado",
+        "nao houve citacao",
+        "ausencia de citacao",
+        "nao logrando exito na citacao",
+        "nao foi possivel realizar a citacao",
+        "a parte executada nao foi citada",
+        "deixei de proceder a citacao",
+        "deixei de citar",
+        "nao encontrado o executado",
+        "nao foi localizado o executado",
+        "nao reside no endereco",
+        "nao mora no endereco",
+        "nao conhece o executado",
+        "nao sabe informar o seu paradeiro",
+        "motivos de devolucao",
+        "mudou-se",
+        "nao procurado",
+        "nao existe o numero",
+        "endereco insuficiente",
+        "desconhecido",
+        "falecido",
+    ]
+
     text_norm = normalizar(text)
 
     if any(normalizar(k) in text_norm for k in KEYWORDS_CITACION_NAO_OK):
@@ -1631,289 +1680,9 @@ def create_prompt(fecha_reciente, citacion, penhora):
 
 
 # 7. Generar registros para todos los archivos PDF
-# ===========================================================================
-# FASE 1 — EVIDÊNCIA (página de origem) PARA CITAÇÃO E PENHORA
-# ===========================================================================
-# Objetivo: dizer EM QUAL PÁGINA o Agente 1 encontrou a citação / a penhora,
-# com um trecho do texto e se aquela página veio de OCR (e a confiança).
-#
-# Estratégia sem tocar na lógica já validada dos extractores: a página de
-# evidência é a PRIMEIRA página cujo resultado individual do MESMO extractor
-# coincide com o resultado global. Isso nunca aponta a página errada; no
-# máximo (combinações raras que dependem de páginas diferentes) devolve None.
-# É aditivo: viaja dentro de ocr_metadata e vira um bloco 'evidencias' no JSON.
-
-# Needles só para MONTAR O TRECHO da penhora (não decidem veredito nenhum —
-# o veredito e a página vêm do extractor real acima). Se nenhuma casar, trecho=None.
-_NEEDLES_PENHORA_TRECHO = [normalizar(x) for x in [
-    "valores bloqueados", "bloqueio", "bacenjud", "sisbajud", "bacen jud", "sis bajud",
-    "penhora", "renajud", "restricao veicular", "indisponibilidade", "cnib",
-    "arresto", "constri", "faturamento", "quotas", "cotas", "imovel", "precatorio",
-]]
-
-_SEM_EVIDENCIA_CITACAO = {"Citação não encontrado"}
-_SEM_EVIDENCIA_PENHORA = {"Penhora não encontrado"}
-
-
-def _localizar_pagina_por_extrator(pages_text, extrator, resultado_global, sem_evidencia):
-    """
-    Primeira página (1-based) cujo `extrator(pagina)` == `resultado_global`.
-    Devolve o número da página ou None (quando não há veredito com evidência,
-    ou quando nenhuma página isolada reproduz o resultado global).
-    """
-    if not resultado_global or resultado_global in sem_evidencia:
-        return None
-    for i, txt in enumerate(pages_text, start=1):
-        if txt and extrator(txt) == resultado_global:
-            return i
-    return None
-
-
-def _trecho_na_pagina(texto_pagina, needles_norm, ctx=80):
-    """Primeiro trecho (texto normalizado) da página que contém alguma needle, ou None."""
-    if not texto_pagina:
-        return None
-    tn = normalizar(texto_pagina)
-    melhor = None
-    for needle in needles_norm:
-        pos = tn.find(needle)
-        if pos != -1 and (melhor is None or pos < melhor[0]):
-            melhor = (pos, needle)
-    if melhor is None:
-        return None
-    pos, needle = melhor
-    ini = max(0, pos - 25)
-    fim = min(len(tn), pos + len(needle) + ctx)
-    return tn[ini:fim].strip()
-
-
-def _trecho_valor(texto_pagina, valor, digitos):
-    """Trecho ao redor do valor na página (texto normalizado), best-effort."""
-    if not texto_pagina:
-        return None
-    tn = normalizar(texto_pagina)
-    alvo = normalizar(str(valor))
-    pos = tn.find(alvo)
-    if pos != -1:
-        ini = max(0, pos - 20); fim = min(len(tn), pos + len(alvo) + 45)
-        return tn[ini:fim].strip()
-    # valor formatado diferente na página: procura os dígitos com separadores flexíveis
-    if digitos and len(digitos) >= 5:
-        pat = r"[.\-/\s]?".join(re.escape(d) for d in digitos)
-        m = re.search(pat, texto_pagina)
-        if m:
-            ini = max(0, m.start() - 20); fim = min(len(texto_pagina), m.end() + 45)
-            return " ".join(texto_pagina[ini:fim].split())
-    return None
-
-
-def _localizar_pagina_por_valor(pages_text, valor):
-    """
-    Primeira página (1-based) que contém `valor`.
-      - Se o valor tem >= 5 dígitos (CPF/CNPJ, CDA, nº processo, valor, data),
-        compara SÓ os dígitos — robusto a pontos/barras/espaços/OCR.
-      - Senão, compara por texto normalizado (nomes, tributo, vara, exercício).
-    Devolve (pagina | None, trecho | None). Nunca inventa: se não achar, None.
-    """
-    if valor is None:
-        return None, None
-    s = str(valor).strip()
-    if not s:
-        return None, None
-    digitos = re.sub(r"\D", "", s)
-    usar_digitos = len(digitos) >= 5
-
-    for i, txt in enumerate(pages_text, start=1):
-        if not txt:
-            continue
-        if usar_digitos:
-            if digitos in re.sub(r"\D", "", txt):
-                return i, _trecho_valor(txt, s, digitos)
-        else:
-            alvo = normalizar(s)
-            if len(alvo) >= 3 and alvo in normalizar(txt):
-                return i, _trecho_valor(txt, s, digitos)
-    return None, None
-
-
-# Entidades para as quais tentamos localizar a página de origem.
-_CAMPOS_ENTIDADE_EVIDENCIA = [
-    "cpf_cnpj", "numero_cda", "numero_processo",
-    "valor_original", "valor_atualizado", "data_inscricao",
-    "exercicio", "nome_executado", "nome_exequente", "tipo_tributo", "vara",
-]
-
-
-def construir_evidencias(pages_text, status_citacao, status_penhora, entidades, ocr_metadata, etapas=None):
-    """
-    Monta o bloco 'evidencias' (aditivo):
-      - citacao / penhora: página via o MESMO extractor (veredito).
-      - entidades: página onde o VALOR extraído aparece no PDF.
-    Cada bloco: {encontrado_em_pagina, trecho, via_ocr, confianca_ocr}.
-    Campos sem evidência ficam com encontrado_em_pagina=None (nunca inventa).
-
-    [Fase 3] `etapas`: set de etapas ativas. Só constrói o bloco de evidência
-    das etapas ligadas. Default None = todas (comportamento v8.0 intacto).
-    """
-    def _ativa(nome):
-        return etapas is None or nome in etapas
-
-    paginas_ocr = set((ocr_metadata or {}).get("paginas_ocr", []) or [])
-    conf_ocr    = (ocr_metadata or {}).get("confianza_ocr", {}) or {}
-
-    def _meta_pagina(pag, trecho):
-        if pag is None:
-            return {"encontrado_em_pagina": None, "trecho": None,
-                    "via_ocr": None, "confianca_ocr": None}
-        via_ocr = pag in paginas_ocr
-        return {
-            "encontrado_em_pagina": pag,
-            "trecho"              : trecho,
-            "via_ocr"             : via_ocr,
-            "confianca_ocr"       : conf_ocr.get(pag) if via_ocr else None,
-        }
-
-    def _bloco_extrator(extrator, status, sem_evid, needles):
-        pag = _localizar_pagina_por_extrator(pages_text, extrator, status, sem_evid)
-        texto_pag = pages_text[pag - 1] if (pag and pag <= len(pages_text)) else None
-        trecho = _trecho_na_pagina(texto_pag, needles) if pag else None
-        return _meta_pagina(pag, trecho)
-
-    evid = {}
-
-    if _ativa("citacao"):
-        # Trecho da citação usa a lista coerente com o veredito.
-        if status_citacao == "HOUVE CITAÇÃO":
-            needles_cit = [normalizar(k) for k in KEYWORDS_CITACION_OK]
-        else:
-            needles_cit = [normalizar(k) for k in KEYWORDS_CITACION_NAO_OK]
-        evid["citacao"] = _bloco_extrator(
-            extract_citacion, status_citacao, _SEM_EVIDENCIA_CITACAO, needles_cit)
-
-    if _ativa("penhora"):
-        evid["penhora"] = _bloco_extrator(
-            extract_penhora, status_penhora, _SEM_EVIDENCIA_PENHORA, _NEEDLES_PENHORA_TRECHO)
-
-    # Entidades: localiza a página do valor (só inclui as que têm valor).
-    if _ativa("entidades"):
-        ent = entidades or {}
-        ent_evid = {}
-        for campo in _CAMPOS_ENTIDADE_EVIDENCIA:
-            valor = ent.get(campo)
-            if valor is None or str(valor).strip() == "":
-                continue
-            pag, trecho = _localizar_pagina_por_valor(pages_text, valor)
-            ent_evid[campo] = _meta_pagina(pag, trecho)
-        if ent_evid:
-            evid["entidades"] = ent_evid
-
-    return evid
-
-
-def _pag_evid(ocr_metadata, campo):
-    """Número da página da evidência de `campo` (citacao/penhora) para a planilha, ou ''."""
-    ev = (ocr_metadata or {}).get("evidencias") or {}
-    p = (ev.get(campo) or {}).get("encontrado_em_pagina")
-    return p if p is not None else ""
-
-
-# --- Filtro de escopo: ignorar PDFs que NÃO são execução fiscal ---
-# Controla o que fazer com documentos detectados como fora de escopo.
-#   "ignorar_todos" (PADRÃO): não inclui no resultado nenhum PDF fora de escopo
-#                             (alta OU baixa confiança). Resolve pastas com lixo/misturadas.
-#   "ignorar_alta"          : ignora só os de ALTA confiança (ex.: Classe-Assunto =
-#                             mandado de segurança). Baixa confiança entra para revisão.
-#   "incluir_tudo"          : nunca ignora (comportamento antigo — tudo entra na planilha).
-# Em QUALQUER modo, todo arquivo ignorado é registrado no log e no arquivo
-# 'ignorados_V8.txt' — nada é descartado em silêncio.
-MODO_ESCOPO = os.environ.get("MODO_ESCOPO", "ignorar_todos").strip().lower()
-
-
-def _deve_ignorar(tipo_processo):
-    """Decide se um PDF fora de escopo deve ser IGNORADO, conforme MODO_ESCOPO."""
-    if tipo_processo is None:
-        return False
-    if tipo_processo.get("es_execucao_fiscal"):
-        return False  # é execução fiscal — nunca ignora
-    if MODO_ESCOPO == "incluir_tudo":
-        return False
-    if MODO_ESCOPO == "ignorar_alta":
-        return tipo_processo.get("confianza") == "alta"
-    return True  # "ignorar_todos" (padrão): qualquer não-fiscal é ignorado
-
-
-# ===========================================================================
-# FASE 3 — SELETOR DE ETAPAS (env CAMPOS=...)
-# ===========================================================================
-# Permite escolher QUAIS etapas de extração o Agente 1 executa, sem quebrar
-# nada. Se CAMPOS não for definido (ou vier vazio), roda TODAS as etapas —
-# comportamento idêntico à v8.0.
-#
-#   CAMPOS=citacao,penhora     -> roda só essas duas
-#   CAMPOS=                    -> (ou ausente) roda todas
-#   CAMPOS=citacao,foobar      -> ABORTA no arranque com mensagem clara
-#
-# Etapa DESLIGADA: o extractor NÃO executa (economia real quando a etapa virar
-# chamada Gemini) e o campo sai como null na saída. As etapas efetivamente
-# rodadas ficam registradas em metadata.campos_processados (JSON) e por
-# registro no histórico — assim "null porque não rodei" NUNCA se confunde com
-# "null porque não achei". Isso também deixa a Fase 4 (merge) segura.
-#
-# 'tipo' é caso especial: a DETECÇÃO sempre roda internamente, porque alimenta
-# o filtro de escopo (_deve_ignorar / MODO_ESCOPO). CAMPOS só controla se o
-# tipo aparece na SAÍDA — nunca desliga o filtro de escopo.
-ETAPAS_VALIDAS = ("citacao", "penhora", "movimentacao", "sinais", "entidades", "tipo")
-
-
-def _parse_campos(raw):
-    """
-    Interpreta a env CAMPOS e devolve o set de etapas ATIVAS na saída.
-      - None / vazio  -> todas as etapas (comportamento v8.0).
-      - lista válida  -> só as etapas pedidas.
-      - nome inválido -> ABORTA (SystemExit) com log claro. Config quebrada é
-        erro de operador, não PDF ruim: falha visível no arranque, não em
-        silêncio nem a meio do lote.
-    """
-    if raw is None or not raw.strip():
-        return set(ETAPAS_VALIDAS)
-    pedidos = [c.strip().lower() for c in raw.split(",") if c.strip()]
-    invalidos = [c for c in pedidos if c not in ETAPAS_VALIDAS]
-    if invalidos:
-        msg = (
-            f"[Fase 3] CAMPOS inválido(s): {invalidos}. "
-            f"Etapas válidas: {list(ETAPAS_VALIDAS)}. "
-            f"Ex.: CAMPOS=citacao,penhora  (vazio ou ausente = todas)."
-        )
-        logging.error(msg)
-        raise SystemExit(msg)
-    if not pedidos:
-        return set(ETAPAS_VALIDAS)
-    return set(pedidos)
-
-
-CAMPOS_ATIVOS = _parse_campos(os.environ.get("CAMPOS"))
-
-
-def _etapa_on(nome):
-    """True se a etapa `nome` deve ser executada/exportada nesta rodada."""
-    return nome in CAMPOS_ATIVOS
-
-
-def _sinais_ou_stub(full_text):
-    """
-    [Fase 3] 'sinais' é derivado de full_text nos exportadores (não viaja na
-    tupla). Só recalcula se a etapa estiver ativa; senão devolve um stub com
-    None nos três sinais — null por não-processado, não por não-encontrado.
-    """
-    if _etapa_on("sinais"):
-        return _extrair_sinais_processuais(full_text)
-    return {"extincao": None, "parcelamento": None, "suspensao_art40": None}
-
-
 def generate_prompts(input_dir):
     pdf_files = [f for f in os.listdir(input_dir) if f.lower().endswith('.pdf')]
     prompts = []
-    ignorados = []   # PDFs fora de escopo que não entram no resultado (auditados à parte)
 
     for pdf_file in pdf_files:
         pdf_path = os.path.join(input_dir, pdf_file)
@@ -1938,92 +1707,72 @@ def generate_prompts(input_dir):
             if ocr_metadata["paginas_ocr"]:
                 n = len(ocr_metadata["paginas_ocr"])
                 conf_prom = sum(ocr_metadata["confianza_ocr"].values()) / n
-                logging.info(f"  {pdf_file}: {n} página(s) vía OCR, confianza media {conf_prom:.1f}%")
+                logging.info(f"  {pdf_file}: {n} página(s) por OCR, confiança média {conf_prom:.1f}%")
 
             if not full_text.strip():
                 logging.warning(f"PDF sin texto extraíble: {pdf_file}")
+                print(f"EXTRACAO FALHOU: {pdf_file} — PDF sem texto extraível")
                 prompts.append((pdf_file, None, None, None, None, None, None,
-                                "Erro - PDF sem texto", None, "", ocr_metadata, tipo_processo, None))
+                                "Erro - PDF sem texto",
+                                "PDF sem texto extraível — digitalização ilegível ou arquivo vazio",
+                                "", ocr_metadata, tipo_processo, None))
                 continue
 
             tipo_processo = detectar_tipo_processo(full_text)
-            if _deve_ignorar(tipo_processo):
-                logging.warning(f"  {pdf_file}: IGNORADO (fora de escopo) — {tipo_processo['motivo']}")
-                ignorados.append({
-                    "arquivo"       : pdf_file,
-                    "confianca"     : tipo_processo.get("confianza"),
-                    "motivo"        : tipo_processo.get("motivo"),
-                    "classe_assunto": tipo_processo.get("classe_assunto"),
-                })
+            if (not tipo_processo["es_execucao_fiscal"]) and tipo_processo["confianza"] == "alta":
+                logging.warning(f"  {pdf_file}: FORA DE ESCOPO — {tipo_processo['motivo']}")
+                print(f"FORA DE ESCOPO: {pdf_file} — {tipo_processo['motivo']}")
+                prompts.append((
+                    pdf_file, None, None, None, None, None, None,
+                    "Fora de escopo - não é execução fiscal",
+                    f"Fora de escopo — não é execução fiscal: {tipo_processo['motivo']}",
+                    full_text, ocr_metadata, tipo_processo, None
+                ))
                 continue
 
-            # [Fase 3] Cada etapa só roda se estiver em CAMPOS_ATIVOS. Etapa
-            # desligada => o extractor NÃO executa e o campo permanece None
-            # (pré-inicializado acima). 'tipo' já rodou (detectar_tipo_processo,
-            # acima) porque alimenta o filtro de escopo; aqui só decidimos se
-            # aparece na saída.
-            if _etapa_on("movimentacao"):
-                fecha_reciente = fecha_ultima_movimentacao(full_text)
+            fecha_reciente = fecha_ultima_movimentacao(full_text)
+            citacion       = extract_citacion(full_text)
+            penhora        = extract_penhora(full_text)
+            fecha_orden, fecha_intento, fecha_efectiva = extraer_fechas_citacion(full_text)
 
-            if _etapa_on("citacao"):
-                citacion = extract_citacion(full_text)
-                fecha_orden, fecha_intento, fecha_efectiva = extraer_fechas_citacion(full_text)
-                # Regla: fecha_citacion_efectiva None si status_citacion != "HOUVE CITAÇÃO"
-                if not citacion or normalizar(citacion) != normalizar("HOUVE CITAÇÃO"):
-                    fecha_efectiva = None
+            # Regla: fecha_citacion_efectiva None si status_citacion != "HOUVE CITAÇÃO"
+            if not citacion or normalizar(citacion) != normalizar("HOUVE CITAÇÃO"):
+                fecha_efectiva = None
 
-            if _etapa_on("penhora"):
-                penhora = extract_penhora(full_text)
-
-            if _etapa_on("entidades"):
-                entidades = extract_entidades_agente2(full_text)
-
+            entidades = extract_entidades_agente2(full_text)
             prompt = create_prompt(fecha_reciente, citacion, penhora)
 
-            # [Fase 1] Evidência: em qual página apareceu a citação/penhora/entidade.
-            # Aditivo — viaja dentro de ocr_metadata. [Fase 3] Só constrói blocos
-            # das etapas ativas (passa CAMPOS_ATIVOS).
-            ocr_metadata["evidencias"] = construir_evidencias(
-                pages_text, citacion, penhora, entidades, ocr_metadata,
-                etapas=CAMPOS_ATIVOS,
-            )
-
-            # [Fase 3] 'tipo' na saída só se estiver em CAMPOS (a detecção já
-            # rodou para o filtro de escopo; nullamos apenas o que vai na tupla).
-            tipo_saida = tipo_processo if _etapa_on("tipo") else None
-
-            _ent_print = entidades or {}
             print(f"\n{'='*60}")
             print(f"ARQUIVO : {pdf_file}")
-            print(f"  Etapas ativas  : {sorted(CAMPOS_ATIVOS)}")
-            print(f"  Última data    : {fecha_reciente.strftime('%Y-%m-%d') if fecha_reciente else '—'}")
-            print(f"  Citação        : {citacion or '—'}")
-            print(f"  Penhora        : {penhora or '—'}")
-            print(f"  CPF/CNPJ       : {_ent_print.get('cpf_cnpj') or '—'}")
-            print(f"  Executado      : {_ent_print.get('nome_executado') or '—'}")
-            print(f"  Valor orig.    : {_ent_print.get('valor_original') or '—'}")
+            print(f"  Última data    : {fecha_reciente.strftime('%Y-%m-%d') if fecha_reciente else 'NÃO ENCONTRADA'}")
+            print(f"  Citação        : {citacion}")
+            print(f"  Penhora        : {penhora}")
+            print(f"  CPF/CNPJ       : {entidades.get('cpf_cnpj') or '—'}")
+            print(f"  Executado      : {entidades.get('nome_executado') or '—'}")
+            print(f"  Valor orig.    : {entidades.get('valor_original') or '—'}")
             print(f"{'='*60}")
 
             prompts.append((
                 pdf_file, fecha_reciente, citacion,
                 fecha_orden, fecha_intento, fecha_efectiva,
-                penhora, prompt, respuesta_gpt, full_text, ocr_metadata, tipo_saida, entidades
+                penhora, prompt, respuesta_gpt, full_text, ocr_metadata, tipo_processo, entidades
             ))
 
         except Exception as e:
             logging.error(f"Erro ao processar {pdf_file}: {e}", exc_info=True)
+            print(f"EXTRACAO FALHOU: {pdf_file} — {type(e).__name__}: {e}")
             prompts.append((
-                pdf_file, None, None, None, None, None, None, "Erro", None, full_text, ocr_metadata, tipo_processo, None
+                pdf_file, None, None, None, None, None, None, "Erro",
+                f"Falha ao ler o PDF ({type(e).__name__}): {e}",
+                full_text, ocr_metadata, tipo_processo, None
             ))
 
-    return prompts, ignorados
+    return prompts
 
 
 # 8. Guardar resumo de sinais en un archivo de texto (auditoría legible)
 def save_prompts_to_file(prompts, output_file):
     with open(output_file, 'w', encoding='utf-8') as file:
-        file.write(f"# Etapas processadas (CAMPOS): {sorted(CAMPOS_ATIVOS)}\n")
-        file.write(f"{'='*50}\n")
         for (pdf_file, _, _, _, _, _, _, prompt, _, _, ocr_metadata, tipo_processo, _) in prompts:
             paginas_ocr = ocr_metadata.get("paginas_ocr", []) if ocr_metadata else []
             ocr_info = f"Páginas via OCR: {paginas_ocr}\n" if paginas_ocr else ""
@@ -2042,7 +1791,7 @@ def process_prompts_to_excel(prompts, output_excel):
          fecha_efectiva, penhora, prompt, respuesta_gpt, full_text,
          ocr_metadata, tipo_processo, entidades) in prompts:
 
-        sinais = _sinais_ou_stub(full_text)   # [Fase 3] respeita CAMPOS
+        sinais = _extrair_sinais_processuais(full_text)
         dias = _dias_desde(fecha_reciente, hoy)
 
         paginas_ocr = ocr_metadata.get("paginas_ocr", []) if ocr_metadata else []
@@ -2058,6 +1807,10 @@ def process_prompts_to_excel(prompts, output_excel):
             # ── Identificação / tipo ──────────────────────────────────────
             "CASO"                          : pdf_file,
             "Número do processo"            : ent.get("numero_processo") or "",
+            # Vazio quando a extração correu bem. Preenchido, avisa o procurador
+            # de que a linha NÃO foi lida do PDF — antes ela saía vazia e era
+            # indistinguível de um processo lido sem dados.
+            "Erro na extração"              : respuesta_gpt or "",
             "É execução fiscal?"            : ("Sim" if tp.get("es_execucao_fiscal") else "Não") if tp else "",
             "Confiança tipo processo"       : tp.get("confianza", "") if tp else "",
             "Classe-Assunto (PJe)"          : (tp.get("classe_assunto") or "(não detectado)") if tp else "",
@@ -2069,8 +1822,6 @@ def process_prompts_to_excel(prompts, output_excel):
             "Data tentativa citação"        : fecha_intento.strftime("%Y-%m-%d") if fecha_intento  else "Não especificado",
             "Data citação efetiva"          : fecha_efectiva.strftime("%Y-%m-%d") if fecha_efectiva else "Não especificado",
             "Resultado da penhora"          : penhora or "Não especificado",
-            "Página citação"                : _pag_evid(ocr_metadata, "citacao"),
-            "Página penhora"                : _pag_evid(ocr_metadata, "penhora"),
             "Extinção detectada"            : sinais["extincao"] or "",
             "Parcelamento detectado"        : sinais["parcelamento"] or "",
             "Suspensão art.40 LEF"          : sinais["suspensao_art40"] or "",
@@ -2140,8 +1891,7 @@ def process_prompts_to_excel(prompts, output_excel):
             "Última data de interação": 16, "Dias desde última movimentação": 14,
             "Status da citação": 30, "Data ordem citação": 14,
             "Data tentativa citação": 14, "Data citação efetiva": 14,
-            "Resultado da penhora": 30, "Página citação": 12, "Página penhora": 12,
-            "Extinção detectada": 22,
+            "Resultado da penhora": 30, "Extinção detectada": 22,
             "Parcelamento detectado": 28, "Suspensão art.40 LEF": 22,
             "Páginas via OCR": 14, "Confiança OCR (%)": 12,
             "CPF/CNPJ": 20, "Nome executado": 30, "Nome exequente": 30,
@@ -2163,7 +1913,7 @@ def process_prompts_to_excel(prompts, output_excel):
 # 9.1 — JSON ESTRUTURADO (interface Agente 1 -> Agente 2)
 # ===========================================================================
 
-def exportar_json_agente2(prompts, output_json, total_ignorados=None):
+def exportar_json_agente2(prompts, output_json):
     """
     Gera o JSON de interface Agente 1 -> Agente 2.
 
@@ -2176,7 +1926,7 @@ def exportar_json_agente2(prompts, output_json, total_ignorados=None):
     import json
     from datetime import datetime as _dt
 
-    VERSION_AGENTE1 = "8.1"
+    VERSION_AGENTE1 = "8.0"
 
     def _nulo(val):
         if val is None:
@@ -2194,17 +1944,25 @@ def exportar_json_agente2(prompts, output_json, total_ignorados=None):
 
         ent = entidades or {}
         tp  = tipo_processo or {}
-        sinais = _sinais_ou_stub(full_text)   # [Fase 3] respeita CAMPOS
+        sinais = _extrair_sinais_processuais(full_text)
 
         ocr_meta  = ocr_metadata or {}
         conf_dict = ocr_meta.get("confianza_ocr", {})
         conf_media = round(sum(conf_dict.values()) / len(conf_dict), 1) if conf_dict else None
 
+        # 'respuesta_gpt' passou a carregar o motivo quando a extração não deu certo
+        # (PDF ilegível, sem texto ou fora de escopo). Sem este campo, um processo
+        # que nunca foi lido saía no JSON igual a um processo lido sem dados — e o
+        # Agente 2 ainda lhe atribuía prioridade.
+        erro_extracao = _nulo(respuesta_gpt)
+
         processos.append({
-            "id_lote"                       : pdf_file,
+            "arquivo"                       : pdf_file,
             "numero_processo"               : _nulo(ent.get("numero_processo")),
+            "extracao_ok"                   : erro_extracao is None,
+            "erro_extracao"                 : erro_extracao,
             "tipo_processo": {
-                "es_execucao_fiscal"        : tp.get("es_execucao_fiscal"),
+                "e_execucao_fiscal"         : tp.get("es_execucao_fiscal"),
                 "confianca"                 : tp.get("confianza"),
                 "classe_assunto"            : _nulo(tp.get("classe_assunto")),
             },
@@ -2224,8 +1982,6 @@ def exportar_json_agente2(prompts, output_json, total_ignorados=None):
                 "paginas"                   : ocr_meta.get("paginas_ocr", []),
                 "confianca_media"           : conf_media,
             },
-            # [Fase 1] Página onde a citação/penhora foi encontrada (aditivo).
-            "evidencias"                    : ocr_meta.get("evidencias"),
             "entidades": {
                 # numero_processo também dentro de 'entidades' (além do nível
                 # superior) — é onde buscar_processo.py e o Agente 2 procuram.
@@ -2245,14 +2001,11 @@ def exportar_json_agente2(prompts, output_json, total_ignorados=None):
 
     payload = {
         "metadata": {
-            "generado_em"     : hoy.strftime("%Y-%m-%dT%H:%M:%S"),
-            "total_procesados": len(prompts),
-            "total_ignorados" : total_ignorados,
-            "version_agente1" : VERSION_AGENTE1,
-            # [Fase 3] Etapas efetivamente rodadas nesta execução. Campos fora
-            # desta lista saem null por NÃO-PROCESSADO (≠ não-encontrado).
-            "campos_processados": sorted(CAMPOS_ATIVOS),
-            "observacao"      : "Agente 1 faz apenas extração determinística; não emite juízo APTO/NÃO APTO.",
+            "gerado_em"        : hoy.strftime("%Y-%m-%dT%H:%M:%S"),
+            "total_processados": len(prompts),
+            "total_com_erro"   : sum(1 for pr in processos if not pr["extracao_ok"]),
+            "versao_agente1"   : VERSION_AGENTE1,
+            "observacao"       : "Agente 1 faz apenas extração determinística; não emite juízo APTO/NÃO APTO.",
         },
         "processos": processos,
     }
@@ -2261,7 +2014,10 @@ def exportar_json_agente2(prompts, output_json, total_ignorados=None):
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
     print(f"JSON do Agente 1 gerado: {output_json}")
-    print(f"  {len(processos)} processo(s) exportado(s) (todos, sem filtro).")
+    com_erro = sum(1 for pr in processos if not pr["extracao_ok"])
+    print(f"  {len(processos) - com_erro} de {len(processos)} processo(s) extraído(s) com sucesso.")
+    if com_erro:
+        print(f"  {com_erro} processo(s) NÃO puderam ser extraídos — ver 'erro_extracao' no JSON.")
     return payload
 
 
@@ -2269,7 +2025,7 @@ def exportar_json_agente2(prompts, output_json, total_ignorados=None):
 # 9.2 — HISTÓRICO DE EXTRAÇÕES (auditoria acumulativa — append-only)
 # ===========================================================================
 
-def exportar_historial_classificacoes(prompts, output_jsonl):
+def exportar_historico_extracoes(prompts, output_jsonl):
     """
     Registra TODOS os processos do lote num JSONL — uma linha por processo.
     APPEND-ONLY: nunca sobrescreve o rastro anterior. Cada processo vai em
@@ -2296,14 +2052,14 @@ def exportar_historial_classificacoes(prompts, output_jsonl):
 
                 ent    = entidades or {}
                 tp     = tipo_processo or {}
-                sinais = _sinais_ou_stub(full_text)   # [Fase 3] respeita CAMPOS
+                sinais = _extrair_sinais_processuais(full_text)
 
                 registro = {
                     "extraido_em"        : hoy.strftime("%Y-%m-%dT%H:%M:%S"),
                     "arquivo"            : pdf_file,
-                    "campos_processados" : sorted(CAMPOS_ATIVOS),   # [Fase 3]
                     "numero_processo"    : _nulo(ent.get("numero_processo")),
-                    "es_execucao_fiscal" : tp.get("es_execucao_fiscal"),
+                    "e_execucao_fiscal"  : tp.get("es_execucao_fiscal"),
+                    "erro_extracao"      : _nulo(respuesta_gpt),
                     "ultima_movimentacao": fecha_reciente.strftime("%Y-%m-%d") if fecha_reciente else None,
                     "status_citacao"     : _nulo(citacion),
                     "resultado_penhora"  : _nulo(penhora),
@@ -2325,48 +2081,19 @@ def exportar_historial_classificacoes(prompts, output_jsonl):
     return gravados, erros
 
 
-def _registrar_ignorados(ignorados, output_file):
-    """
-    Grava a lista de PDFs IGNORADOS (fora de escopo) para auditoria — nada é
-    descartado em silêncio. Se algum for execução fiscal de verdade, o usuário
-    pode rodar com MODO_ESCOPO=incluir_tudo (ou ignorar_alta) e revisar.
-    """
-    from datetime import datetime as _dt
-    n = len(ignorados)
-    logging.info(f"Modo de escopo: '{MODO_ESCOPO}' — {n} arquivo(s) ignorado(s) (fora de escopo)")
-    try:
-        with open(output_file, "w", encoding="utf-8") as f:
-            f.write(f"# Arquivos IGNORADOS (fora de escopo) — modo={MODO_ESCOPO}\n")
-            f.write(f"# Gerado em {_dt.now().strftime('%Y-%m-%d %H:%M:%S')} — total: {n}\n")
-            f.write("# Estes PDFs NAO entraram na planilha nem no JSON. Se algum for\n")
-            f.write("# execucao fiscal de verdade, rode com MODO_ESCOPO=incluir_tudo e revise.\n\n")
-            for ig in ignorados:
-                f.write(f"- {ig['arquivo']}  [confianca: {ig.get('confianca')}]  {ig.get('motivo')}\n")
-    except Exception as e:
-        logging.error(f"Falha ao gravar lista de ignorados em {output_file}: {e}", exc_info=True)
-    print(f"Arquivos ignorados (fora de escopo): {n} — lista em {output_file}")
-    return n
-
-
 # 10. Ejecutar el flujo
 if __name__ == "__main__":
     os.makedirs(PASTA_JSON, exist_ok=True)
     os.makedirs(PASTA_RESULTADOS, exist_ok=True)
 
-    # [Fase 3] Deixa explícito, no log e no stdout, o que esta execução vai rodar.
-    logging.info(f"[Fase 3] Etapas ativas (CAMPOS): {sorted(CAMPOS_ATIVOS)}")
-    print(f"[Fase 3] Etapas ativas nesta execução (CAMPOS): {sorted(CAMPOS_ATIVOS)}")
-
     _timestamp = datetime.now().strftime("%Y-%m-%d_%Hh%M")
     output_file_resumo    = os.path.join(PASTA_JSON, f"resumo_sinais_V8.txt")
     output_file_excel     = os.path.join(PASTA_RESULTADOS, f"resultados_V8.xlsx")
     output_file_json      = os.path.join(PASTA_JSON, f"saida_agente1_V8.json")
-    output_file_historico = os.path.join(PASTA_JSON, "historico_extracoes.jsonl")
-    output_file_ignorados = os.path.join(PASTA_JSON, "ignorados_V8.txt")
+    output_file_historico = os.path.join(PASTA_JSON, "historico_extracoes.jsonl")  
 
-    prompts, ignorados = generate_prompts(input_directory)
-    _registrar_ignorados(ignorados, output_file_ignorados)   # auditoria — nunca em silêncio
+    prompts = generate_prompts(input_directory)
     save_prompts_to_file(prompts, output_file_resumo)
     process_prompts_to_excel(prompts, output_file_excel)
-    exportar_json_agente2(prompts, output_file_json, total_ignorados=len(ignorados))
-    exportar_historial_classificacoes(prompts, output_file_historico)
+    exportar_json_agente2(prompts, output_file_json)
+    exportar_historico_extracoes(prompts, output_file_historico)
