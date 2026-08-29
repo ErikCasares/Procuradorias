@@ -1632,7 +1632,11 @@ def _extrair_sinais_processuais(full_text):
     """
     Reúne os sinais processuais detectados (fatos, não veredito). Fonte única
     usada pela planilha, pelo JSON e pelo histórico para evitar divergência.
+    [Fase 3] Só roda se a etapa 'sinais' foi pedida em CAMPOS; senão devolve
+    tudo None (o campo não foi solicitado — diferente de 'procurado e vazio').
     """
+    if "sinais" not in CAMPOS:
+        return {"extincao": None, "parcelamento": None, "suspensao_art40": None}
     return {
         "extincao"       : extract_extincao(full_text),
         "parcelamento"   : extract_parcelamento(full_text),
@@ -1836,6 +1840,39 @@ def _pag_evid(ocr_metadata, campo):
 MODO_ESCOPO = os.environ.get("MODO_ESCOPO", "ignorar_todos").strip().lower()
 
 
+# ===========================================================================
+# FASE 3 — SELETOR DE ETAPAS (definir o que o agente deve buscar)
+# ===========================================================================
+# Env CAMPOS: lista separada por vírgula das etapas a executar. Vazio/"todas"
+# = tudo (comportamento padrão, retrocompatível). Etapas não pedidas ficam
+# NULL na saída — o que é DIFERENTE de "procurado e não encontrado".
+# O JSON registra 'campos_processados' (proveniência) para o passo seguinte
+# (Fase 4 — reaproveitamento) poder distinguir "não pedido" de "vazio".
+#
+# ATENÇÃO: uma extração PARCIAL não deve ir direto ao Agente 2 sem antes ser
+# combinada com o estado anterior (Fase 4) — senão o Agente 2 lê os campos não
+# pedidos como ausentes. Por isso emitimos um aviso visível ao rodar parcial.
+_CAMPOS_VALIDOS = {"citacao", "penhora", "movimentacao", "sinais", "entidades", "tipo"}
+
+
+def _parse_campos(valor):
+    if not valor or valor.strip().lower() in ("", "todas", "todos", "all", "*"):
+        return set(_CAMPOS_VALIDOS)
+    pedidos = {c.strip().lower() for c in valor.split(",") if c.strip()}
+    invalidos = pedidos - _CAMPOS_VALIDOS
+    if invalidos:
+        logging.warning(f"CAMPOS inválidos ignorados: {sorted(invalidos)}. "
+                        f"Válidos: {sorted(_CAMPOS_VALIDOS)}")
+    validos = pedidos & _CAMPOS_VALIDOS
+    if not validos:
+        logging.warning("Nenhum CAMPO válido informado — processando TODOS por segurança.")
+        return set(_CAMPOS_VALIDOS)
+    return validos
+
+
+CAMPOS = _parse_campos(os.environ.get("CAMPOS"))
+
+
 def _deve_ignorar(tipo_processo):
     if tipo_processo is None:
         return False
@@ -1872,6 +1909,15 @@ def generate_prompts(input_dir):
     prompts = []
     ignorados = []   # PDFs fora de escopo que não entram no resultado (auditados à parte)
 
+    # [Fase 3] Aviso visível quando a extração é PARCIAL (nem todos os campos).
+    if CAMPOS != _CAMPOS_VALIDOS:
+        faltantes = sorted(_CAMPOS_VALIDOS - CAMPOS)
+        logging.warning(f"EXTRAÇÃO PARCIAL — campos pedidos: {sorted(CAMPOS)}. "
+                        f"Não processados (ficam null): {faltantes}.")
+        print(f"[Fase 3] EXTRAÇÃO PARCIAL — processando só: {sorted(CAMPOS)}")
+        print(f"         Campos não pedidos ficam NULL. NÃO envie ao Agente 2 sem "
+              f"combinar com o estado anterior (merge — Fase 4).")
+
     for pdf_file in pdf_files:
         pdf_path = os.path.join(input_dir, pdf_file)
 
@@ -1906,45 +1952,55 @@ def generate_prompts(input_dir):
                                 "", ocr_metadata, tipo_processo, None))
                 continue
 
-            tipo_processo = detectar_tipo_processo(full_text)
-            if _deve_ignorar(tipo_processo):
-                logging.warning(f"  {pdf_file}: IGNORADO (fora de escopo) — {tipo_processo['motivo']}")
-                print(f"IGNORADO (fora de escopo): {pdf_file} — {tipo_processo['motivo']}")
-                ignorados.append({
-                    "arquivo"       : pdf_file,
-                    "confianca"     : tipo_processo.get("confianza"),
-                    "motivo"        : tipo_processo.get("motivo"),
-                    "classe_assunto": tipo_processo.get("classe_assunto"),
-                })
-                continue
+            # [Fase 3] 'tipo' também é a base do filtro de escopo. Se não for
+            # pedido, não classificamos e não filtramos por escopo (processa tudo).
+            if "tipo" in CAMPOS:
+                tipo_processo = detectar_tipo_processo(full_text)
+                if _deve_ignorar(tipo_processo):
+                    logging.warning(f"  {pdf_file}: IGNORADO (fora de escopo) — {tipo_processo['motivo']}")
+                    print(f"IGNORADO (fora de escopo): {pdf_file} — {tipo_processo['motivo']}")
+                    ignorados.append({
+                        "arquivo"       : pdf_file,
+                        "confianca"     : tipo_processo.get("confianza"),
+                        "motivo"        : tipo_processo.get("motivo"),
+                        "classe_assunto": tipo_processo.get("classe_assunto"),
+                    })
+                    continue
 
-            fecha_reciente = fecha_ultima_movimentacao(full_text)
-            citacion       = extract_citacion(full_text)
-            penhora        = extract_penhora(full_text)
-            fecha_orden, fecha_intento, fecha_efectiva = extraer_fechas_citacion(full_text)
+            if "movimentacao" in CAMPOS:
+                fecha_reciente = fecha_ultima_movimentacao(full_text)
 
-            # Regla: fecha_citacion_efectiva None si status_citacion != "HOUVE CITAÇÃO"
-            if not citacion or normalizar(citacion) != normalizar("HOUVE CITAÇÃO"):
-                fecha_efectiva = None
+            if "citacao" in CAMPOS:
+                citacion = extract_citacion(full_text)
+                fecha_orden, fecha_intento, fecha_efectiva = extraer_fechas_citacion(full_text)
+                # Regla: fecha_citacion_efectiva None si status_citacion != "HOUVE CITAÇÃO"
+                if not citacion or normalizar(citacion) != normalizar("HOUVE CITAÇÃO"):
+                    fecha_efectiva = None
 
-            entidades = extract_entidades_agente2(full_text)
+            if "penhora" in CAMPOS:
+                penhora = extract_penhora(full_text)
+
+            if "entidades" in CAMPOS:
+                entidades = extract_entidades_agente2(full_text)
+
             prompt = create_prompt(fecha_reciente, citacion, penhora)
 
             # [Fase 1] Evidência: em qual página apareceu citação/penhora/entidades.
-            # Aditivo — viaja dentro de ocr_metadata, sem alterar a tupla nem os
-            # campos existentes (status_citacao/resultado_penhora seguem strings).
+            # Só localiza os campos que foram pedidos (os None são ignorados).
+            # Aditivo — viaja dentro de ocr_metadata, sem alterar a tupla.
             ocr_metadata["evidencias"] = construir_evidencias(
                 pages_text, citacion, penhora, entidades, ocr_metadata
             )
 
+            _ent = entidades or {}
             print(f"\n{'='*60}")
             print(f"ARQUIVO : {pdf_file}")
             print(f"  Última data    : {fecha_reciente.strftime('%Y-%m-%d') if fecha_reciente else 'NÃO ENCONTRADA'}")
             print(f"  Citação        : {citacion}")
             print(f"  Penhora        : {penhora}")
-            print(f"  CPF/CNPJ       : {entidades.get('cpf_cnpj') or '—'}")
-            print(f"  Executado      : {entidades.get('nome_executado') or '—'}")
-            print(f"  Valor orig.    : {entidades.get('valor_original') or '—'}")
+            print(f"  CPF/CNPJ       : {_ent.get('cpf_cnpj') or '—'}")
+            print(f"  Executado      : {_ent.get('nome_executado') or '—'}")
+            print(f"  Valor orig.    : {_ent.get('valor_original') or '—'}")
             print(f"{'='*60}")
 
             prompts.append((
@@ -2204,6 +2260,8 @@ def exportar_json_agente2(prompts, output_json, total_ignorados=None):
             "gerado_em"        : hoy.strftime("%Y-%m-%dT%H:%M:%S"),
             "total_processados": len(prompts),
             "total_ignorados"  : total_ignorados,
+            "campos_processados": sorted(CAMPOS),
+            "extracao_parcial" : CAMPOS != _CAMPOS_VALIDOS,
             "total_com_erro"   : sum(1 for pr in processos if not pr["extracao_ok"]),
             "versao_agente1"   : VERSION_AGENTE1,
             "observacao"       : "Agente 1 faz apenas extração determinística; não emite juízo APTO/NÃO APTO.",
