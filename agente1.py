@@ -76,6 +76,16 @@ input_directory  = os.environ.get("PASTA_ENTRADA")    or os.path.join(CURRENT_DI
 PASTA_JSON       = os.environ.get("PASTA_JSON")       or os.path.join(CURRENT_DIR, "JSON")
 PASTA_RESULTADOS = os.environ.get("PASTA_RESULTADOS") or os.path.join(CURRENT_DIR, "resultados")
 
+# [Fase 2] Cache do texto/OCR por hash do PDF. Fica junto ao script (CURRENT_DIR),
+# NÃO em PASTA_JSON — porque PASTA_JSON pode ser isolada por lote e o cache precisa
+# ser COMPARTILHADO entre execuções/lotes para valer a pena. Sobrescrevível por env.
+#   USAR_CACHE=0     desliga o cache (sempre reextrai).
+#   CACHE_REFRESH=1  ignora o cache existente e regrava (forçar releitura).
+# Docker: montar PASTA_CACHE num volume persistente, senão o cache some ao sair.
+PASTA_CACHE   = os.environ.get("PASTA_CACHE") or os.path.join(CURRENT_DIR, "cache_ocr")
+USAR_CACHE    = os.environ.get("USAR_CACHE", "1").strip().lower() not in ("0", "false", "nao", "não", "off")
+CACHE_REFRESH = os.environ.get("CACHE_REFRESH", "0").strip().lower() in ("1", "true", "sim", "on")
+
 
 # --- Configuração do OCR (usado só nas páginas digitalizadas) ---
 #
@@ -1904,7 +1914,107 @@ def _registrar_ignorados(ignorados, output_file):
     return n
 
 
+# ===========================================================================
+# FASE 2 — CACHE DO TEXTO/OCR POR HASH DO CONTEÚDO DO PDF
+# ===========================================================================
+# Guarda o resultado do passo CARO (pdfplumber + OCR) indexado pelo hash do
+# conteúdo do PDF. Cache-hit pula OCR inteiro no reprocessamento. Se o PDF mudar,
+# o hash muda e reextrai sozinho. Falha SEMPRE de forma segura: qualquer erro de
+# cache cai para a extração normal (nunca derruba o lote).
+
+def _hash_arquivo(pdf_path, _bloco=1 << 20):
+    """SHA-256 do conteúdo do arquivo (streaming — barato perto do OCR)."""
+    import hashlib
+    h = hashlib.sha256()
+    with open(pdf_path, "rb") as f:
+        for chunk in iter(lambda: f.read(_bloco), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _caminho_cache(hash_hex):
+    return os.path.join(PASTA_CACHE, f"{hash_hex}.json")
+
+
+def _ler_cache(hash_hex):
+    """Devolve (pages_text, metadata) do cache, ou None se não existe/corrompido."""
+    import json
+    caminho = _caminho_cache(hash_hex)
+    if not os.path.exists(caminho):
+        return None
+    try:
+        with open(caminho, encoding="utf-8") as f:
+            dados = json.load(f)
+        pages_text = dados["pages_text"]
+        meta = dados.get("metadata", {}) or {}
+        # JSON serializa chaves de dict como string; confianza_ocr usa página (int).
+        conf = meta.get("confianza_ocr", {}) or {}
+        meta["confianza_ocr"] = {int(k): v for k, v in conf.items()}
+        meta["paginas_ocr"] = list(meta.get("paginas_ocr", []) or [])
+        return pages_text, meta
+    except Exception as e:
+        logging.error(f"Cache corrompido em {caminho} — ignorando e reextraindo: {e}", exc_info=True)
+        return None
+
+
+def _gravar_cache(hash_hex, pdf_path, pages_text, metadata):
+    """Grava o cache de forma ATÔMICA (.tmp + replace) para não deixar cache meio-escrito."""
+    import json
+    from datetime import datetime as _dt
+    try:
+        os.makedirs(PASTA_CACHE, exist_ok=True)
+        caminho = _caminho_cache(hash_hex)
+        payload = {
+            "hash"          : hash_hex,
+            "arquivo_origem": os.path.basename(pdf_path),
+            "gerado_em"     : _dt.now().strftime("%Y-%m-%dT%H:%M:%S"),
+            "total_paginas" : len(pages_text),
+            "pages_text"    : pages_text,
+            "metadata": {
+                "paginas_ocr"  : list((metadata or {}).get("paginas_ocr", []) or []),
+                "confianza_ocr": (metadata or {}).get("confianza_ocr", {}) or {},
+            },
+        }
+        tmp = caminho + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+        os.replace(tmp, caminho)
+    except Exception as e:
+        logging.error(f"Falha ao gravar cache de {os.path.basename(pdf_path)}: {e}", exc_info=True)
+
+
+def extract_text_by_page_cached(pdf_path):
+    """
+    [Fase 2] Wrapper de extract_text_by_page() com cache por hash do conteúdo.
+    Cache-hit pula pdfplumber + OCR. Se o PDF mudar, reextrai. Qualquer erro de
+    cache cai para a extração normal (segurança).
+    """
+    if not USAR_CACHE:
+        return extract_text_by_page(pdf_path)
+
+    try:
+        hash_hex = _hash_arquivo(pdf_path)
+    except Exception as e:
+        logging.error(f"Falha ao calcular hash de {pdf_path} — extraindo sem cache: {e}", exc_info=True)
+        return extract_text_by_page(pdf_path)
+
+    if not CACHE_REFRESH:
+        cache = _ler_cache(hash_hex)
+        if cache is not None:
+            pages_text, meta = cache
+            n_ocr = len(meta.get("paginas_ocr", []))
+            logging.info(f"  {os.path.basename(pdf_path)}: CACHE HIT (hash {hash_hex[:12]}…, "
+                         f"{len(pages_text)} pág, {n_ocr} via OCR) — OCR pulado")
+            print(f"CACHE HIT: {os.path.basename(pdf_path)} — texto reaproveitado (sem OCR)")
+            return pages_text, meta
+
+    pages_text, meta = extract_text_by_page(pdf_path)
+    _gravar_cache(hash_hex, pdf_path, pages_text, meta)
+    return pages_text, meta
+
+
 def generate_prompts(input_dir):
+    # [Fase 2] extração com cache é feita via extract_text_by_page_cached() dentro do loop.
     pdf_files = [f for f in os.listdir(input_dir) if f.lower().endswith('.pdf')]
     prompts = []
     ignorados = []   # PDFs fora de escopo que não entram no resultado (auditados à parte)
@@ -1935,7 +2045,7 @@ def generate_prompts(input_dir):
         entidades      = None
 
         try:
-            pages_text, ocr_metadata = extract_text_by_page(pdf_path)
+            pages_text, ocr_metadata = extract_text_by_page_cached(pdf_path)
             full_text  = " ".join(p for p in pages_text if p)
 
             if ocr_metadata["paginas_ocr"]:
