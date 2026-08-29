@@ -346,21 +346,30 @@ def _a1_snapshot(rec, campo):
 
 def _mostrar_agente1(proc: dict):
     ent = proc.get("entidades", {})
+    # [Fase 1] página de origem por entidade (se disponível no JSON)
+    _ent_evid = ((proc.get("evidencias") or {}).get("entidades") or {})
+    def _v(valor, campo):
+        b = _ent_evid.get(campo) or {}
+        p = b.get("encontrado_em_pagina")
+        if valor is None or p is None:
+            return valor
+        via = " OCR" if b.get("via_ocr") else ""
+        return f"{valor}  (pág. {p}{via})"
     print(_titulo("\n┌─ AGENTE 1 — Triagem e dados extraídos"))
     print(_dim(f"│  fonte: {proc.get('_origem_arquivo','?')}"))
     print("│")
     print(_linha("Arquivo",  proc.get("arquivo")))    
-    print(_linha("Nº do processo",  ent.get("numero_processo")))
-    print(_linha("Executado",       ent.get("nome_executado")))
-    print(_linha("Exequente",       ent.get("nome_exequente")))
-    print(_linha("CPF/CNPJ",        ent.get("cpf_cnpj")))
-    print(_linha("Tipo de tributo", ent.get("tipo_tributo")))
-    print(_linha("Exercício",       ent.get("exercicio")))
-    print(_linha("Nº CDA",          ent.get("numero_cda")))
-    print(_linha("Data inscrição",  ent.get("data_inscricao")))
-    print(_linha("Valor original",  ent.get("valor_original")))
-    print(_linha("Valor atualizado",ent.get("valor_atualizado")))
-    print(_linha("Vara",            ent.get("vara")))
+    print(_linha("Nº do processo",  _v(ent.get("numero_processo"), "numero_processo")))
+    print(_linha("Executado",       _v(ent.get("nome_executado"), "nome_executado")))
+    print(_linha("Exequente",       _v(ent.get("nome_exequente"), "nome_exequente")))
+    print(_linha("CPF/CNPJ",        _v(ent.get("cpf_cnpj"), "cpf_cnpj")))
+    print(_linha("Tipo de tributo", _v(ent.get("tipo_tributo"), "tipo_tributo")))
+    print(_linha("Exercício",       _v(ent.get("exercicio"), "exercicio")))
+    print(_linha("Nº CDA",          _v(ent.get("numero_cda"), "numero_cda")))
+    print(_linha("Data inscrição",  _v(ent.get("data_inscricao"), "data_inscricao")))
+    print(_linha("Valor original",  _v(ent.get("valor_original"), "valor_original")))
+    print(_linha("Valor atualizado",_v(ent.get("valor_atualizado"), "valor_atualizado")))
+    print(_linha("Vara",            _v(ent.get("vara"), "vara")))
     print("│")
     decisao = proc.get("decisao_agente1") or ""
     if decisao:  # só versões antigas (v7) trazem decisão
@@ -376,7 +385,14 @@ def _mostrar_agente1(proc: dict):
     if sinais.get("suspensao_art40_lef"):
         print(_linha("Sinal art.40 LEF", sinais.get("suspensao_art40_lef")))
     print(_linha("Status citação",  proc.get("status_citacao")))
+    _evid = proc.get("evidencias") or {}
+    _bc = _evid.get("citacao") or {}
+    if _bc.get("encontrado_em_pagina"):
+        print(_linha("  ↳ citação na", f"pág. {_bc['encontrado_em_pagina']}" + (" (OCR)" if _bc.get('via_ocr') else "")))
     print(_linha("Resultado penhora",proc.get("resultado_penhora")))
+    _bp = _evid.get("penhora") or {}
+    if _bp.get("encontrado_em_pagina"):
+        print(_linha("  ↳ penhora na", f"pág. {_bp['encontrado_em_pagina']}" + (" (OCR)" if _bp.get('via_ocr') else "")))
     print(_linha("Última movimentação", proc.get("ultima_movimentacao")))
     # OCR: v8.0 aninha em 'ocr'; v7 usava 'confianca_ocr_media' no topo.
     conf = (proc.get("ocr") or {}).get("confianca_media")
