@@ -400,6 +400,15 @@ def _mostrar_agente1(proc: dict):
         conf = proc.get("confianca_ocr_media")
     if conf is not None:
         print(_linha("Confiança OCR", f"{conf}%"))
+    # [Fase 4] Conflitos de merge — mesmo PDF deu valor diferente do guardado.
+    conflitos = proc.get("conflitos") or []
+    if conflitos:
+        print("│")
+        print(_linha("⚠ CONFLITOS", _alerta(f"{len(conflitos)} campo(s) a revisar")))
+        for c in conflitos:
+            print(_linha(f"  • {c.get('campo')}",
+                         f"guardado: {c.get('valor_anterior')!r}  ×  novo: {c.get('valor_novo')!r}"
+                         f"  ({c.get('motivo')})"))
 
 
 def _mostrar_auditoria(rec: dict, historico=None):

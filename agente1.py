@@ -1883,6 +1883,154 @@ def _parse_campos(valor):
 CAMPOS = _parse_campos(os.environ.get("CAMPOS"))
 
 
+# ===========================================================================
+# FASE 4 — REAPROVEITAMENTO / MERGE (estado atual por processo)
+# ===========================================================================
+# Um arquivo dedicado e COMPARTILHADO guarda o "estado atual" de cada processo,
+# campo a campo, com proveniência (quando, de qual lote, de qual hash de PDF).
+# A cada corrida o merge atualiza esse estado respeitando CAMPOS:
+#   - etapa NÃO pedida  -> mantém o valor anterior (é o reaproveitamento);
+#   - etapa pedida:
+#       * valor igual        -> refresca proveniência;
+#       * valor diferente:
+#            - PDF mudou (hash != )  -> toma o novo (documento evoluiu);
+#            - mesmo PDF (ou hash ?) -> conserva o velho e MARCA CONFLITO p/ revisão.
+# Chave = número do processo; se não houver, nome do arquivo (com reverse-lookup
+# por arquivo para não duplicar um processo já conhecido pelo número).
+# Fica junto ao script (compartilhado, estável entre lotes). Docker: volume.
+ESTADO_PATH = os.environ.get("ESTADO_PATH") or os.path.join(CURRENT_DIR, "estado_atual_processos.json")
+USAR_MERGE  = os.environ.get("USAR_MERGE", "1").strip().lower() not in ("0", "false", "nao", "não", "off")
+
+# Campos do 'pr' (schema do JSON) agrupados por etapa. Dicts aninhados
+# (sinais/entidades/tipo) são tratados como unidade da sua etapa.
+_CAMPOS_POR_ETAPA = {
+    "movimentacao": ["ultima_movimentacao"],  # dias_desde é recomputado à parte
+    "citacao"     : ["status_citacao", "data_ordem_citacao",
+                     "data_tentativa_citacao", "data_citacao_efetiva"],
+    "penhora"     : ["resultado_penhora"],
+    "sinais"      : ["sinais_processuais"],
+    "entidades"   : ["entidades", "numero_processo"],
+    "tipo"        : ["tipo_processo"],
+}
+
+
+def _ler_estado(caminho):
+    import json
+    if not os.path.exists(caminho):
+        return {}
+    try:
+        with open(caminho, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        logging.error(f"Estado atual corrompido em {caminho} — começando vazio: {e}", exc_info=True)
+        return {}
+
+
+def _gravar_estado(caminho, estado):
+    import json
+    try:
+        os.makedirs(os.path.dirname(caminho) or ".", exist_ok=True)
+        tmp = caminho + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(estado, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, caminho)  # escrita atômica
+    except Exception as e:
+        logging.error(f"Falha ao gravar estado atual em {caminho}: {e}", exc_info=True)
+
+
+def _resolver_chave(estado, numero_processo, arquivo):
+    """Número do processo se houver; senão tenta achar entrada existente pelo
+    arquivo (para não duplicar um processo já conhecido pelo número); senão arquivo."""
+    if numero_processo:
+        return numero_processo, "numero_processo"
+    for chave, ent in estado.items():
+        if ent.get("arquivo") == arquivo:
+            return chave, ent.get("tipo_chave", "arquivo")
+    return arquivo, "arquivo"
+
+
+def _merge_estado(pr, estado, chave, tipo_chave, hash_novo, campos_run, origem_lote):
+    """
+    Combina o 'pr' desta corrida com o estado guardado, campo a campo, e devolve
+    o pr MERGED (estado completo). Atualiza `estado[chave]` in-place.
+    """
+    agora = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    entry = estado.get(chave) or {
+        "chave": chave, "tipo_chave": tipo_chave, "arquivo": pr.get("arquivo"),
+        "numero_processo": pr.get("numero_processo"),
+        "dados": {}, "prov": {}, "conflitos": [], "atualizado_em": agora,
+    }
+    dados = entry.setdefault("dados", {})
+    prov  = entry.setdefault("prov", {})
+    entry.setdefault("conflitos", [])
+
+    _AUSENTE = object()
+    for etapa, campos in _CAMPOS_POR_ETAPA.items():
+        for campo in campos:
+            if etapa not in campos_run:
+                # não pedido nesta corrida -> mantém o guardado (reaproveitamento)
+                if campo in dados:
+                    pr[campo] = dados[campo]
+                continue
+            novo = pr.get(campo)
+            antigo = dados.get(campo, _AUSENTE)
+            hash_antigo = prov.get(campo, {}).get("origem_hash")
+
+            def _set(valor, extra=None):
+                dados[campo] = valor
+                p = {"extraido_em": agora, "origem_lote": origem_lote, "origem_hash": hash_novo}
+                if extra:
+                    p.update(extra)
+                prov[campo] = p
+                entry["conflitos"] = [c for c in entry["conflitos"] if c["campo"] != campo]
+
+            if antigo is _AUSENTE or antigo == novo:
+                _set(novo)
+            elif hash_antigo and hash_novo and hash_antigo != hash_novo:
+                _set(novo, {"substituiu": antigo, "motivo": "pdf_alterado"})  # documento evoluiu
+            else:
+                # mesmo PDF (ou hash desconhecido) -> conserva o velho e marca conflito
+                pr[campo] = antigo
+                conf = {"campo": campo, "valor_anterior": antigo, "valor_novo": novo,
+                        "visto_em": agora, "origem_lote": origem_lote, "revisar": True,
+                        "motivo": "mesmo_pdf" if (hash_antigo and hash_novo) else "hash_desconhecido"}
+                entry["conflitos"] = [c for c in entry["conflitos"] if c["campo"] != campo] + [conf]
+
+    # 'dias_desde' é derivado -> recomputa a partir do ultima_movimentacao merged
+    um = pr.get("ultima_movimentacao")
+    pr["dias_desde_ultima_movimentacao"] = _dias_desde_str(um)
+
+    # Evidências: mantém as das etapas não pedidas; atualiza as pedidas.
+    old_ev = dados.get("evidencias") or {}
+    new_ev = pr.get("evidencias") or {}
+    merged_ev = dict(old_ev)
+    for sub, et in (("citacao", "citacao"), ("penhora", "penhora"), ("entidades", "entidades")):
+        if et in campos_run:
+            merged_ev[sub] = new_ev.get(sub)
+    dados["evidencias"] = merged_ev
+    pr["evidencias"] = merged_ev
+
+    entry["arquivo"] = pr.get("arquivo") or entry.get("arquivo")
+    entry["numero_processo"] = pr.get("numero_processo") or entry.get("numero_processo")
+    entry["tipo_chave"] = tipo_chave
+    entry["atualizado_em"] = agora
+    estado[chave] = entry
+
+    if entry["conflitos"]:
+        pr["conflitos"] = entry["conflitos"]
+    return pr
+
+
+def _dias_desde_str(fecha_str):
+    """dias desde uma data 'YYYY-MM-DD' (string), ou None."""
+    if not fecha_str:
+        return None
+    try:
+        return (datetime.now() - datetime.strptime(fecha_str, "%Y-%m-%d")).days
+    except Exception:
+        return None
+
+
 def _deve_ignorar(tipo_processo):
     if tipo_processo is None:
         return False
@@ -1988,20 +2136,20 @@ def extract_text_by_page_cached(pdf_path):
     [Fase 2] Wrapper de extract_text_by_page() com cache por hash do conteúdo.
     Cache-hit pula pdfplumber + OCR. Se o PDF mudar, reextrai. Qualquer erro de
     cache cai para a extração normal (segurança).
+    [Fase 4] Sempre anexa meta['hash_pdf'] (usado pelo merge hash-aware), mesmo
+    com o cache desligado.
     """
-    if not USAR_CACHE:
-        return extract_text_by_page(pdf_path)
-
+    hash_hex = None
     try:
         hash_hex = _hash_arquivo(pdf_path)
     except Exception as e:
-        logging.error(f"Falha ao calcular hash de {pdf_path} — extraindo sem cache: {e}", exc_info=True)
-        return extract_text_by_page(pdf_path)
+        logging.error(f"Falha ao calcular hash de {pdf_path}: {e}", exc_info=True)
 
-    if not CACHE_REFRESH:
+    if USAR_CACHE and hash_hex and not CACHE_REFRESH:
         cache = _ler_cache(hash_hex)
         if cache is not None:
             pages_text, meta = cache
+            meta["hash_pdf"] = hash_hex
             n_ocr = len(meta.get("paginas_ocr", []))
             logging.info(f"  {os.path.basename(pdf_path)}: CACHE HIT (hash {hash_hex[:12]}…, "
                          f"{len(pages_text)} pág, {n_ocr} via OCR) — OCR pulado")
@@ -2009,7 +2157,9 @@ def extract_text_by_page_cached(pdf_path):
             return pages_text, meta
 
     pages_text, meta = extract_text_by_page(pdf_path)
-    _gravar_cache(hash_hex, pdf_path, pages_text, meta)
+    meta["hash_pdf"] = hash_hex
+    if USAR_CACHE and hash_hex:
+        _gravar_cache(hash_hex, pdf_path, pages_text, meta)
     return pages_text, meta
 
 
@@ -2300,6 +2450,9 @@ def exportar_json_agente2(prompts, output_json, total_ignorados=None):
 
     hoy = _dt.now()
     processos = []
+    estado = _ler_estado(ESTADO_PATH) if USAR_MERGE else {}
+    n_merged = 0
+    n_conflitos = 0
 
     for tupla in prompts:
         (pdf_file, fecha_reciente, citacion, fecha_orden, fecha_intento,
@@ -2320,7 +2473,7 @@ def exportar_json_agente2(prompts, output_json, total_ignorados=None):
         # Agente 2 ainda lhe atribuía prioridade.
         erro_extracao = _nulo(respuesta_gpt)
 
-        processos.append({
+        pr = {
             "arquivo"                       : pdf_file,
             "numero_processo"               : _nulo(ent.get("numero_processo")),
             "extracao_ok"                   : erro_extracao is None,
@@ -2363,7 +2516,21 @@ def exportar_json_agente2(prompts, output_json, total_ignorados=None):
                 "valor_atualizado"          : _nulo(ent.get("valor_atualizado")),
                 "vara"                      : _nulo(ent.get("vara")),
             },
-        })
+        }
+
+        # [Fase 4] merge com o estado atual (só processos lidos com sucesso).
+        if USAR_MERGE and pr["extracao_ok"]:
+            hash_novo = ocr_meta.get("hash_pdf")
+            chave, tipo_chave = _resolver_chave(estado, pr["numero_processo"], pdf_file)
+            pr = _merge_estado(pr, estado, chave, tipo_chave, hash_novo, CAMPOS, pdf_file)
+            n_merged += 1
+            if pr.get("conflitos"):
+                n_conflitos += len(pr["conflitos"])
+
+        processos.append(pr)
+
+    if USAR_MERGE:
+        _gravar_estado(ESTADO_PATH, estado)
 
     payload = {
         "metadata": {
@@ -2373,6 +2540,10 @@ def exportar_json_agente2(prompts, output_json, total_ignorados=None):
             "campos_processados": sorted(CAMPOS),
             "extracao_parcial" : CAMPOS != _CAMPOS_VALIDOS,
             "total_com_erro"   : sum(1 for pr in processos if not pr["extracao_ok"]),
+            "merge_ativo"      : USAR_MERGE,
+            "processos_merged" : n_merged,
+            "conflitos_detectados": n_conflitos,
+            "estado_atual"     : ESTADO_PATH if USAR_MERGE else None,
             "versao_agente1"   : VERSION_AGENTE1,
             "observacao"       : "Agente 1 faz apenas extração determinística; não emite juízo APTO/NÃO APTO.",
         },

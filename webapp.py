@@ -595,6 +595,7 @@ def _publico(lote: dict, incluir_log=False, incluir_analises=False) -> dict:
         "iniciado_em"  : lote.get("iniciado_em"),
         "concluido_em" : lote.get("concluido_em"),
         "arquivos"     : lote.get("arquivos", []),
+        "campos"       : lote.get("campos") or "todas",   # [Fase 3] etapas pedidas
         "etapa"        : lote.get("etapa"),
         # Quem espera precisa de sinal de vida: um lote silencioso por oito
         # minutos é indistinguível de um lote travado. O tempo é calculado
@@ -801,9 +802,12 @@ async def _processar_lote(lote: dict):
                 "PASTA_ENTRADA"   : str(entrada),
                 "PASTA_JSON"      : str(saida_json),
                 "PASTA_RESULTADOS": str(saida_result),
+                # [Fase 3] etapas pedidas para este lote ("" = todas). O merge
+                # (Fase 4) combina extrações parciais com o estado compartilhado.
+                "CAMPOS"          : lote.get("campos") or "",
             },
             lote,
-            "Agente 1 — extração, OCR e classificação",
+            "Agente 1 — extração e OCR",
         )
         if rc != 0:
             raise RuntimeError(f"Agente 1 encerrou com código {rc}")
@@ -1131,6 +1135,13 @@ class Lote(BaseModel):
     iniciado_em : str | None = Field(None, description="Nulo enquanto o lote está na fila")
     concluido_em: str | None = None
     arquivos    : list[str] = Field(default_factory=list, description="PDFs recebidos neste lote")
+    campos      : str | None = Field(
+        "todas",
+        description="Etapas extraídas neste lote (Fase 3): citacao, penhora, "
+                    "movimentacao, sinais, entidades, tipo — ou 'todas'. "
+                    "Etapas não pedidas são reaproveitadas do estado anterior (merge).",
+        examples=["todas"],
+    )
     etapa       : str | None = Field(None, description="Passo corrente, para exibir a quem espera")
     decorrido_s : int | None = Field(
         None,
@@ -1356,7 +1367,29 @@ def _nome_pdf_seguro(nome: str) -> str:
     return limpo
 
 
-async def _gravar_lote(arquivos: list, origem: str) -> dict:
+_ETAPAS_VALIDAS = {"citacao", "penhora", "movimentacao", "sinais", "entidades", "tipo"}
+
+
+def _normalizar_campos(campos: str) -> str:
+    """
+    Valida/normaliza a seleção de etapas (Fase 3 do Agente 1). Devolve string
+    separada por vírgula com as etapas válidas, ou "" quando é 'todas' (ou vazio),
+    que é como o Agente 1 entende "processar tudo". Etapas inválidas são descartadas.
+    """
+    if not campos:
+        return ""
+    pedidos = [c.strip().lower() for c in campos.split(",") if c.strip()]
+    seen, out = set(), []
+    for c in pedidos:
+        if c in _ETAPAS_VALIDAS and c not in seen:
+            seen.add(c)
+            out.append(c)
+    if not out or set(out) == _ETAPAS_VALIDAS:
+        return ""          # tudo -> Agente 1 roda todas as etapas (default)
+    return ",".join(out)
+
+
+async def _gravar_lote(arquivos: list, origem: str, campos: str = "") -> dict:
     """Cria o lote em disco e o enfileira."""
     lote_id = datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + secrets.token_hex(3)
     entrada = _dir_lote(lote_id) / "entrada"
@@ -1399,6 +1432,7 @@ async def _gravar_lote(arquivos: list, origem: str) -> dict:
         "iniciado_em" : None,
         "concluido_em": None,
         "arquivos"    : nomes,
+        "campos"      : _normalizar_campos(campos),   # [Fase 3] etapas pedidas ("" = todas)
         "etapa"       : "na fila",
         "log"         : [],
         "analises"    : [],
@@ -1473,6 +1507,9 @@ async def health():
 )
 async def criar_lote(
     arquivos: list[UploadFile] = File(..., description="Um ou mais PDFs de processos"),
+    campos: str = Form("", description="Etapas a extrair, separadas por vírgula "
+                       "(citacao,penhora,movimentacao,sinais,entidades,tipo). "
+                       "Vazio = todas. Etapas não pedidas são reaproveitadas do estado anterior."),
     consumidor: str = Depends(autenticar_api),
 ):
     """
@@ -1507,7 +1544,7 @@ async def criar_lote(
 
     Ou abra o **painel** em `/` e arraste os arquivos — mesma fila, mesmo pipeline.
     """
-    lote = await _gravar_lote(arquivos, origem=consumidor)
+    lote = await _gravar_lote(arquivos, origem=consumidor, campos=campos)
     return _publico(lote)
 
 
@@ -1977,9 +2014,10 @@ async def logout(sessao: str = Cookie(None)):
 @app.post("/painel/lotes", include_in_schema=False, summary="Enviar lote pelo painel", response_model=Lote)
 async def painel_criar(
     arquivos: list[UploadFile] = File(...),
+    campos: str = Form(""),
     _=Depends(exigir_painel),
 ):
-    lote = await _gravar_lote(arquivos, origem="painel")
+    lote = await _gravar_lote(arquivos, origem="painel", campos=campos)
     return _publico(lote)
 
 
@@ -2238,10 +2276,11 @@ const escapar = s => String(s).replace(/[&<>"]/g,
 //
 // Devolve sempre {ok, status, dados, erro} — nunca lança. Todo caminho de
 // falha tem mensagem que diz o que fazer.
-function enviarLote(url, arquivos, cabecalhos, aoProgresso) {
+function enviarLote(url, arquivos, cabecalhos, aoProgresso, campos) {
   return new Promise(resolve => {
     const fd = new FormData();
     for (const f of arquivos) fd.append('arquivos', f);
+    if (campos) fd.append('campos', campos);   // [Fase 3] etapas selecionadas
 
     const req = new XMLHttpRequest();
     req.open('POST', url);
@@ -2589,6 +2628,22 @@ PAINEL = ("""<!doctype html>
 
     <div id="lista"></div>
 
+    <details style="margin-top:.9rem">
+      <summary style="cursor:pointer;font-size:.9rem;color:#5c6b7a">
+        Etapas a extrair (avançado) — por padrão, todas</summary>
+      <div class="linha" id="campos-box" style="flex-wrap:wrap;gap:.8rem;margin-top:.6rem;font-size:.9rem">
+        <label><input type="checkbox" class="campo" value="citacao" checked> Citação</label>
+        <label><input type="checkbox" class="campo" value="penhora" checked> Penhora</label>
+        <label><input type="checkbox" class="campo" value="movimentacao" checked> Movimentação</label>
+        <label><input type="checkbox" class="campo" value="sinais" checked> Sinais (extinção/parcelamento/art.40)</label>
+        <label><input type="checkbox" class="campo" value="entidades" checked> Entidades (CPF, CDA, valor…)</label>
+        <label><input type="checkbox" class="campo" value="tipo" checked> Tipo (execução fiscal?)</label>
+      </div>
+      <p class="vazio" style="padding:.4rem 0 0">As etapas não marcadas são
+        <b>reaproveitadas</b> do que já foi extraído antes (não se perdem). Útil para
+        reprocessar só uma etapa (ex.: só penhora) sem refazer o resto.</p>
+    </details>
+
     <div class="linha" style="margin-top:.9rem">
       <button id="btn-up" disabled>Enviar e processar</button>
       <button class="ghost" id="btn-limpar" hidden>Limpar seleção</button>
@@ -2711,8 +2766,13 @@ $('#btn-up').onclick = async () => {
   // Antes não havia catch nenhum, e uma falha de rede deixava a tela parada
   // em "Enviando…" com o botão reabilitado — dois cliques, dois lotes iguais.
   try {
+    // [Fase 3] etapas marcadas; se todas (ou nenhuma) -> "" = todas.
+    const marcados = Array.from(document.querySelectorAll('.campo:checked')).map(c => c.value);
+    const todas = document.querySelectorAll('.campo').length;
+    const campos = (marcados.length === 0 || marcados.length === todas) ? '' : marcados.join(',');
     const r = await enviarLote('/painel/lotes', Arquivos.itens, null,
-                               (env, tot) => { $('#up-msg').textContent = textoProgresso(env, tot); });
+                               (env, tot) => { $('#up-msg').textContent = textoProgresso(env, tot); },
+                               campos);
     if (r.ok) {
       $('#up-msg').textContent =
         `Lote ${r.dados.lote_id} criado com ${r.dados.arquivos.length} PDF(s) — acompanhe abaixo.`;
