@@ -32,6 +32,13 @@ services:
       # Ordena o trabalho do procurador; NÃO é critério de ajuizamento.
       LIMIAR_PRIORIDADE_ALTA: ${LIMIAR_PRIORIDADE_ALTA:-5000}
       LIMIAR_PRIORIDADE_MEDIA: ${LIMIAR_PRIORIDADE_MEDIA:-1000}
+      # ── Extração do Agente 1 (Fases 2–4) ──
+      # PASTA_CACHE e ESTADO_PATH já vêm do Dockerfile, apontando para os volumes
+      # persistentes (/app/dados e /app/JSON). Aqui só ficam os interruptores de
+      # comportamento, todos com padrão seguro; mude só se precisar.
+      MODO_ESCOPO: ${MODO_ESCOPO:-ignorar_todos}   # ignorar_todos | ignorar_alta | incluir_tudo
+      USAR_CACHE: ${USAR_CACHE:-1}                  # 0 desliga o cache de OCR
+      USAR_MERGE: ${USAR_MERGE:-1}                  # 0 desliga o reaproveitamento entre corridas
     # O OCR é o que consome memória. Sem teto, um PDF grande derruba o host;
     # com teto, o container morre sozinho e o lote é reportado como erro.
     # Mínimo recomendado: 2 GB. Abaixo disso, reduza OCR_MAX_LOTE.
@@ -75,8 +82,17 @@ services:
       OCR_DPI: ${OCR_DPI:-200}
       OCR_MAX_LOTE: ${OCR_MAX_LOTE:-10}
       OCR_MAX_WORKERS: ${OCR_MAX_WORKERS:-2}
+      # [Fase 3] Etapas a extrair neste lote batch; vazio = todas. Ex.: CAMPOS=penhora
+      # reprocessa só a penhora, reaproveitando o resto do estado (merge).
+      CAMPOS: ${CAMPOS:-}
+      MODO_ESCOPO: ${MODO_ESCOPO:-ignorar_todos}
+      USAR_CACHE: ${USAR_CACHE:-1}
+      USAR_MERGE: ${USAR_MERGE:-1}
     volumes:
       - "./processos pra analiser:/app/processos pra analiser"
       - "./JSON:/app/JSON"
       - "./resultados:/app/resultados"
+      # [Fase 5] dados/ montado também aqui: cache de OCR e estado do merge são
+      # COMPARTILHADOS entre a web e o batch (mesma fonte de verdade e mesmo cache).
+      - "./dados:/app/dados"
     command: ["python", "agente1.py"]

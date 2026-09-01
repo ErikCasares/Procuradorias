@@ -27,6 +27,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
+# [Fase 5] Cache de OCR e estado do merge em volumes PERSISTENTES (senão sumiriam
+# ao recriar o container, pois cairiam em /app, dentro da imagem):
+#   - estado do merge  -> /app/JSON  (importante; vai junto no backup do histórico)
+#   - cache de OCR      -> /app/dados (regenerável; não precisa de backup)
+# Ambas as pastas já são montadas como volume. Valem também no Easypanel (docker run).
+# Sobrescrevíveis por ambiente se o operador quiser outro caminho.
+ENV PASTA_CACHE=/app/dados/cache_ocr \
+    ESTADO_PATH=/app/JSON/estado_atual_processos.json
+
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
@@ -39,7 +48,7 @@ COPY entrypoint.sh /entrypoint.sh
 # O chown vale só para o que NÃO for sobreposto por um bind-mount de host: um
 # bind-mount traz o dono do host (root, no Easypanel) e ignora isto. Quem acerta
 # o dono do que foi montado é o entrypoint, em tempo de execução.
-RUN mkdir -p "/app/processos pra analiser" /app/JSON /app/resultados /app/dados/lotes \
+RUN mkdir -p "/app/processos pra analiser" /app/JSON /app/resultados /app/dados/lotes /app/dados/cache_ocr \
     && useradd --create-home --uid 10001 hera \
     && chown -R hera:hera /app \
     && chmod +x /entrypoint.sh

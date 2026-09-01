@@ -2427,6 +2427,40 @@ def process_prompts_to_excel(prompts, output_excel):
 # 9.1 — JSON ESTRUTURADO (interface Agente 1 -> Agente 2)
 # ===========================================================================
 
+class _LockEstado:
+    """
+    [Fase 5] Lock exclusivo de arquivo (POSIX flock) para serializar o
+    read-modify-write do estado compartilhado quando há processos concorrentes
+    (ex.: a web e um `docker compose run agente1` ao mesmo tempo). Best-effort:
+    se o flock não existir (ex.: Windows no dev), segue sem lock, só com aviso.
+    O lock é liberado no release() e, como garantia, na saída do processo.
+    """
+    def __init__(self, base_path):
+        self.lockpath = (base_path or "estado_atual_processos.json") + ".lock"
+        self.f = None
+
+    def acquire(self):
+        try:
+            import fcntl
+            os.makedirs(os.path.dirname(self.lockpath) or ".", exist_ok=True)
+            self.f = open(self.lockpath, "w")
+            fcntl.flock(self.f, fcntl.LOCK_EX)   # bloqueia até conseguir (serializa)
+        except Exception as e:
+            logging.warning(f"Lock de estado indisponível ({e}) — seguindo sem lock.")
+            self.f = None
+        return self
+
+    def release(self):
+        if self.f:
+            try:
+                import fcntl
+                fcntl.flock(self.f, fcntl.LOCK_UN)
+                self.f.close()
+            except Exception:
+                pass
+            self.f = None
+
+
 def exportar_json_agente2(prompts, output_json, total_ignorados=None):
     """
     Gera o JSON de interface Agente 1 -> Agente 2.
@@ -2450,6 +2484,9 @@ def exportar_json_agente2(prompts, output_json, total_ignorados=None):
 
     hoy = _dt.now()
     processos = []
+    _lock_estado = _LockEstado(ESTADO_PATH) if USAR_MERGE else None
+    if _lock_estado:
+        _lock_estado.acquire()          # serializa o merge entre processos concorrentes
     estado = _ler_estado(ESTADO_PATH) if USAR_MERGE else {}
     n_merged = 0
     n_conflitos = 0
@@ -2531,6 +2568,8 @@ def exportar_json_agente2(prompts, output_json, total_ignorados=None):
 
     if USAR_MERGE:
         _gravar_estado(ESTADO_PATH, estado)
+        if _lock_estado:
+            _lock_estado.release()      # libera após o write (read-modify-write atômico)
 
     payload = {
         "metadata": {

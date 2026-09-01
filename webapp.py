@@ -57,9 +57,16 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTex
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, Field
 
+import buscar_processo
+
 # A rota /api/v1/processos executa `buscar_processo.py` como subprocess (Opção A):
 # roda o arquivo inteiro e devolve a saída formatada do main(), para a API e o
-# terminal nunca divergirem. Por isso não importamos mais buscar_dados aqui.
+# terminal nunca divergirem.
+#
+# [V7.3] A rota de atalho /api/v1/lotes/{lote_id}/processo (1 PDF por lote), lá
+# embaixo, já importa `buscar_dados` direto: a resposta dela é JSON estruturado
+# (ProcessoConsultado), não o texto do CLI, então não há o que formatar e depois
+# desformatar — e chamar a função é mais barato que abrir um subprocesso.
 
 logging.basicConfig(
     level=logging.INFO,
@@ -1302,6 +1309,21 @@ serial — um por vez, porque o OCR já satura a CPU.
 
 Ciclo de vida: `na_fila` → `processando` → `concluido` | `erro`
 
+## Um PDF por vez
+
+Quem manda **um único PDF por lote** pode pular o formato agregado do passo 3
+e ir direto ao relatório do processo:
+
+```http
+GET /api/v1/lotes/{lote_id}/processo
+```
+
+É o mesmo relatório de `GET /api/v1/processos` — mas sem precisar saber o
+número CNJ de antemão, já que ele sai do próprio PDF enviado. Só funciona
+quando o lote tem exatamente 1 PDF **e** dele saiu exatamente 1 processo; com
+mais de um PDF, ou um PDF com mais de um processo, a rota responde `422` e
+aponta para `/resultado`.
+
 ## Consulta por número de processo
 
 Quando a pergunta parte do processo e não do lote:
@@ -1844,6 +1866,117 @@ def _pasta_recortada(destino: Path, consumidor: str) -> None:
                     continue          # linha corrompida: não é deste nem de ninguém
                 if rec.get(chave) in permitido:
                     saida.write(linha + "\n")
+
+
+def _numeros_do_lote(lote_id: str) -> set[str]:
+    """
+    Números de processo que o Agente 1 extraiu deste lote — lidos do JSON
+    ISOLADO do lote (dados/lotes/<id>/json/saida_agente1_V8.json), não do
+    histórico compartilhado.
+
+    Existe para a rota de atalho '/lotes/{lote_id}/processo' logo abaixo: ela
+    recebe o lote_id mas não o número CNJ até ler aqui.
+    """
+    traspasse = _dir_lote(lote_id) / "json" / "saida_agente1_V8.json"
+    if not traspasse.exists():
+        return set()
+    try:
+        with open(traspasse, encoding="utf-8") as f:
+            payload = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return set()
+    return {
+        numero
+        for proc in payload.get("processos", [])
+        if (numero := (proc.get("entidades") or {}).get("numero_processo"))
+    }
+
+
+@app.get(
+    "/api/v1/lotes/{lote_id}/processo",
+    tags=["Lotes"],
+    summary="Consultar o processo deste lote (lotes de 1 PDF)",
+    response_model=ProcessoConsultado,
+    responses={
+        404: {
+            "model": Erro,
+            "description": "Lote de outro consumidor, inexistente, ou nenhum "
+                            "número de processo pôde ser extraído do PDF",
+        },
+        409: {"model": Erro, "description": "Lote ainda não concluído — continue o polling"},
+        422: {
+            "model": Erro,
+            "description": "O lote não tem exatamente 1 PDF, ou dele saiu mais de 1 processo",
+        },
+        **_ERROS_AUTH,
+    },
+)
+async def processo_do_lote(lote_id: str, consumidor: str = Depends(autenticar_api)):
+    """
+    Atalho para quem manda **um PDF por vez** (um processo por lote): em vez do
+    formato agregado de `/resultado`, devolve o mesmo relatório estruturado de
+    `GET /api/v1/processos` — já com o número CNJ que saiu deste PDF, sem o
+    consumidor precisar lê-lo do payload de `/resultado` para então perguntar
+    de novo por `/api/v1/processos`.
+
+    Só funciona quando o lote tem **exatamente 1 PDF** e dele saiu
+    **exatamente 1 número de processo**. Lotes com mais de um PDF — ou um PDF
+    que contenha mais de um processo — respondem `422`; use `/resultado` (ou
+    consulte cada número em `/api/v1/processos`) nesses casos.
+    """
+    lote = _lote_do_consumidor(lote_id, consumidor)
+    if lote["status"] != "concluido":
+        raise HTTPException(409, f"Lote ainda em '{lote['status']}' — aguarde 'concluido'")
+
+    if len(lote.get("arquivos", [])) != 1:
+        raise HTTPException(
+            422,
+            f"Este lote tem {len(lote.get('arquivos', []))} PDF(s). Esta rota só "
+            "atende lotes de um único PDF — use GET .../resultado para vários.",
+        )
+
+    numeros = _numeros_do_lote(lote_id)
+    if not numeros:
+        raise HTTPException(
+            404,
+            "Não foi possível extrair um número de processo deste PDF. Veja "
+            f"'avisos' e 'log' em GET /api/v1/lotes/{lote_id}.",
+        )
+    if len(numeros) > 1:
+        raise HTTPException(
+            422,
+            f"Este PDF contém {len(numeros)} processos ({', '.join(sorted(numeros))}). "
+            "Consulte cada um em GET /api/v1/processos?numero=..., ou use /resultado.",
+        )
+    numero = next(iter(numeros))
+
+    # Mesmo isolamento de /api/v1/processos: a busca roda sobre uma cópia
+    # recortada aos lotes deste consumidor, nunca sobre a pasta JSON/ real.
+    with tempfile.TemporaryDirectory(prefix="consulta-") as tmp:
+        recorte = Path(tmp)
+        await asyncio.to_thread(_pasta_recortada, recorte, consumidor)
+        dados = await asyncio.to_thread(buscar_processo.buscar_dados, numero, str(recorte))
+
+    if not dados.get("agente1") and not dados.get("agente2") and not dados.get("auditoria"):
+        # Não deveria acontecer — o número saiu do JSON deste próprio lote —,
+        # mas sem esta guarda uma falha ao montar o recorte devolveria um
+        # ProcessoConsultado com tudo nulo em vez de avisar o que deu errado.
+        log.error(f"Lote {lote_id}: número {numero} extraído do PDF mas ausente no recorte")
+        raise HTTPException(404, f"Nenhum processo com o número {numero}.")
+
+    return {
+        "numero_processo": numero,
+        "encontrado_em": [
+            fonte for fonte in ("agente1", "agente2", "auditoria") if dados.get(fonte)
+        ],
+        "agente1": _sem_internos(dados.get("agente1")),
+        "agente2": _sem_internos(dados.get("agente2")),
+        "auditoria": {
+            "atual": _sem_internos(dados.get("auditoria")),
+            "historico": [_sem_internos(r) for r in dados.get("auditoria_historico", [])],
+            "total": len(dados.get("auditoria_historico", [])),
+        } if dados.get("auditoria") else None,
+    }
 
 
 @app.get(
