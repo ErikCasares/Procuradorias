@@ -1892,6 +1892,67 @@ def _numeros_do_lote(lote_id: str) -> set[str]:
     }
 
 
+async def _relatorio_processo_do_lote(lote: dict, pasta_busca) -> dict:
+    """
+    Núcleo comum às duas rotas de atalho 'processo do lote' (API com token e
+    painel com sessão): valida que o lote tem exatamente 1 PDF e exatamente 1
+    número extraído, busca os dados em `pasta_busca` e monta o payload no
+    formato de `ProcessoConsultado`.
+
+    `pasta_busca` já deve vir pronta para `buscar_processo.buscar_dados`: uma
+    cópia recortada ao consumidor (rota da API) ou a PASTA_JSON cheia (painel,
+    que enxerga o acervo inteiro por desenho — ver `_resposta_arquivo`).
+    """
+    lote_id = lote["id"]
+    if lote["status"] != "concluido":
+        raise HTTPException(409, f"Lote ainda em '{lote['status']}' — aguarde 'concluido'")
+
+    if len(lote.get("arquivos", [])) != 1:
+        raise HTTPException(
+            422,
+            f"Este lote tem {len(lote.get('arquivos', []))} PDF(s). Esta rota só "
+            "atende lotes de um único PDF — use o resultado agregado para vários.",
+        )
+
+    numeros = _numeros_do_lote(lote_id)
+    if not numeros:
+        raise HTTPException(
+            404,
+            "Não foi possível extrair um número de processo deste PDF. Veja "
+            f"'avisos' e 'log' do lote {lote_id}.",
+        )
+    if len(numeros) > 1:
+        raise HTTPException(
+            422,
+            f"Este PDF contém {len(numeros)} processos ({', '.join(sorted(numeros))}). "
+            "Consulte cada um individualmente, ou use o resultado agregado.",
+        )
+    numero = next(iter(numeros))
+
+    dados = await asyncio.to_thread(buscar_processo.buscar_dados, numero, str(pasta_busca))
+
+    if not dados.get("agente1") and not dados.get("agente2") and not dados.get("auditoria"):
+        # Não deveria acontecer — o número saiu do JSON deste próprio lote —,
+        # mas sem esta guarda uma falha ao montar a busca devolveria um
+        # ProcessoConsultado com tudo nulo em vez de avisar o que deu errado.
+        log.error(f"Lote {lote_id}: número {numero} extraído do PDF mas ausente na busca")
+        raise HTTPException(404, f"Nenhum processo com o número {numero}.")
+
+    return {
+        "numero_processo": numero,
+        "encontrado_em": [
+            fonte for fonte in ("agente1", "agente2", "auditoria") if dados.get(fonte)
+        ],
+        "agente1": _sem_internos(dados.get("agente1")),
+        "agente2": _sem_internos(dados.get("agente2")),
+        "auditoria": {
+            "atual": _sem_internos(dados.get("auditoria")),
+            "historico": [_sem_internos(r) for r in dados.get("auditoria_historico", [])],
+            "total": len(dados.get("auditoria_historico", [])),
+        } if dados.get("auditoria") else None,
+    }
+
+
 @app.get(
     "/api/v1/lotes/{lote_id}/processo",
     tags=["Lotes"],
@@ -1925,58 +1986,12 @@ async def processo_do_lote(lote_id: str, consumidor: str = Depends(autenticar_ap
     consulte cada número em `/api/v1/processos`) nesses casos.
     """
     lote = _lote_do_consumidor(lote_id, consumidor)
-    if lote["status"] != "concluido":
-        raise HTTPException(409, f"Lote ainda em '{lote['status']}' — aguarde 'concluido'")
-
-    if len(lote.get("arquivos", [])) != 1:
-        raise HTTPException(
-            422,
-            f"Este lote tem {len(lote.get('arquivos', []))} PDF(s). Esta rota só "
-            "atende lotes de um único PDF — use GET .../resultado para vários.",
-        )
-
-    numeros = _numeros_do_lote(lote_id)
-    if not numeros:
-        raise HTTPException(
-            404,
-            "Não foi possível extrair um número de processo deste PDF. Veja "
-            f"'avisos' e 'log' em GET /api/v1/lotes/{lote_id}.",
-        )
-    if len(numeros) > 1:
-        raise HTTPException(
-            422,
-            f"Este PDF contém {len(numeros)} processos ({', '.join(sorted(numeros))}). "
-            "Consulte cada um em GET /api/v1/processos?numero=..., ou use /resultado.",
-        )
-    numero = next(iter(numeros))
-
     # Mesmo isolamento de /api/v1/processos: a busca roda sobre uma cópia
     # recortada aos lotes deste consumidor, nunca sobre a pasta JSON/ real.
     with tempfile.TemporaryDirectory(prefix="consulta-") as tmp:
         recorte = Path(tmp)
         await asyncio.to_thread(_pasta_recortada, recorte, consumidor)
-        dados = await asyncio.to_thread(buscar_processo.buscar_dados, numero, str(recorte))
-
-    if not dados.get("agente1") and not dados.get("agente2") and not dados.get("auditoria"):
-        # Não deveria acontecer — o número saiu do JSON deste próprio lote —,
-        # mas sem esta guarda uma falha ao montar o recorte devolveria um
-        # ProcessoConsultado com tudo nulo em vez de avisar o que deu errado.
-        log.error(f"Lote {lote_id}: número {numero} extraído do PDF mas ausente no recorte")
-        raise HTTPException(404, f"Nenhum processo com o número {numero}.")
-
-    return {
-        "numero_processo": numero,
-        "encontrado_em": [
-            fonte for fonte in ("agente1", "agente2", "auditoria") if dados.get(fonte)
-        ],
-        "agente1": _sem_internos(dados.get("agente1")),
-        "agente2": _sem_internos(dados.get("agente2")),
-        "auditoria": {
-            "atual": _sem_internos(dados.get("auditoria")),
-            "historico": [_sem_internos(r) for r in dados.get("auditoria_historico", [])],
-            "total": len(dados.get("auditoria_historico", [])),
-        } if dados.get("auditoria") else None,
-    }
+        return await _relatorio_processo_do_lote(lote, recorte)
 
 
 @app.get(
@@ -2191,6 +2206,30 @@ async def painel_baixar_arquivo(lote_id: str, tipo: TipoArquivo, _=Depends(exigi
 
 
 @app.get(
+    "/painel/lotes/{lote_id}/processo",
+    include_in_schema=False,
+    summary="Consultar o processo deste lote pelo painel",
+    response_model=ProcessoConsultado,
+    responses={404: {"model": Erro, "description": "Lote inexistente"}},
+)
+async def painel_processo(lote_id: str, _=Depends(exigir_painel)):
+    """
+    Equivalente a `GET /api/v1/lotes/{lote_id}/processo`, com a sessão do
+    painel em vez do token. Usado pela interface quando o lote tem 1 único
+    PDF: em vez dos botões de download, mostra a tarjeta com o relatório do
+    processo — não faz sentido baixar um Excel para um processo só.
+
+    O painel enxerga o acervo inteiro (não filtra por consumidor), então a
+    busca roda direto sobre a PASTA_JSON, sem o recorte que a rota da API
+    precisa para isolar consumidores entre si.
+    """
+    lote = _lotes.get(lote_id)
+    if not lote:
+        raise HTTPException(404, "Lote não encontrado")
+    return await _relatorio_processo_do_lote(lote, PASTA_JSON)
+
+
+@app.get(
     "/painel/relatorios",
     include_in_schema=False,
     summary="Listar os relatórios acumulados",
@@ -2245,6 +2284,24 @@ async def index(sessao: str = Cookie(None)):
 # ════════════════════════════════════════════════════════════════
 # PÁGINAS
 # ════════════════════════════════════════════════════════════════
+
+# [V7.3] Tarjeta do relatório de processo — compartilhada pelo painel e pela
+# página de teste do Swagger (/api/docs). Usada quando o lote tem 1 único PDF:
+# substitui os botões de download, que não fazem sentido para um processo só.
+_ESTILO_PROCESSO = """
+  .pc-card { border:1px solid #eef1f4; border-radius:8px; padding:.85rem 1rem;
+    margin-top:.65rem; background:#fbfcfd; }
+  .pc-cab { display:flex; align-items:center; gap:.6rem; flex-wrap:wrap;
+    font-size:.95rem; margin-bottom:.3rem; }
+  .pc-badge { display:inline-block; padding:.15rem .55rem; border-radius:20px;
+    font-size:.76rem; font-weight:700; }
+  .pc-secao { margin-top:.7rem; padding-top:.6rem; border-top:1px solid #eef1f4; }
+  .pc-secao h4 { margin:0 0 .4rem; font-size:.78rem; text-transform:uppercase;
+    letter-spacing:.04em; color:#5c6b7a; font-weight:600; }
+  .pc-linha { display:flex; gap:.5rem; font-size:.87rem; padding:.15rem 0; }
+  .pc-linha .pc-label { color:#5c6b7a; min-width:150px; flex:none; }
+  .pc-vazio { color:#8b98a5; font-size:.85rem; margin-top:.5rem; }
+"""
 
 _ESTILO = """
   * { box-sizing: border-box; }
@@ -2327,7 +2384,7 @@ _ESTILO = """
     overflow:auto; white-space:pre-wrap; margin:.5rem 0 0; }
   details summary { cursor:pointer; color:#1F4E79; font-size:.85rem; font-weight:600; }
   .erro-msg { color:#9b2c22; font-size:.9rem; margin-top:.5rem; }
-"""
+""" + _ESTILO_PROCESSO
 
 _JS_ARQUIVOS = """
 // ── Coletor de PDFs ──────────────────────────────────────────────
@@ -2481,6 +2538,97 @@ const ROTULO_ARQUIVO = {
   agente2_json    : 'JSON do Agente 2',
   agente2_planilha: 'Planilha do Agente 2 (acumulada)',
 };
+
+// ── Relatório do processo (lote de 1 único PDF) ────────────────────
+//
+// Quando o lote tem 1 PDF só, a interface troca os botões de download pelo
+// relatório do processo — baixar um Excel não faz sentido para um processo
+// só. Compartilhado entre o painel (/painel/lotes/{id}/processo, cookie) e a
+// página de teste do Swagger (/api/v1/lotes/{id}/processo, token Bearer).
+//
+// Cache por URL: o lote concluído não muda mais, então uma vez buscado não
+// há por que repetir a chamada a cada rodada do polling (a cada 3 s).
+const _processoCache = new Map();
+
+async function obterProcesso(url, cabecalhos) {
+  if (_processoCache.has(url)) return _processoCache.get(url);
+  let resultado = null;
+  try {
+    const r = await fetch(url, {headers: cabecalhos || {}});
+    if (r.ok) resultado = await r.json();
+  } catch (_) { /* rede instável — cai no formato de downloads */ }
+  _processoCache.set(url, resultado);
+  return resultado;
+}
+
+const CORES_PRIORIDADE = {
+  ALTA:  {cor: '#9b2c22', fundo: '#fde5e3'},
+  MEDIA: {cor: '#8a6100', fundo: '#fff4d6'},
+  BAIXA: {cor: '#1d6b34', fundo: '#dff3e4'},
+};
+
+// Monta a tarjeta HTML a partir do JSON de GET .../processo (ProcessoConsultado).
+function renderizarProcesso(d) {
+  const ag1 = d.agente1 || {};
+  const ent = ag1.entidades || {};
+  const an  = (d.agente2 && d.agente2.analise) || {};
+  const aud = d.auditoria && d.auditoria.atual;
+
+  const linha = (label, valor) => (valor === null || valor === undefined || valor === '')
+    ? ''
+    : `<div class="pc-linha"><span class="pc-label">${escapar(label)}</span><span>${escapar(valor)}</span></div>`;
+
+  let html = '<div class="pc-card">';
+  html += `<div class="pc-cab"><b>${escapar(d.numero_processo)}</b>`;
+  if (an.prioridade) {
+    const cp = CORES_PRIORIDADE[an.prioridade] || {cor: '#5c6b7a', fundo: '#eef2f6'};
+    html += ` <span class="pc-badge" style="background:${cp.fundo};color:${cp.cor}">${escapar(an.prioridade)}</span>`;
+  }
+  html += '</div>';
+
+  if (Object.keys(ent).length || ag1.status_citacao || ag1.resultado_penhora) {
+    html += '<div class="pc-secao"><h4>Dados extraídos — Agente 1</h4>';
+    html += linha('Executado', ent.nome_executado);
+    html += linha('CPF/CNPJ', ent.cpf_cnpj);
+    html += linha('Exequente', ent.nome_exequente);
+    html += linha('Tipo de tributo', ent.tipo_tributo);
+    html += linha('Valor original', ent.valor_original);
+    html += linha('Valor atualizado', ent.valor_atualizado);
+    html += linha('Vara', ent.vara);
+    html += linha('Status citação', ag1.status_citacao);
+    html += linha('Resultado penhora', ag1.resultado_penhora);
+    html += linha('Última movimentação', ag1.ultima_movimentacao);
+    html += '</div>';
+  }
+
+  if (d.agente2) {
+    html += '<div class="pc-secao"><h4>Priorização — Agente 2</h4>';
+    if (d.agente2.erro) {
+      html += `<div class="pc-linha"><span class="pc-label">Status</span><span>FALHA NA ANÁLISE: ${escapar(d.agente2.erro)}</span></div>`;
+    } else {
+      html += linha('Ação recomendada', an.acao_recomendada);
+      html += linha('Justificativa', an.justificativa);
+      html += linha('Alerta de prescrição', an.alerta_prescricao ? 'SIM' : 'não');
+      if ((an.observacoes || []).length)
+        html += linha('Observações', an.observacoes.join('; '));
+    }
+    html += '</div>';
+  }
+
+  if (aud) {
+    html += '<div class="pc-secao"><h4>Auditoria</h4>';
+    if (aud.decisao) html += linha('Decisão', aud.decisao);
+    html += linha('Motivo', aud.motivo);
+    html += linha('Registrado em', aud.classificado_em || aud.extraido_em);
+    html += '</div>';
+  }
+
+  if (!d.agente2 && !aud)
+    html += '<p class="pc-vazio">Ainda sem priorização do Agente 2 — só a extração do Agente 1.</p>';
+
+  html += '</div>';
+  return html;
+}
 """
 
 
@@ -2518,6 +2666,7 @@ _ENVIO_DOCS = ("""
     border:1px solid #f2dcb3; color:#7a4b00; margin-top:.3rem; }
   @media (prefers-reduced-motion:reduce) { .hera .barra i { animation:none } }
 </style>
+<style>""" + _ESTILO_PROCESSO + """</style>
 
 <div class="hera"><div class="cx">
   <h2>Enviar um lote de teste</h2>
@@ -2619,7 +2768,7 @@ const MAX_MB = __MAX_MB__;
     a.click(); URL.revokeObjectURL(a.href);
   }
 
-  function pintar(l) {
+  async function pintar(l) {
     const dur = s => s == null ? '' : (s < 60 ? s + ' s' : Math.floor(s/60) + ' min');
     let html = `<b>${escapar(l.lote_id)}</b> — ${escapar(l.status)}`;
     if (l.status === 'na_fila')
@@ -2632,6 +2781,19 @@ const MAX_MB = __MAX_MB__;
     if (l.resumo) html += `<div style="margin-top:.4rem">${escapar(l.resumo)}</div>`;
     if (l.erro)   html += `<div class="ruim">${escapar(l.erro)}</div>`;
     (l.avisos || []).forEach(a => html += `<div class="av">&#9888; ${escapar(a)}</div>`);
+
+    // [V7.3] Lote de 1 único PDF: mostra o relatório do processo em vez dos
+    // botões de download — baixar um Excel não faz sentido para 1 processo.
+    let processo = null;
+    if (l.status === 'concluido' && (l.arquivos || []).length === 1) {
+      processo = await obterProcesso(`/api/v1/lotes/${l.lote_id}/processo`, autorizacao());
+    }
+
+    if (processo) {
+      html += renderizarProcesso(processo);
+      estado.innerHTML = html;
+      return;
+    }
 
     const baixaveis = l.downloads || [];
     if (baixaveis.length)
@@ -2655,7 +2817,7 @@ const MAX_MB = __MAX_MB__;
       const r = await fetch('/api/v1/lotes/' + id, {headers: autorizacao()});
       if (!r.ok) { clearInterval(acompanhando); return; }
       const l = await r.json();
-      pintar(l);
+      await pintar(l);
       if (l.status === 'concluido' || l.status === 'erro') clearInterval(acompanhando);
     };
     await passo();
@@ -2961,11 +3123,24 @@ function andamento(l) {
   return '';
 }
 
-function cartaoLote(l) {
+async function cartaoLote(l) {
   const comAviso = l.status === 'concluido' && l.avisos.length;
   const emCurso = l.status === 'na_fila' || l.status === 'processando';
   const cls = comAviso ? 'b-alerta' : (CLASSE[l.status] || 'b-fila');
   const rotulo = comAviso ? 'concluído com avisos' : l.status;
+
+  // [V7.3] Lote de 1 único PDF: mostra o relatório do processo em vez dos
+  // botões de download — baixar um Excel não faz sentido para 1 processo.
+  let processo = null;
+  if (l.status === 'concluido' && (l.arquivos || []).length === 1) {
+    processo = await obterProcesso(`/painel/lotes/${encodeURIComponent(l.lote_id)}/processo`);
+  }
+  const corpoDownloads = processo
+    ? renderizarProcesso(processo)
+    : ((l.downloads || []).length ? `<div class="baixe">${l.downloads.map(t =>
+        `<a class="dl" href="/painel/lotes/${encodeURIComponent(l.lote_id)}/arquivos/${t}"
+            download>&#8681; ${esc(ROTULO_ARQUIVO[t] || t)}</a>`).join('')}</div>` : '');
+
   return `
   <div style="border:1px solid #eef1f4;border-radius:8px;padding:.85rem 1rem;margin-bottom:.7rem">
     <div class="linha" style="justify-content:space-between">
@@ -2978,9 +3153,7 @@ function cartaoLote(l) {
       <span class="badge ${cls}">${emCurso ? '<span class="pulso"></span>' : ''}${esc(rotulo)}</span>
     </div>
     ${andamento(l)}
-    ${(l.downloads || []).length ? `<div class="baixe">${l.downloads.map(t =>
-        `<a class="dl" href="/painel/lotes/${encodeURIComponent(l.lote_id)}/arquivos/${t}"
-            download>&#8681; ${esc(ROTULO_ARQUIVO[t] || t)}</a>`).join('')}</div>` : ''}
+    ${corpoDownloads}
     ${l.resumo ? `<div style="margin-top:.5rem;font-size:.9rem">${esc(l.resumo)}</div>` : ''}
     ${l.erro ? `<div class="erro-msg">${esc(l.erro)}</div>` : ''}
     ${l.avisos.map(a => `<div class="av-item">&#9888; ${esc(a)}</div>`).join('')}
@@ -2995,8 +3168,9 @@ async function carregar() {
     const r = await fetch('/painel/lotes');
     if (r.status === 401) { location.reload(); return; }
     const j = await r.json();
+    const cartoes = await Promise.all(j.lotes.map(cartaoLote));
     $('#lotes').innerHTML = j.lotes.length
-      ? j.lotes.map(cartaoLote).join('')
+      ? cartoes.join('')
       : '<p class="vazio">Nenhum lote enviado ainda.</p>';
 
     // O procurador pode estar com a seção 3 na tela e não ver o cartão do lote.
