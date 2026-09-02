@@ -1107,6 +1107,17 @@ class ProcessoConsultado(BaseModel):
     agente2: ProcessoAnalisado | None = Field(
         None, description="Nulo enquanto o Agente 2 não analisou o processo"
     )
+    # [V7.3] O histórico é APPEND-ONLY: o mesmo processo pode ter sido analisado
+    # mais de uma vez entre lotes (reenviado, reclassificado). `agente2` acima
+    # é sempre a análise vigente; aqui vêm TODAS — inclusive a vigente, na
+    # ordem em que foram lidas — para quem quiser ver a evolução completa,
+    # igual ao que `buscar_processo.py` mostra no CLI. Lista com 1 item só
+    # significa "nunca foi reanalisado".
+    agente2_historico: list[ProcessoAnalisado] = Field(
+        default_factory=list,
+        description="Todas as análises do Agente 2 para este processo, em outros "
+                    "lotes inclusive — 1 item quando nunca foi reanalisado.",
+    )
     auditoria: AuditoriaProcesso | None = Field(
         None,
         description="Classificação de triagem — TODAS as decisões, inclusive NÃO APTO. "
@@ -1945,6 +1956,7 @@ async def _relatorio_processo_do_lote(lote: dict, pasta_busca) -> dict:
         ],
         "agente1": _sem_internos(dados.get("agente1")),
         "agente2": _sem_internos(dados.get("agente2")),
+        "agente2_historico": [_sem_internos(r) for r in dados.get("agente2_historico", [])],
         "auditoria": {
             "atual": _sem_internos(dados.get("auditoria")),
             "historico": [_sem_internos(r) for r in dados.get("auditoria_historico", [])],
@@ -2301,6 +2313,9 @@ _ESTILO_PROCESSO = """
   .pc-linha { display:flex; gap:.5rem; font-size:.87rem; padding:.15rem 0; }
   .pc-linha .pc-label { color:#5c6b7a; min-width:150px; flex:none; }
   .pc-vazio { color:#8b98a5; font-size:.85rem; margin-top:.5rem; }
+  .pc-hist { margin:.5rem 0 0; padding-left:1rem; border-left:2px solid #eef1f4; }
+  .pc-hist-item { font-size:.83rem; padding:.25rem 0; }
+  .pc-hist-item .pc-hist-quando { color:#8b98a5; margin-right:.4rem; }
 """
 
 _ESTILO = """
@@ -2630,6 +2645,26 @@ function renderizarProcesso(d) {
       if ((an.observacoes || []).length)
         html += linha('Observações', an.observacoes.join('; '));
     }
+    // [V7.3] Histórico completo (append-only): o processo pode ter sido
+    // analisado mais de uma vez, em lotes diferentes — 1 registro só não
+    // mostra evolução nenhuma, por isso só aparece com 2+.
+    const histA2 = d.agente2_historico || [];
+    if (histA2.length > 1) {
+      html += `<div class="pc-hist"><b style="font-size:.8rem;color:#5c6b7a">Histórico de análises (${histA2.length}):</b>`;
+      histA2.forEach(r => {
+        const a = r.analise || {};
+        const cp = CORES_PRIORIDADE[a.prioridade] || {cor: '#5c6b7a', fundo: '#eef2f6'};
+        const rotulo = r.erro
+          ? `<span style="color:#9b2c22">FALHA NA ANÁLISE</span>`
+          : (a.prioridade
+              ? `<span class="pc-badge" style="background:${cp.fundo};color:${cp.cor}">${escapar(a.prioridade)}</span>`
+              : '');
+        html += `<div class="pc-hist-item"><span class="pc-hist-quando">${escapar(r.processado_em || '—')}</span>`
+              + `${rotulo} ${escapar(a.acao_recomendada || r.erro || '')} `
+              + `${escapar(r.origem_lote ? `(lote ${escapar(r.origem_lote)})` : '')}</div>`;
+      });
+      html += '</div>';
+    }
     html += '</div>';
   }
 
@@ -2638,6 +2673,16 @@ function renderizarProcesso(d) {
     if (aud.decisao) html += linha('Decisão', aud.decisao);
     html += linha('Motivo', aud.motivo);
     html += linha('Registrado em', aud.classificado_em || aud.extraido_em);
+    // [V7.3] Idem: evolução das classificações de triagem entre lotes.
+    const histAud = (d.auditoria && d.auditoria.historico) || [];
+    if (histAud.length > 1) {
+      html += `<div class="pc-hist"><b style="font-size:.8rem;color:#5c6b7a">Histórico de classificações (${histAud.length}):</b>`;
+      histAud.forEach(r => {
+        html += `<div class="pc-hist-item"><span class="pc-hist-quando">${escapar(r.classificado_em || r.extraido_em || '—')}</span>`
+              + `${escapar(r.decisao || '')} ${escapar(r.motivo || '')}</div>`;
+      });
+      html += '</div>';
+    }
     html += '</div>';
   }
 
