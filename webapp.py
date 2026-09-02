@@ -2574,6 +2574,22 @@ function renderizarProcesso(d) {
   const an  = (d.agente2 && d.agente2.analise) || {};
   const aud = d.auditoria && d.auditoria.atual;
 
+  // [Fase 1 do Agente 1] Cada entidade extraída carrega a página do PDF onde
+  // foi encontrada — o mesmo dado que o CLI (buscar_processo.py) mostra como
+  // "(pág. N)". Sem isto o procurador não sabe onde conferir no PDF original.
+  const evid    = ag1.evidencias || {};
+  const evidEnt = evid.entidades || {};
+  const comPagina = (valor, campo) => {
+    if (valor === null || valor === undefined || valor === '') return valor;
+    const b = evidEnt[campo];
+    const pag = b && b.encontrado_em_pagina;
+    return pag == null ? valor : `${valor}  (pág. ${pag}${b.via_ocr ? ' OCR' : ''})`;
+  };
+  const paginaDe = (bloco) => {
+    const pag = bloco && bloco.encontrado_em_pagina;
+    return pag == null ? null : `pág. ${pag}${bloco.via_ocr ? ' (OCR)' : ''}`;
+  };
+
   const linha = (label, valor) => (valor === null || valor === undefined || valor === '')
     ? ''
     : `<div class="pc-linha"><span class="pc-label">${escapar(label)}</span><span>${escapar(valor)}</span></div>`;
@@ -2588,15 +2604,17 @@ function renderizarProcesso(d) {
 
   if (Object.keys(ent).length || ag1.status_citacao || ag1.resultado_penhora) {
     html += '<div class="pc-secao"><h4>Dados extraídos — Agente 1</h4>';
-    html += linha('Executado', ent.nome_executado);
-    html += linha('CPF/CNPJ', ent.cpf_cnpj);
-    html += linha('Exequente', ent.nome_exequente);
-    html += linha('Tipo de tributo', ent.tipo_tributo);
-    html += linha('Valor original', ent.valor_original);
-    html += linha('Valor atualizado', ent.valor_atualizado);
-    html += linha('Vara', ent.vara);
+    html += linha('Executado', comPagina(ent.nome_executado, 'nome_executado'));
+    html += linha('CPF/CNPJ', comPagina(ent.cpf_cnpj, 'cpf_cnpj'));
+    html += linha('Exequente', comPagina(ent.nome_exequente, 'nome_exequente'));
+    html += linha('Tipo de tributo', comPagina(ent.tipo_tributo, 'tipo_tributo'));
+    html += linha('Valor original', comPagina(ent.valor_original, 'valor_original'));
+    html += linha('Valor atualizado', comPagina(ent.valor_atualizado, 'valor_atualizado'));
+    html += linha('Vara', comPagina(ent.vara, 'vara'));
     html += linha('Status citação', ag1.status_citacao);
+    html += linha('　↳ citação na', paginaDe(evid.citacao));
     html += linha('Resultado penhora', ag1.resultado_penhora);
+    html += linha('　↳ penhora na', paginaDe(evid.penhora));
     html += linha('Última movimentação', ag1.ultima_movimentacao);
     html += '</div>';
   }
