@@ -7,6 +7,12 @@ from datetime import datetime
 import logging
 from openai import OpenAI
 
+# --- OCR para páginas escaneadas (sin texto digital) ---
+import pytesseract
+from pytesseract import Output
+from pdf2image import convert_from_path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 
 # Función para normalizar texto (remover acentos, convertir a minúsculas)
 def normalizar(text):
@@ -45,8 +51,8 @@ logging.basicConfig(level=logging.INFO)
 # Directorio de entrada y salida
 current_dir = os.path.dirname(os.path.abspath(__file__))
 input_directory = os.path.join(current_dir, "processos pra analiser")
-output_file_prompts = os.path.join(current_dir, "prompts_generadosV9.txt")
-output_file_excel = os.path.join(current_dir, "resultados_procesosV9.xlsx")
+output_file_prompts = os.path.join(current_dir, "prompts_generadosV6.txt")
+output_file_excel = os.path.join(current_dir, "resultados_procesosV6.xlsx")
 
 
 
@@ -110,10 +116,302 @@ PROMPT_TEMPLATE_FULL = """Você é um assistente jurídico especializado em exec
     STATUS PENHORA: <resumo do que encontrou sobre penhora>
     """
 
+# --- Configuración de OCR (fallback para páginas escaneadas) ---
+OCR_DPI = 300
+# [AJUSTABLE] DPI más bajo = OCR más rápido. Medido: 300dpi≈1.27s/página,
+# 200dpi≈0.73s/página, 150dpi≈0.52s/página, mismo texto correcto en
+# pruebas sintéticas. Antes de bajarlo en producción, comparar la
+# "Confiança OCR (%)" en el Excel contra una muestra de páginas reales
+# escaneadas (no las sintéticas usadas para validar esto) — documentos
+# con sellos/firmas/ruído de escaneo pueden perder precisión a menor DPI
+# de un modo que el texto sintético no refleja.
+OCR_MIN_CHARS = 20      # umbral empírico — ajustable según casos reales
+OCR_IDIOMA = 'por'
+
+# [NUEVO] Agrupamiento de páginas OCR en lotes, para reducir la cantidad
+# de llamadas a Poppler (cada llamada reabre y parsea el PDF) y para
+# habilitar paralelismo real entre lotes en máquinas multi-núcleo.
+OCR_CLUSTER_GAP = 5     # páginas que necesitan OCR separadas por <= N páginas se fusionan en un solo lote
+OCR_MAX_LOTE = 40        # tamaño máximo de un lote — evita que un cluster gigante se vuelva 1 sola tarea sin paralelismo
+OCR_MAX_WORKERS = 4      # lotes procesados en paralelo — subir si tu máquina tiene más núcleos disponibles
+
+
+def _pagina_necesita_ocr(texto_pagina, min_chars=OCR_MIN_CHARS):
+    """
+    pdfplumber devuelve None o una cadena muy corta cuando la página
+    es una imagen escaneada sin capa de texto digital.
+    """
+    if texto_pagina is None:
+        return True
+    return len(texto_pagina.strip()) < min_chars
+
+
+def _agrupar_paginas_en_lotes(paginas_ocr, gap_maximo=OCR_CLUSTER_GAP, max_lote=OCR_MAX_LOTE):
+    """
+    Agrupa números de página que necesitan OCR en rangos (inicio, fin)
+    inclusive, para minimizar la cantidad de llamadas a Poppler.
+
+    Páginas separadas por <= gap_maximo páginas se fusionan en un mismo
+    rango (se renderizan también las páginas intermedias que no
+    necesitan OCR, pero sale más barato que abrir un proceso de Poppler
+    nuevo por cada página individual).
+
+    Rangos más grandes que max_lote se subdividen, para que un cluster
+    grande no termine siendo una sola tarea gigante sin paralelismo.
+    """
+    if not paginas_ocr:
+        return []
+    paginas_ordenadas = sorted(paginas_ocr)
+    lotes_brutos = []
+    inicio = anterior = paginas_ordenadas[0]
+    for p in paginas_ordenadas[1:]:
+        if p - anterior > gap_maximo:
+            lotes_brutos.append((inicio, anterior))
+            inicio = p
+        anterior = p
+    lotes_brutos.append((inicio, anterior))
+
+    lotes_finales = []
+    for ini, fin in lotes_brutos:
+        cursor = ini
+        while cursor <= fin:
+            sub_fin = min(cursor + max_lote - 1, fin)
+            lotes_finales.append((cursor, sub_fin))
+            cursor = sub_fin + 1
+    return lotes_finales
+
+
+def _ocr_lote(pdf_path, inicio, fin, paginas_necesarias, dpi=OCR_DPI, idioma=OCR_IDIOMA):
+    """
+    Renderiza el rango [inicio, fin] en UNA sola llamada a Poppler y
+    aplica OCR solo a las páginas de `paginas_necesarias` dentro de ese
+    rango (las demás páginas del rango ya tenían texto digital).
+    Devuelve {numero_pagina: (texto_extraido, confianza_0_a_100)}.
+    """
+    resultados = {}
+    try:
+        imagenes = convert_from_path(pdf_path, dpi=dpi, first_page=inicio, last_page=fin)
+    except Exception as e:
+        logging.error(f"Error renderizando lote {inicio}-{fin} de {pdf_path}: {e}", exc_info=True)
+        for p in paginas_necesarias:
+            resultados[p] = ("", 0.0)
+        return resultados
+
+    for offset, imagen in enumerate(imagenes):
+        numero_pagina = inicio + offset
+        if numero_pagina not in paginas_necesarias:
+            continue  # esta página del rango ya tenía texto digital
+        try:
+            datos = pytesseract.image_to_data(imagen, lang=idioma, output_type=Output.DICT)
+            palabras, confianzas = [], []
+            for texto, conf in zip(datos['text'], datos['conf']):
+                if texto.strip():
+                    palabras.append(texto)
+                    if int(conf) >= 0:   # tesseract usa -1 cuando no calcula confianza
+                        confianzas.append(int(conf))
+            texto_final = ' '.join(palabras)
+            confianza = sum(confianzas) / len(confianzas) if confianzas else 0.0
+            resultados[numero_pagina] = (texto_final, confianza)
+        except Exception as e:
+            logging.error(f"Error OCR en página {numero_pagina} de {pdf_path}: {e}", exc_info=True)
+            resultados[numero_pagina] = ("", 0.0)
+    return resultados
+
+
+# --- Filtro de tipo de documento: ¿es una execução fiscal de dívida ativa? ---
+# [NUEVO] El Agente 1 solo está diseñado para clasificar execuções fiscais
+# de dívida ativa. Sin este filtro, cualquier PDF judicial (ej. ações de
+# saúde, mandados de segurança) recibe igualmente un DECISÃO/MOTIVO con el
+# mismo formato prolijo, aunque la decisión no tenga sentido para ese caso.
+
+KEYWORDS_CLASSE_EXECUCAO_FISCAL = [
+    "execucao fiscal",
+    "execucoes fiscais",
+    "cobranca da divida ativa",
+    "cobranca de divida ativa",
+    "execucao da divida ativa",
+]
+
+KEYWORDS_CLASSE_NAO_FISCAL = [
+    "obrigacao de fazer",
+    "mandado de seguranca",
+    "acao civil publica",
+    "fornecimento de medicamento",
+    "sem registro na anvisa",
+    "indenizacao por dano",
+    "alvara judicial",
+    "usucapiao",
+    "interdicao",
+    "acao popular",
+    "desapropriacao",
+]
+
+# Marcadores de respaldo en todo el texto, usados solo cuando no se
+# encuentra (o es ambiguo) el campo Classe-Assunto del PJe
+KEYWORDS_TEXTO_EXECUCAO_FISCAL = [
+    "execucao fiscal",
+    "exequente",
+    "certidao de divida ativa",
+    "cda no", "cda n.", "cda no.",
+    "lei 6.830", "lei n. 6.830", "lei no 6.830",
+    "divida ativa",
+    "embargos a execucao fiscal",
+    "penhora",
+]
+
+KEYWORDS_TEXTO_NAO_FISCAL = [
+    "obrigacao de fazer",
+    "fornecimento de medicamento",
+    "tratamento medico",
+    "anvisa",
+    "sistema unico de saude",
+    "alimentos",
+    "guarda do menor",
+    "uniao estavel",
+    "usucapiao",
+    "mandado de seguranca",
+]
+
+
+def _extraer_classe_assunto(text_norm):
+    """
+    Busca el campo 'Classe - Assunto:' típico de las capas administrativas
+    del PJe. Usa re.DOTALL porque el PDF puede quebrar la línea a mitad de
+    frase (ej. '[Obrigação de' \\n 'Fazer / Não Fazer...]'), y colapsa
+    espacios/saltos de línea antes de devolver el fragmento.
+    """
+    m = re.search(r"classe\s*[-/]?\s*assunto\s*:?\s*(.{0,300})", text_norm, re.DOTALL)
+    if not m:
+        return None
+    fragmento = re.sub(r"\s+", " ", m.group(1))
+    corte = re.split(
+        r"reclamante|requerente|autor|orgao julgador|exequente|executado|reclamado",
+        fragmento
+    )[0]
+    return corte.strip()
+
+
+def detectar_tipo_processo(text):
+    """
+    Determina si el texto corresponde a una execução fiscal de dívida ativa.
+
+    Señal primaria: campo 'Classe - Assunto' del PJe (cuando aparece, es la
+    fuente más confiable porque viene de la propia clasificación del tribunal).
+    Señal de respaldo: conteo de keywords en todo el texto, usado solo cuando
+    el campo Classe-Assunto no aparece o no es concluyente.
+
+    Solo retorna confianza='alta' cuando el campo Classe-Assunto es explícito
+    en una u otra dirección; la heurística por conteo nunca llega a 'alta',
+    a propósito, para evitar bloquear documentos por una heurística todavía
+    no validada contra suficientes casos reales de la PGMS.
+
+    Devuelve:
+      {
+        "es_execucao_fiscal": bool,
+        "confianza": "alta" | "media" | "baixa",
+        "motivo": str,
+        "classe_assunto": str | None,
+      }
+    """
+    text_norm = normalizar(text)
+    classe_assunto = _extraer_classe_assunto(text_norm)
+
+    if classe_assunto:
+        if any(normalizar(k) in classe_assunto for k in KEYWORDS_CLASSE_NAO_FISCAL):
+            return {
+                "es_execucao_fiscal": False,
+                "confianza": "alta",
+                "motivo": f"Classe-Assunto indica outro tipo de ação: '{classe_assunto[:150]}'",
+                "classe_assunto": classe_assunto,
+            }
+        if any(normalizar(k) in classe_assunto for k in KEYWORDS_CLASSE_EXECUCAO_FISCAL):
+            return {
+                "es_execucao_fiscal": True,
+                "confianza": "alta",
+                "motivo": f"Classe-Assunto confirma execução fiscal: '{classe_assunto[:150]}'",
+                "classe_assunto": classe_assunto,
+            }
+        # Campo encontrado pero ambiguo: cae a la heurística por conteo
+
+    score_fiscal = sum(1 for k in KEYWORDS_TEXTO_EXECUCAO_FISCAL if normalizar(k) in text_norm)
+    score_nao_fiscal = sum(1 for k in KEYWORDS_TEXTO_NAO_FISCAL if normalizar(k) in text_norm)
+
+    if score_fiscal == 0 and score_nao_fiscal == 0:
+        return {
+            "es_execucao_fiscal": True,
+            "confianza": "baixa",
+            "motivo": "Nenhum marcador de tipo de ação encontrado — recomenda-se revisão manual",
+            "classe_assunto": classe_assunto,
+        }
+
+    es_fiscal = score_fiscal >= score_nao_fiscal
+    return {
+        "es_execucao_fiscal": es_fiscal,
+        "confianza": "media",
+        "motivo": f"Heurística por contagem de palavras-chave: fiscal={score_fiscal}, não-fiscal={score_nao_fiscal}",
+        "classe_assunto": classe_assunto,
+    }
+
+
 # 1. Extraer texto de PDF por páginas
 def extract_text_by_page(pdf_path):
+    """
+    Extrae texto de cada página. Páginas sin texto digital suficiente se
+    agrupan en lotes (rangos contiguos o casi contiguos) y se procesan
+    con OCR en paralelo, en vez de abrir un proceso de Poppler nuevo por
+    cada página individual.
+
+    Devuelve:
+      textos:   list[str]  — mismo formato que antes, compatible con el resto del pipeline
+      metadata: dict       — {'paginas_ocr': [...], 'confianza_ocr': {pagina: score}}
+    """
+    textos = {}
     with pdfplumber.open(pdf_path) as pdf:
-        return [page.extract_text() for page in pdf.pages]
+        total_paginas = len(pdf.pages)
+        paginas_que_necesitan_ocr = []
+        for i, page in enumerate(pdf.pages, start=1):
+            texto = page.extract_text()
+            if _pagina_necesita_ocr(texto):
+                paginas_que_necesitan_ocr.append(i)
+                textos[i] = None  # se completa en la fase de OCR
+            else:
+                textos[i] = texto
+
+    metadata = {"paginas_ocr": [], "confianza_ocr": {}}
+
+    if paginas_que_necesitan_ocr:
+        lotes = _agrupar_paginas_en_lotes(paginas_que_necesitan_ocr)
+        necesarias_por_lote = {
+            (ini, fin): set(p for p in paginas_que_necesitan_ocr if ini <= p <= fin)
+            for ini, fin in lotes
+        }
+        logging.info(
+            f"  {os.path.basename(pdf_path)}: {len(paginas_que_necesitan_ocr)} página(s) "
+            f"necesitam OCR, agrupadas em {len(lotes)} lote(s) "
+            f"(até {OCR_MAX_WORKERS} em paralelo)"
+        )
+        with ThreadPoolExecutor(max_workers=OCR_MAX_WORKERS) as executor:
+            futuros = {
+                executor.submit(_ocr_lote, pdf_path, ini, fin, necesarias_por_lote[(ini, fin)]): (ini, fin)
+                for ini, fin in lotes
+            }
+            concluidos = 0
+            for futuro in as_completed(futuros):
+                ini, fin = futuros[futuro]
+                concluidos += 1
+                try:
+                    resultado_lote = futuro.result()
+                    for numero_pagina, (texto_ocr, confianza) in resultado_lote.items():
+                        textos[numero_pagina] = texto_ocr
+                        metadata["paginas_ocr"].append(numero_pagina)
+                        metadata["confianza_ocr"][numero_pagina] = round(confianza, 1)
+                    logging.info(f"  Lote {concluidos}/{len(lotes)} concluído (páginas {ini}-{fin})")
+                except Exception as e:
+                    logging.error(f"Lote {ini}-{fin} de {pdf_path} falhou: {e}", exc_info=True)
+
+    metadata["paginas_ocr"].sort()
+    lista_textos = [textos[i] for i in range(1, total_paginas + 1)]
+    return lista_textos, metadata
 
 # 2. Filtrar texto relevante con palabras clave
 def filter_text_by_keywords(text, keywords):
@@ -829,147 +1127,15 @@ def extract_extincao(text):
         "transito em julgado",
         "extinto por prescricao",
         "extinta por prescricao",
-        "baixa definitiva nos autos",
-        "arquivem-se com baixa",
-        "cancelamento da distribuicao",
+        "processo arquivado",
+        "arquivem-se",
+        "dando-se baixa",
     ]
     text_norm = normalizar(text)
     for k in KEYWORDS_EXTINCAO:
         if normalizar(k) in text_norm:
             return "processo extinto/sentenciado"
     return None
-
-def extract_reforma_sentenca(text):
-    """
-    Detecta se uma sentença de extinção foi REFORMADA em apelação.
-    Se retornar algo, o resultado de extract_extincao() deve ser cancelado.
-    """
-    KEYWORDS_REFORMA = [
-        "dou provimento ao apelo",
-        "dou provimento ao recurso",
-        "reformo a sentenca",
-        "afasto a prescricao",
-        "afastando a prescricao",
-        "afastando-se a prescricao decretada",
-        "determinar o retorno dos autos",
-        "para prosseguimento da execucao fiscal",
-        "retornem ao juizo de origem",
-        "retorno dos autos a origem",
-        "anulo a sentenca",
-        "sentenca anulada",
-        "provimento ao apelo",
-        "reforma da sentenca",
-        "regular processamento da execucao",
-        "determino o retorno",
-    ]
-    text_norm = normalizar(text)
-    for k in KEYWORDS_REFORMA:
-        if normalizar(k) in text_norm:
-            return f"sentença reformada em apelação ({k})"
-    return None
-
-
-def _citacao_por_sinal_forte(text):
-    """
-    Retorna True se 'HOUVE CITAÇÃO' é suportado por evidência FORTE.
-    Rejeita sinais fracos como boilerplate e cabeçalhos de extrato.
-    """
-    STRONG_CITACAO = [
-        # Certidão do OJ confirmando pessoalmente
-        "certifico que procedi a citacao",
-        "certifico que o executado foi citado",
-        "certifico que citei",
-        "certifico ter realizado a citacao",
-        "devidamente citado",
-        "fica citado",
-        "ar positivo",
-        # Executado compareceu / defendeu-se
-        "apresentou embargos",
-        "embargos foram opostos",
-        "citacao valida",
-        "exarou o ciente",
-        "aceitou a contrafe",
-        # Instrumento de confissão ASSINADO pelo executado
-        "instrumento de confissao de divida e compromisso de pagamento parcelado",
-        "confissao de divida e compromisso",
-        # Comparecimento espontâneo (art. 239 §1º CPC)
-        "citacao espontanea",
-        "supriu a citacao",
-        "suprida a citacao",
-        "art. 239",
-    ]
-    text_norm = normalizar(text)
-    return any(normalizar(s) in text_norm for s in STRONG_CITACAO)
-
-def verificacao_dupla(extincao, citacion, parcelamento, full_text):
-    """
-    Segunda verificação para eliminar falsos NÃO APTO e HOUVE CITAÇÃO.
-
-    Evalúa cada resultado potencialmente problemático y lo corrige si
-    detecta evidencia contraria en el texto completo.
-
-    Retorna dict con los valores corregidos y una lista de alertas.
-    """
-    alertas = []
-
-    # ── Correção 1: extinção reformada em apelação ───────────────────────────
-    if extincao:
-        reforma = extract_reforma_sentenca(full_text)
-        if reforma:
-            alertas.append(f"EXTINÇÃO CANCELADA — {reforma}")
-            extincao = None   # ← processo não está mais extinto
-
-    # ── Correção 2: HOUVE CITAÇÃO sem sinal forte ────────────────────────────
-    if citacion == "HOUVE CITAÇÃO":
-        if not _citacao_por_sinal_forte(full_text):
-            alertas.append("CITAÇÃO REVERTIDA — apenas sinais fracos (boilerplate/cabeçalho)")
-            citacion = "Citação não encontrado"
-
-    # ── Correção 3: PAD detectado sem marcador forte ─────────────────────────
-    if parcelamento:
-        if not _parcelamento_por_sinal_forte(full_text):
-            alertas.append("PAD REVERTIDO — sem marcadores de PAD ativo confirmado")
-            parcelamento = None
-
-    return {
-        "extincao"    : extincao,
-        "citacion"    : citacion,
-        "parcelamento": parcelamento,
-        "alertas"     : alertas,
-    }
-
-
-
-def _parcelamento_por_sinal_forte(text):
-    """
-    Retorna True se a detecção de PAD tem pelo menos um marcador FORTE de PAD ativo.
-    Evita falsos positivos por keywords genéricos (art. 265, "suspensão do feito").
-    """
-    STRONG_PAD = [
-        # Extrato PAD com situação explícita
-        "situacao do parcelamento: homologado",
-        "situacao pad: homologado",
-        "situacao: homologado",
-        "bloq pad",
-        # Número específico de PAD no texto
-        "pad n.",
-        "pad no.",
-        "pad nr.",
-        "pad/ppi n",
-        # Instrumento assinado (texto completo do instrumento, não só menção)
-        "instrumento de confissao de divida e responsabilidade solidaria",
-        "instrumento de confissao de divida e compromisso de pagamento parcelado",
-        # Artigo CTN — inciso VI (parcelamento real, não genérico)
-        "art. 151, vi",
-        "art. 151, inc. vi",
-        "art. 151, inciso vi",
-        # Evidência de pagamento de parcela
-        "pagamento da primeira parcela",
-        "primeira parcela",
-    ]
-    text_norm = normalizar(text)
-    return any(normalizar(s) in text_norm for s in STRONG_PAD)
-
 
 
 def extract_parcelamento(text):
@@ -1090,14 +1256,30 @@ def generate_prompts(input_dir):
         fecha_efectiva = None
         prompt         = "Error"
         respuesta_gpt  = None
+        ocr_metadata   = {"paginas_ocr": [], "confianza_ocr": {}}
+        tipo_processo  = None
 
         try:
-            pages_text = extract_text_by_page(pdf_path)
+            pages_text, ocr_metadata = extract_text_by_page(pdf_path)
             full_text  = " ".join(p for p in pages_text if p)
+
+            if ocr_metadata["paginas_ocr"]:
+                n = len(ocr_metadata["paginas_ocr"])
+                conf_prom = sum(ocr_metadata["confianza_ocr"].values()) / n
+                logging.info(f"  {pdf_file}: {n} página(s) vía OCR, confianza media {conf_prom:.1f}%")
 
             if not full_text.strip():
                 logging.warning(f"PDF sin texto extraíble: {pdf_file}")
-                prompts.append((pdf_file, None, None, None, None, None, None, "Error - PDF sin texto", "Error", ""))
+                prompts.append((pdf_file, None, None, None, None, None, None, "Error - PDF sin texto", "Error", "", ocr_metadata, tipo_processo))
+                continue
+
+            tipo_processo = detectar_tipo_processo(full_text)
+            if (not tipo_processo["es_execucao_fiscal"]) and tipo_processo["confianza"] == "alta":
+                logging.warning(f"  {pdf_file}: FORA DE ESCOPO — {tipo_processo['motivo']}")
+                prompts.append((
+                    pdf_file, None, None, None, None, None, None,
+                    "Fora de escopo - não é execução fiscal", None, full_text, ocr_metadata, tipo_processo
+                ))
                 continue
 
             fecha_reciente = fecha_ultima_movimentacao(full_text)  # ← corregido
@@ -1121,13 +1303,13 @@ def generate_prompts(input_dir):
             prompts.append((
                 pdf_file, fecha_reciente, citacion,
                 fecha_orden, fecha_intento, fecha_efectiva,
-                penhora, prompt, respuesta_gpt, full_text
+                penhora, prompt, respuesta_gpt, full_text, ocr_metadata, tipo_processo
             ))
 
         except Exception as e:
             logging.error(f"Error al procesar {pdf_file}: {e}", exc_info=True)
             prompts.append((
-                pdf_file, None, None, None, None, None, None, "Error", "Error", full_text
+                pdf_file, None, None, None, None, None, None, "Error", "Error", full_text, ocr_metadata, tipo_processo
             ))
 
     return prompts
@@ -1259,8 +1441,11 @@ def call_chatgpt(full_text, fecha, citacion, penhora):
 # 8. Guardar prompts en un archivo de texto
 def save_prompts_to_file(prompts, output_file):
     with open(output_file, 'w', encoding='utf-8') as file:
-        for pdf_file, _, _, _, _, _, _, prompt, respuesta, _ in prompts:
-            file.write(f"Archivo: {pdf_file}\nPrompt:\n{prompt}\nRespuesta GPT:\n{respuesta}\n{'-'*50}\n")
+        for pdf_file, _, _, _, _, _, _, prompt, respuesta, _, ocr_metadata, tipo_processo in prompts:
+            paginas_ocr = ocr_metadata.get("paginas_ocr", []) if ocr_metadata else []
+            ocr_info = f"Páginas via OCR: {paginas_ocr}\n" if paginas_ocr else ""
+            tipo_info = f"Tipo de processo: {tipo_processo['motivo']}\n" if tipo_processo else ""
+            file.write(f"Archivo: {pdf_file}\n{tipo_info}{ocr_info}Prompt:\n{prompt}\nRespuesta GPT:\n{respuesta}\n{'-'*50}\n")
     print(f"Prompts guardados en {output_file}")
 
 # 9. Procesar prompts y generar Excel
@@ -1268,25 +1453,29 @@ def process_prompts_to_excel(prompts, output_excel):
     resultados = []
     hoy = datetime.now()
 
-    for pdf_file, fecha_reciente, citacion, fecha_orden, fecha_intento, fecha_efectiva, penhora, prompt, respuesta_gpt, full_text in prompts:
+    for pdf_file, fecha_reciente, citacion, fecha_orden, fecha_intento, fecha_efectiva, penhora, prompt, respuesta_gpt, full_text, ocr_metadata, tipo_processo in prompts:
         extincao      = extract_extincao(full_text)      # [FIX] Passo 2: extinção
         parcelamento  = extract_parcelamento(full_text)
         suspensao_art40 = extract_suspensao_art40(full_text)
-
-        # ← DOUBLE VERIFICATION ─────────────────────────────────────────────────
-        dv = verificacao_dupla(extincao, citacion, parcelamento, full_text)
-        extincao     = dv["extincao"]
-        citacion     = dv["citacion"]
-        parcelamento = dv["parcelamento"]
-        alertas_dv   = dv["alertas"]
-        # ────────────────────────────────────────────────────────────────────────
-
-
         # Inicializar siempre antes del bloque de decisión
         respuesta_gpt = None
         fonte = "Sistema automático"
 
-        if fecha_reciente is None:
+        # [NUEVO] Corte temprano: si el filtro de tipo de documento ya
+        # detectó con alta confianza que esto no es una execução fiscal,
+        # no tiene sentido aplicar el resto del árbol (citação/penhora)
+        # ni escalar a GPT.
+        fora_de_escopo = (
+            tipo_processo is not None
+            and not tipo_processo["es_execucao_fiscal"]
+            and tipo_processo["confianza"] == "alta"
+        )
+
+        if fora_de_escopo:
+            decision = "FORA DE ESCOPO"
+            motivo = tipo_processo["motivo"]
+            fonte = "Filtro de tipo de documento"
+        elif fecha_reciente is None:
             decision = "Informação insuficiente"
             motivo = "Data da última movimentação não informada"
         elif (hoy - fecha_reciente).days < 365:
@@ -1371,6 +1560,13 @@ def process_prompts_to_excel(prompts, output_excel):
                 logging.error(f"Error GPT para {pdf_file}: {e}")
                 respuesta_gpt = "Error en API"
 
+        paginas_ocr = ocr_metadata.get("paginas_ocr", []) if ocr_metadata else []
+        confianza_ocr_dict = ocr_metadata.get("confianza_ocr", {}) if ocr_metadata else {}
+        confianza_ocr_media = (
+            round(sum(confianza_ocr_dict.values()) / len(confianza_ocr_dict), 1)
+            if confianza_ocr_dict else None
+        )
+
         resultados.append({
             "CASO"                    : pdf_file,
             "Última data de interação": fecha_reciente.strftime("%Y-%m-%d") if fecha_reciente else "Não especificado",
@@ -1380,11 +1576,13 @@ def process_prompts_to_excel(prompts, output_excel):
             "Fecha citación efectiva" : fecha_efectiva.strftime("%Y-%m-%d") if fecha_efectiva else "Não especificado",
             "Resultado da penhora"    : penhora or "Não especificado",
             "Decisión"                : decision,
-            "Verificação Dupla"       : " | ".join(alertas_dv) if alertas_dv else "",
-            "Fonte da decisão"        : fonte,
             "Motivo"                  : motivo,
             "Fonte da decisão"        : fonte,
             "Respuesta GPT"           : respuesta_gpt or "",
+            "Páginas via OCR"         : ", ".join(map(str, paginas_ocr)) if paginas_ocr else "",
+            "Confiança OCR (%)"       : confianza_ocr_media if confianza_ocr_media is not None else "",
+            "Tipo de Processo"        : (tipo_processo["classe_assunto"] or "(não detectado)") if tipo_processo else "",
+            "Confiança Tipo Processo" : tipo_processo["confianza"] if tipo_processo else "",
         })
 
     df = pd.DataFrame(resultados)
