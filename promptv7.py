@@ -51,8 +51,8 @@ logging.basicConfig(level=logging.INFO)
 # Directorio de entrada y salida
 current_dir = os.path.dirname(os.path.abspath(__file__))
 input_directory = os.path.join(current_dir, "processos pra analiser")
-output_file_prompts = os.path.join(current_dir, "prompts_generadosV6.txt")
-output_file_excel = os.path.join(current_dir, "resultados_procesosV6.xlsx")
+output_file_prompts = os.path.join(current_dir, "prompts_generadosV7.txt")
+output_file_excel = os.path.join(current_dir, "resultados_procesosV7.xlsx")
 
 
 
@@ -1104,9 +1104,60 @@ def extract_extincao(text):
     """
     [FIX Maria Gloria] Detecta se o processo foi extinto/sentenciado.
     Retorna string descritiva ou None.
+
+    Lógica em três camadas:
+
+    1. REVERSÃO: se o texto contém sinais de que uma sentença de extinção
+       foi REFORMADA por acórdão de apelação, retorna None imediatamente —
+       o processo foi reativado e não deve ser marcado como extinto.
+       Exemplos reais: acórdão TJBA dando provimento ao Município e mandando
+       os autos de volta ao juízo de origem para tramitação regular.
+
+    2. KEYWORDS FORTES: muito específicas de extinção — sozinhas bastam para
+       confirmar que o processo foi extinto. Só aparecem em sentenças/decisões
+       que efetivamente extinguem a execução.
+
+    3. KEYWORDS FRACAS: genéricas, aparecem em qualquer processo incluindo em
+       acórdãos que *reformam* sentenças de extinção (ex: "arquivem-se",
+       "transito em julgado", "dando-se baixa"). Só disparam extinção se
+       acompanhadas de pelo menos uma keyword forte — nunca sozinhas.
+
+    [FIX bug latente identificado em chat anterior]
+    "transito em julgado" e "arquivem-se" aparecem no fechamento de qualquer
+    processo judicial brasileiro; remover como disparadores isolados evita falso
+    positivo em processos com sentença de extinção REFORMADA por apelação.
     """
-    KEYWORDS_EXTINCAO = [
-        # Sentença de extinção por prescrição
+    # ── 1. SINAIS DE REVERSÃO (sentença de extinção reformada por apelação) ──
+    # Se qualquer um destes aparecer, a extinção foi revertida → não é extinto.
+    KEYWORDS_REVERSAO = [
+        # Acórdão dando provimento ao exequente (reforma da extinção)
+        "dar provimento",
+        "dou provimento",
+        "da-se provimento",
+        "recurso provido",
+        "provimento ao recurso",
+        "reforma a sentenca",
+        "reforma-se a sentenca",
+        "reformando a sentenca",
+        "anulando a sentenca",
+        "anulo a sentenca",
+        # Retorno ao juízo de origem para tramitação (após reforma)
+        "retorno dos autos ao primeiro grau",
+        "retornem os autos ao juizo de origem",
+        "retornem-se os autos",
+        "retorno ao juizo de origem",
+        "regular tramitacao",
+        "para regular tramitacao",
+        # Redirecionamento da execução (sócio-gerente) — processo ativo
+        "redirecionamento da execucao",
+        "redirecionar a execucao",
+        "desconsideracao da personalidade juridica",
+        "incluir o socio",
+        "citar o socio",
+    ]
+
+    # ── 2. KEYWORDS FORTES (extinção confirmada, sozinhas bastam) ──
+    KEYWORDS_FORTES = [
         "processo ja se encontra sentenciado",
         "ja se encontra sentenciado",
         "processo sentenciado",
@@ -1116,26 +1167,487 @@ def extract_extincao(text):
         "julgo extinta a execucao",
         "julgo extinto o feito",
         "extingo a execucao",
-        "extinção da execução",
         "extincao da execucao",
-        "extinção do processo",
         "extincao do processo",
-        "processo extinto",
         "sentenca de extincao",
-        "sentenca transitada",
-        "transitada em julgado",
-        "transito em julgado",
         "extinto por prescricao",
         "extinta por prescricao",
+        # "processo extinto" mantido como forte — é conclusivo quando isolado
+        "processo extinto",
+    ]
+
+    # ── 3. KEYWORDS FRACAS (precisam de ao menos uma forte para disparar) ──
+    # Estas aparecem em qualquer encerramento processual, inclusive em acórdãos
+    # que reformam sentenças de extinção. Nunca disparam sozinhas.
+    KEYWORDS_FRACAS = [
+        "sentenca transitada",
+        "transitada em julgado",
+        "transito em julgado",      # [FIX] aparece em acórdãos de reforma também
         "processo arquivado",
-        "arquivem-se",
-        "dando-se baixa",
+        "arquivem-se",              # [FIX] encerramento genérico, não só extinção
+        "dando-se baixa",           # [FIX] idem
+        "extinção da execução",
+        "extinção do processo",
+    ]
+
+    text_norm = normalizar(text)
+
+    # Passo 1: checar reversão — se houver, retorna None diretamente
+    if any(normalizar(k) in text_norm for k in KEYWORDS_REVERSAO):
+        return None
+
+    # Passo 2: checar keywords fortes — qualquer uma dispara extinção
+    tem_forte = any(normalizar(k) in text_norm for k in KEYWORDS_FORTES)
+    if tem_forte:
+        return "processo extinto/sentenciado"
+
+    # Passo 3: keywords fracas só disparam se acompanhadas de ao menos uma forte
+    # (que já verificamos acima — se chegou aqui, não há forte)
+    # → keywords fracas sozinhas NÃO disparam extinção
+    return None
+
+
+# ===========================================================================
+# EXTRACCIÓN DE ENTIDADES PARA EL AGENTE 2
+# ===========================================================================
+#
+# Propósito: extraer del texto del processo los datos estructurados que el
+# Agente 2 necesitará para análisis jurídico-fiscal y priorización de cobro.
+#
+# Diseño deliberadamente conservador:
+#   - Cada campo devuelve el valor extraído O None (nunca inventa).
+#   - Todos los campos son opcionales: si no se encuentra, el downstream
+#     decide qué hacer con None.
+#   - Se puede ampliar campo a campo sin tocar el resto del pipeline.
+#
+# Campos actuales (base funcional v1):
+#   cpf_cnpj         — CPF o CNPJ del executado (primer encontrado)
+#   nome_executado   — Razón social / nombre del executado
+#   nome_exequente   — Municipio / ente exequente
+#   valor_original   — Valor original de la deuda (R$)
+#   valor_atualizado — Valor actualizado de la deuda (R$), si figura
+#   tipo_tributo     — ISS, IPTU, TFF, etc.
+#   numero_cda       — Número de la Certidão de Dívida Ativa
+#   numero_processo  — Número CNJ del processo
+#   data_inscricao   — Fecha de inscripción en la dívida ativa
+#   vara             — Vara/Juízo (ej. "9ª Vara da Fazenda Pública")
+#   exercicio        — Año(s) del tributo (ej. "2006", "2014/2015")
+#
+# Para agregar un campo nuevo: definir su regex/lógica como función privada
+# _extrair_CAMPO() y llamarla dentro de extract_entidades_agente2().
+# ===========================================================================
+
+def _extrair_cpf_cnpj(text):
+    """
+    Extrae el CPF o CNPJ del executado.
+    Prioriza CNPJ (14 dígitos) sobre CPF (11 dígitos).
+    Busca en contexto de labels típicos del processo para evitar falsos positivos
+    (ej. CNPJ del propio Municipio que aparece como exequente).
+    Devuelve el primer CNPJ/CPF encontrado asociado al executado, o None.
+    """
+    # Primero intentamos con contexto "executado" / "contribuinte" / "réu"
+    _PATRON_CNPJ = r"\d{2}[\.\s]?\d{3}[\.\s]?\d{3}[\/\s]?\d{4}[\-\s]?\d{2}"
+    _PATRON_CPF  = r"\d{3}[\.\s]?\d{3}[\.\s]?\d{3}[\-\s]?\d{2}"
+
+    # Buscar en contexto del executado/réu/contribuinte (primeras apariciones)
+    contextos_executado = [
+        r"executad[oa][:\s]+[^\n]{0,200}",
+        r"r[eé]u[:\s]+[^\n]{0,200}",
+        r"contribuinte[:\s]+[^\n]{0,200}",
+        r"cpf[\/]?cnpj[:\s]+[^\n]{0,100}",
+        r"cnpj[\/]?cpf[:\s]+[^\n]{0,100}",
+        r"inscri[cç][aã]o[:\s]+[^\n]{0,100}",
     ]
     text_norm = normalizar(text)
-    for k in KEYWORDS_EXTINCAO:
-        if normalizar(k) in text_norm:
-            return "processo extinto/sentenciado"
+    for ctx_pat in contextos_executado:
+        for ctx_match in re.finditer(ctx_pat, text_norm):
+            fragmento = ctx_match.group(0)
+            # Preferir CNPJ
+            m = re.search(_PATRON_CNPJ, fragmento)
+            if m:
+                raw = re.sub(r"[\s]", "", m.group(0))
+                digitos = re.sub(r"\D", "", raw)
+                if len(digitos) == 14:
+                    return f"{digitos[:2]}.{digitos[2:5]}.{digitos[5:8]}/{digitos[8:12]}-{digitos[12:]}"
+            # Fallback CPF
+            m = re.search(_PATRON_CPF, fragmento)
+            if m:
+                raw = re.sub(r"[\s]", "", m.group(0))
+                digitos = re.sub(r"\D", "", raw)
+                if len(digitos) == 11:
+                    return f"{digitos[:3]}.{digitos[3:6]}.{digitos[6:9]}-{digitos[9:]}"
     return None
+
+
+def _extrair_nome_executado(text):
+    """
+    Extrae el nombre/razón social del executado.
+    Busca en labels típicos del cabeçalho del processo.
+    """
+    _PATRONES = [
+        r"executad[oa]\s*:\s*([^\n\r]{3,80})",
+        r"r[eé]u\s*:\s*([^\n\r]{3,80})",
+        r"contribuinte\s*:\s*([^\n\r]{3,80})",
+        r"nome[\/\s]?raz[aã]o social\s*:\s*([^\n\r]{3,80})",
+    ]
+    for pat in _PATRONES:
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            nome = m.group(1).strip().rstrip(".,;")
+            # Filtrar resultados demasiado cortos o que son solo números
+            if len(nome) >= 4 and not nome.replace(" ", "").isdigit():
+                return nome[:100]
+    return None
+
+
+def _extrair_nome_exequente(text):
+    """
+    Extrae el nombre del exequente (normalmente 'Município de Salvador' o similar).
+    [FIX] Limpia artefactos de OCR como comillas dobles al inicio ("''Município...").
+    """
+    _PATRONES = [
+        r"exequente\s*:\s*([^\n\r]{3,80})",
+        r"credor\s*:\s*([^\n\r]{3,80})",
+        r"autor\s*:\s*([^\n\r]{3,80})",
+    ]
+    for pat in _PATRONES:
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            nome = m.group(1).strip().rstrip(".,;")
+            # Limpiar comillas OCR al inicio
+            nome = nome.lstrip("'\"\u201c\u201d\u2018\u2019").strip()
+            if len(nome) >= 4:
+                return nome[:80]
+    return None
+
+
+def _extrair_valor(text):
+    """
+    Extrae valor original y valor actualizado de la deuda.
+    Devuelve (valor_original, valor_atualizado) como strings "R$ X.XXX,XX" o None.
+
+    Estrategia:
+    - "Valor Originário" o "Valor Original" → valor_original
+    - "Total em R$" / "Total a Pagar" / "Valor Atual" → valor_atualizado
+    - Si no hay labels, busca la primera mención de valor en R$
+    """
+    # Patrón de valor monetario brasileño
+    _PAT_VALOR = r"r\$\s*[\d.,]+"
+
+    def _limpiar_valor(raw):
+        """Normaliza el valor a formato 'R$ X.XXX,XX'"""
+        m = re.search(r"[\d.,]+", raw)
+        if not m:
+            return None
+        return f"R$ {m.group(0).strip()}"
+
+    text_norm = normalizar(text)
+
+    valor_original   = None
+    valor_atualizado = None
+
+    # Buscar valor originário
+    for pat in [
+        r"valor origin[aá]ri[oa]\s*[r\$:\s]+([\d.,]+)",
+        r"valor original\s*[r\$:\s]+([\d.,]+)",
+        r"vl\.?\s*original\s*[r\$:\s]+([\d.,]+)",
+    ]:
+        m = re.search(pat, text_norm)
+        if m:
+            valor_original = f"R$ {m.group(1).strip()}"
+            break
+
+    # Buscar valor atualizado / total a pagar
+    for pat in [
+        r"total em r\$\s*[:\s]*([\d.,]+)",
+        r"total a pagar\s*[:\s]*([\d.,]+)",
+        r"valor atual\s*[:\s]*([\d.,]+)",
+        r"valor atualizado\s*[:\s]*([\d.,]+)",
+        r"vl\.?\s*corrigido\s*[:\s]*([\d.,]+)",
+    ]:
+        m = re.search(pat, text_norm)
+        if m:
+            valor_atualizado = f"R$ {m.group(1).strip()}"
+            break
+
+    # Fallback: si no hay labels, buscar primer valor en R$ en el texto
+    if not valor_original:
+        m = re.search(r"r\$\s*([\d.,]+)", text_norm)
+        if m:
+            valor_original = f"R$ {m.group(1).strip()}"
+
+    return valor_original, valor_atualizado
+
+
+def _extrair_tipo_tributo(text):
+    """
+    Extrae el tipo de tributo de la execução fiscal.
+    Busca en el campo 'Espécie' de la CDA o en el Classe-Assunto.
+    """
+    # [FIX] Lista ordenada de más específico a menos (evita matches parciales)
+    _TRIBUTOS = [
+        ("imposto predial territorial urbano",  "IPTU — Imposto Predial e Territorial Urbano"),
+        ("imposto predial e territorial urbano", "IPTU — Imposto Predial e Territorial Urbano"),
+        ("taxa de licenciamento",               "Taxa de Licenciamento de Estabelecimento"),
+        ("taxa de fiscalizacao de funcionamento","TFF — Taxa de Fiscalização de Funcionamento"),
+        ("tff",                                  "TFF — Taxa de Fiscalização de Funcionamento"),
+        ("cosip",                                "COSIP — Contribuição de Iluminação Pública"),
+        ("contribuicao de iluminacao publica",   "COSIP — Contribuição de Iluminação Pública"),
+        ("imposto sobre servicos",               "ISS — Imposto sobre Serviços"),
+        ("iss",                                  "ISS — Imposto sobre Serviços"),
+        ("itbi",                                 "ITBI — Imposto sobre Transmissão de Bens Imóveis"),
+        ("imposto sobre transmissao",            "ITBI — Imposto sobre Transmissão de Bens Imóveis"),
+        ("iptu",                                 "IPTU — Imposto Predial e Territorial Urbano"),
+        ("multa",                                "Multa"),
+    ]
+    # Fragmentos processuais que NO identifican tributo
+    # [FIX] Fragmentos que son categorías processuais o texto de petição, no tributos
+    _FRAGMENTOS_IGNORAR = [
+        "divida ativa",
+        "divida municipal",
+        "credito tributario",
+        "execucao fiscal",     # solo "execução fiscal" sin tributo especificado
+        "devedor",             # fragmentos de texto de petição inicial
+        "requerendo",
+        "credor",
+        "municipio de salvador reu",  # cabeçalho do Classe-Assunto do PJe
+        "parte ativa",
+    ]
+    _RUIDO_LEGAL = ["art.", "lei n", "lei no", "inciso", "paragrafo", "ans."]
+
+    text_norm = normalizar(text)
+
+    # [FIX] Patrón "execucao fiscal - [texto]" eliminado: capturaba
+    # "contra [nome do executado]" de la petição inicial en PDFs donde
+    # el Classe-Assunto dice solo "Execução Fiscal" sin tributo.
+    # Los 3 patrones abajo son suficientes; el fallback cubre el resto.
+    for pat in [
+        r"esp[eé]cie\s*[:\s]+([^\n\r]{3,60})",
+        r"tributo\s*[:\s]+([^\n\r]{3,60})",
+        r"classe\s*[-]?\s*assunto\s*[:\s]+([^\n\r]{3,80})",
+    ]:
+        m = re.search(pat, text_norm)
+        if m:
+            fragmento = normalizar(m.group(1).strip())
+            if any(ig in fragmento for ig in _FRAGMENTOS_IGNORAR):
+                continue
+            for kw, label in _TRIBUTOS:
+                if kw in fragmento:
+                    return label
+            if not any(r in fragmento for r in _RUIDO_LEGAL) and len(fragmento) > 3:
+                return fragmento[:60].strip()
+
+    for kw, label in _TRIBUTOS:
+        if kw in text_norm:
+            return label
+
+    return None
+
+
+def _extrair_numero_cda(text):
+    """
+    Extrae el número de la Certidão de Dívida Ativa (CDA).
+
+    Formatos reales observados en PDFs de la PGMS:
+    - "CDA n. 12012243416"              → número largo en la CDA emitida por la PGM
+    - "CDA nº 65.2014.001323.05155"     → formato con año y livro/folha
+    - "Certidão de Dívida Ativa - nº 12012243416"
+
+    [FIX] El número de inscrição municipal (CGA) como "Inscrição 230536" NO es el
+    número de CDA — es el registro interno del contribuinte na PGMS/SEFAZ.
+    Antes lo capturaba erróneamente. Ahora solo retorna números de CDA reales.
+    El número de inscrição se guarda separado si se necesita en el futuro.
+    """
+    _PATRONES = [
+        r"cda\s*n[o°º.]?\s*([\d/.\-]+)",
+        r"certid[aã]o de d[ií]vida ativa\s*[-\s]*n[o°º.]?\s*([\d/.\-]+)",
+        r"n[o°º.]?\s+da\s+cda\s*[:\s]*([\d/.\-]+)",
+    ]
+    for pat in _PATRONES:
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            valor = m.group(1).strip().rstrip(".")
+            # Descartar si el valor es muy corto (< 5 dígitos)
+            if len(re.sub(r"\D", "", valor)) >= 5:
+                return valor
+    return None
+
+
+def _extrair_numero_processo(text):
+    """
+    Extrae el número CNJ del processo (formato NNNNNNN-DD.AAAA.J.TT.OOOO).
+    """
+    m = re.search(r"\d{7}-\d{2}\.\d{4}\.\d\.\d{2}\.\d{4}", text)
+    if m:
+        return m.group(0)
+    return None
+
+
+def _extrair_vara(text):
+    """
+    Extrae la vara/juízo donde tramita el processo.
+    """
+    _PATRONES = [
+        r"(\d+[aª°]\s*vara\s*da\s*fazenda\s*p[uú]blica[^\n\r]{0,40})",
+        r"([oó]rg[aã]o julgador\s*[:\s]+[^\n\r]{5,60})",
+        r"(vara\s*[^\n\r]{3,40})",
+    ]
+    for pat in _PATRONES:
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            return m.group(1).strip()[:80]
+    return None
+
+
+def _extrair_exercicio(text):
+    """
+    Extrae el año o período fiscal del tributo.
+    [FIX] Prioriza el contexto de la tabla de CDA (Espécie + Exercício en misma línea)
+    para evitar capturar años de acórdãos o jurisprudência que aparecen antes.
+    """
+    text_norm = normalizar(text)
+
+    # Paso 1: contexto de tabla de CDA de la PGMS
+    # Formato A: "Espécie: ISS  Exercício: 2006  Meses: 10"  (año en misma línea)
+    # Formato B: header "Exercício  Meses  Valor\n2006  10  540,00" (año en línea siguiente)
+    m_cda = re.search(
+        r"(?:esp[eé]cie|tributo)[^\n]{0,80}exerc[ií]cio\s*[:\s]*(\d{4}(?:[/]\d{4})?)",
+        text_norm
+    )
+    if not m_cda:
+        # "Exercício AAAA Meses" — año en misma línea que header
+        m_cda = re.search(
+            r"exerc[ií]cio\s*[:\s]*(\d{4}(?:[/]\d{4})?)\s+(?:meses|cotas|valor)",
+            text_norm
+        )
+    if not m_cda:
+        # Formato B: "exercício  meses  valor do debito\n2006  10  540,00"
+        # Si hay múltiples años en filas siguientes, devolver rango.
+        m_b = re.search(
+            r"exerc[ií]cio\s+meses[^\n]*\n\s*(\d{4}(?:[/]\d{4})?)",
+            text_norm
+        )
+        if m_b:
+            bloque_tab = text_norm[m_b.start():]
+            anos_tab = re.findall(r"\b(20[012]\d)\s+\d{1,2}\s+[\d.,]+", bloque_tab)
+            if anos_tab:
+                anos_s = sorted(set(anos_tab))
+                return anos_s[0] if len(anos_s) == 1 else f"{anos_s[0]}/{anos_s[-1]}"
+            return m_b.group(1).strip()
+    if not m_cda:
+        # Formato alternativo PGMS: "Exercício: 2006\nMeses: 10\nValor"
+        m_cda = re.search(
+            r"exerc[ií]cio\s*:\s*(\d{4})\s*\n\s*(?:meses|cotas)",
+            text_norm
+        )
+    if m_cda:
+        return m_cda.group(1).strip()
+
+    # Paso 2: "Exercício: 2006" o "Exercício: 2014/2015" standalone
+    # [FIX] Validar que el año esté en rango razonable (1990-2030)
+    # para evitar capturar años de jurisprudência o artigos de lei.
+    m = re.search(r"exerc[ií]cio\s*[:\s]*(\d{4}(?:[/\-]\d{4})?)", text_norm)
+    if m:
+        val = m.group(1).strip().replace("-", "/")
+        ano_base = int(val[:4])
+        if 1990 <= ano_base <= 2030:
+            return val
+
+    # Paso 3: "exercícios de 2005 e 2006"
+    m2 = re.search(r"exerc[ií]cios?\s+(?:de\s+)?(\d{4})\s+e\s+(\d{4})", text_norm)
+    if m2:
+        return f"{m2.group(1)}/{m2.group(2)}"
+
+    # Paso 4: todos los años en contexto de "exercício" standalone
+    todos = re.findall(r"exerc[ií]cio\s+(\d{4})", text_norm)
+    if todos:
+        anos = sorted(set(todos))
+        return anos[0] if len(anos) == 1 else f"{anos[0]}/{anos[-1]}"
+
+    # Paso 5: tabla de CDA — filas "año  meses(1-12)  valor"
+    # [FIX] Exigir que los meses sean 1-12 (no cualquier número de 1-2 dígitos)
+    # para evitar capturar años de jurisprudência o referencias legales.
+    # Solo opera cuando hay un patrón claro de tabla fiscal.
+    _PAT_TABLA = re.compile(
+        r"\b(20[012]\d)\s+(?:[1-9]|1[0-2])\s+[\d.,]{3,}"  # año  meses(1-12)  valor≥3chars
+    )
+    todos_tabla = _PAT_TABLA.findall(text_norm)
+    if todos_tabla:
+        anos = sorted(set(todos_tabla))
+        return anos[0] if len(anos) == 1 else f"{anos[0]}/{anos[-1]}"
+
+    return None
+def _extrair_data_inscricao(text):
+    """
+    Extrae la fecha de inscripción en la dívida ativa.
+
+    [FIX] Valida que el resultado sea una fecha plausible (DD/MM/AAAA o DD/MM/AA).
+    Descarta resultados garbled de OCR como "06/0821" que tienen longitud anómala.
+    """
+    _PATRONES = [
+        r"data\s*d[ae]\s*inscri[cç][aã]o\s*[:\s]*([\d/\.\-]+)",
+        r"inscri[cç][aã]o\s+na\s+d[ií]vida\s+ativa\s*[:\s]*([\d/\.\-]+)",
+        r"data\s+de\s+emiss[aã]o\s*[:\s]*([\d/\.\-]+)",
+    ]
+    _PAT_FECHA_VALIDA = re.compile(
+        r"^\d{1,2}[/\.\-]\d{1,2}[/\.\-]\d{2,4}$"
+    )
+    for pat in _PATRONES:
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            candidato = m.group(1).strip()
+            # Validar que tenga estructura de fecha (d/m/a o d.m.a)
+            if _PAT_FECHA_VALIDA.match(candidato):
+                return candidato
+    return None
+
+
+def extract_entidades_agente2(text):
+    """
+    Punto de entrada principal para extracción de entidades.
+
+    Extrae del texto completo del processo los campos estructurados
+    necesarios para el Agente 2 (análisis jurídico-fiscal).
+
+    Devuelve un dict con todos los campos. Los campos no encontrados
+    tienen valor None — nunca se inventa información.
+
+    Campos:
+        cpf_cnpj         (str|None)  CPF o CNPJ del executado
+        nome_executado   (str|None)  Nombre/razón social del executado
+        nome_exequente   (str|None)  Nombre del exequente
+        valor_original   (str|None)  Valor original de la deuda
+        valor_atualizado (str|None)  Valor actualizado de la deuda
+        tipo_tributo     (str|None)  Tipo de tributo (ISS, IPTU, TFF, etc.)
+        numero_cda       (str|None)  Número de la CDA
+        numero_processo  (str|None)  Número CNJ del processo
+        vara             (str|None)  Vara/Juízo
+        exercicio        (str|None)  Año fiscal del tributo
+        data_inscricao   (str|None)  Fecha de inscripción en dívida ativa
+    """
+    if not text:
+        return {k: None for k in [
+            "cpf_cnpj", "nome_executado", "nome_exequente",
+            "valor_original", "valor_atualizado", "tipo_tributo",
+            "numero_cda", "numero_processo", "vara",
+            "exercicio", "data_inscricao",
+        ]}
+
+    valor_original, valor_atualizado = _extrair_valor(text)
+
+    return {
+        "cpf_cnpj"        : _extrair_cpf_cnpj(text),
+        "nome_executado"  : _extrair_nome_executado(text),
+        "nome_exequente"  : _extrair_nome_exequente(text),
+        "valor_original"  : valor_original,
+        "valor_atualizado": valor_atualizado,
+        "tipo_tributo"    : _extrair_tipo_tributo(text),
+        "numero_cda"      : _extrair_numero_cda(text),
+        "numero_processo" : _extrair_numero_processo(text),
+        "vara"            : _extrair_vara(text),
+        "exercicio"       : _extrair_exercicio(text),
+        "data_inscricao"  : _extrair_data_inscricao(text),
+    }
 
 
 def extract_parcelamento(text):
@@ -1258,6 +1770,7 @@ def generate_prompts(input_dir):
         respuesta_gpt  = None
         ocr_metadata   = {"paginas_ocr": [], "confianza_ocr": {}}
         tipo_processo  = None
+        entidades      = None   # dict con entidades para el Agente 2
 
         try:
             pages_text, ocr_metadata = extract_text_by_page(pdf_path)
@@ -1270,7 +1783,7 @@ def generate_prompts(input_dir):
 
             if not full_text.strip():
                 logging.warning(f"PDF sin texto extraíble: {pdf_file}")
-                prompts.append((pdf_file, None, None, None, None, None, None, "Error - PDF sin texto", "Error", "", ocr_metadata, tipo_processo))
+                prompts.append((pdf_file, None, None, None, None, None, None, "Error - PDF sin texto", "Error", "", ocr_metadata, tipo_processo, None))
                 continue
 
             tipo_processo = detectar_tipo_processo(full_text)
@@ -1278,11 +1791,11 @@ def generate_prompts(input_dir):
                 logging.warning(f"  {pdf_file}: FORA DE ESCOPO — {tipo_processo['motivo']}")
                 prompts.append((
                     pdf_file, None, None, None, None, None, None,
-                    "Fora de escopo - não é execução fiscal", None, full_text, ocr_metadata, tipo_processo
+                    "Fora de escopo - não é execução fiscal", None, full_text, ocr_metadata, tipo_processo, None
                 ))
                 continue
 
-            fecha_reciente = fecha_ultima_movimentacao(full_text)  # ← corregido
+            fecha_reciente = fecha_ultima_movimentacao(full_text)
             citacion       = extract_citacion(full_text)
             penhora        = extract_penhora(full_text)
             fecha_orden, fecha_intento, fecha_efectiva = extraer_fechas_citacion(full_text)
@@ -1291,25 +1804,31 @@ def generate_prompts(input_dir):
             if not citacion or normalizar(citacion) != normalizar("HOUVE CITAÇÃO"):
                 fecha_efectiva = None
 
-            prompt         = create_prompt(fecha_reciente, citacion, penhora)
+            # Extracción de entidades para el Agente 2
+            entidades = extract_entidades_agente2(full_text)
+
+            prompt = create_prompt(fecha_reciente, citacion, penhora)
 
             print(f"\n{'='*60}")
             print(f"ARQUIVO : {pdf_file}")
             print(f"  Última fecha   : {fecha_reciente.strftime('%Y-%m-%d') if fecha_reciente else 'NO ENCONTRADA'}")
             print(f"  Citação        : {citacion}")
             print(f"  Penhora        : {penhora}")
+            print(f"  CPF/CNPJ       : {entidades.get('cpf_cnpj') or '—'}")
+            print(f"  Executado      : {entidades.get('nome_executado') or '—'}")
+            print(f"  Valor orig.    : {entidades.get('valor_original') or '—'}")
             print(f"{'='*60}")
 
             prompts.append((
                 pdf_file, fecha_reciente, citacion,
                 fecha_orden, fecha_intento, fecha_efectiva,
-                penhora, prompt, respuesta_gpt, full_text, ocr_metadata, tipo_processo
+                penhora, prompt, respuesta_gpt, full_text, ocr_metadata, tipo_processo, entidades
             ))
 
         except Exception as e:
             logging.error(f"Error al procesar {pdf_file}: {e}", exc_info=True)
             prompts.append((
-                pdf_file, None, None, None, None, None, None, "Error", "Error", full_text, ocr_metadata, tipo_processo
+                pdf_file, None, None, None, None, None, None, "Error", "Error", full_text, ocr_metadata, tipo_processo, None
             ))
 
     return prompts
@@ -1441,7 +1960,7 @@ def call_chatgpt(full_text, fecha, citacion, penhora):
 # 8. Guardar prompts en un archivo de texto
 def save_prompts_to_file(prompts, output_file):
     with open(output_file, 'w', encoding='utf-8') as file:
-        for pdf_file, _, _, _, _, _, _, prompt, respuesta, _, ocr_metadata, tipo_processo in prompts:
+        for pdf_file, _, _, _, _, _, _, prompt, respuesta, _, ocr_metadata, tipo_processo, _ in prompts:
             paginas_ocr = ocr_metadata.get("paginas_ocr", []) if ocr_metadata else []
             ocr_info = f"Páginas via OCR: {paginas_ocr}\n" if paginas_ocr else ""
             tipo_info = f"Tipo de processo: {tipo_processo['motivo']}\n" if tipo_processo else ""
@@ -1453,7 +1972,7 @@ def process_prompts_to_excel(prompts, output_excel):
     resultados = []
     hoy = datetime.now()
 
-    for pdf_file, fecha_reciente, citacion, fecha_orden, fecha_intento, fecha_efectiva, penhora, prompt, respuesta_gpt, full_text, ocr_metadata, tipo_processo in prompts:
+    for pdf_file, fecha_reciente, citacion, fecha_orden, fecha_intento, fecha_efectiva, penhora, prompt, respuesta_gpt, full_text, ocr_metadata, tipo_processo, entidades in prompts:
         extincao      = extract_extincao(full_text)      # [FIX] Passo 2: extinção
         parcelamento  = extract_parcelamento(full_text)
         suspensao_art40 = extract_suspensao_art40(full_text)
@@ -1567,7 +2086,11 @@ def process_prompts_to_excel(prompts, output_excel):
             if confianza_ocr_dict else None
         )
 
+        # Extraer campos de entidades (con fallback si entidades es None)
+        ent = entidades or {}
+
         resultados.append({
+            # ── Campos originales del Agente 1 ──────────────────────────────
             "CASO"                    : pdf_file,
             "Última data de interação": fecha_reciente.strftime("%Y-%m-%d") if fecha_reciente else "Não especificado",
             "Status da citação"       : citacion or "Não especificado",
@@ -1583,10 +2106,44 @@ def process_prompts_to_excel(prompts, output_excel):
             "Confiança OCR (%)"       : confianza_ocr_media if confianza_ocr_media is not None else "",
             "Tipo de Processo"        : (tipo_processo["classe_assunto"] or "(não detectado)") if tipo_processo else "",
             "Confiança Tipo Processo" : tipo_processo["confianza"] if tipo_processo else "",
+            # ── Entidades para el Agente 2 ───────────────────────────────────
+            "A2_numero_processo"      : ent.get("numero_processo") or "",
+            "A2_cpf_cnpj"            : ent.get("cpf_cnpj") or "",
+            "A2_nome_executado"      : ent.get("nome_executado") or "",
+            "A2_nome_exequente"      : ent.get("nome_exequente") or "",
+            "A2_tipo_tributo"        : ent.get("tipo_tributo") or "",
+            "A2_exercicio"           : ent.get("exercicio") or "",
+            "A2_numero_cda"          : ent.get("numero_cda") or "",
+            "A2_data_inscricao"      : ent.get("data_inscricao") or "",
+            "A2_valor_original"      : ent.get("valor_original") or "",
+            "A2_valor_atualizado"    : ent.get("valor_atualizado") or "",
+            "A2_vara"                : ent.get("vara") or "",
         })
 
     df = pd.DataFrame(resultados)
-    df.to_excel(output_excel, index=False)
+    # [FIX] Columnas que deben guardarse como texto puro en Excel
+    # Estrategia: escribir con openpyxl y forzar data_type='s' (string)
+    # en las celdas de esas columnas, evitando que Excel las interprete
+    # como números aunque sean dígitos puros.
+    cols_texto = ["A2_numero_cda", "A2_cpf_cnpj", "A2_numero_processo"]
+    for col in cols_texto:
+        if col in df.columns:
+            df[col] = df[col].astype(str).replace({"nan": "", "None": ""})
+
+    with pd.ExcelWriter(output_excel, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Resultados")
+        ws = writer.sheets["Resultados"]
+        from openpyxl.utils import get_column_letter
+        for col_name in cols_texto:
+            if col_name in df.columns:
+                col_idx = df.columns.get_loc(col_name) + 1
+                col_letter = get_column_letter(col_idx)
+                for cell in ws[col_letter][1:]:  # saltar header
+                    if cell.value:
+                        # Forzar tipo string explícitamente en openpyxl
+                        cell.value = str(cell.value)
+                        cell.data_type = "s"
+                        cell.number_format = "@"
     print(f"Planilla Excel generada: {output_excel}")
 # 10. Ejecutar el flujo
 if __name__ == "__main__":
