@@ -45,8 +45,8 @@ logging.basicConfig(level=logging.INFO)
 # Directorio de entrada y salida
 current_dir = os.path.dirname(os.path.abspath(__file__))
 input_directory = os.path.join(current_dir, "processos pra analiser")
-output_file_prompts = os.path.join(current_dir, "prompts_generadosV4.txt")
-output_file_excel = os.path.join(current_dir, "resultados_procesosV4.xlsx")
+output_file_prompts = os.path.join(current_dir, "prompts_generadosV9.txt")
+output_file_excel = os.path.join(current_dir, "resultados_procesosV9.xlsx")
 
 
 
@@ -130,15 +130,34 @@ KEYWORDS_MOVIMENTACAO_PROCESSUAL = [
     # Despachos y decisiones
     "despacho", "decisao interlocutoria", "decisao",
     "sentenca", "acordao",
+    "conferi.", "digitei, eu",
     # Certidões processuales
     "certidao de publicacao de relacao",
     "certidao de remessa da intimacao",
     "certidao de intimacao",
     "ciencia da intimacao",
     "certidao de publicacao",
-    # Peticiones
+    # Peticiones del exequente  [FIX Bug G]
     "pede deferimento",
     "pede juntada",
+    "vem requerer",
+    "vem expor e requerer",
+    "vem, por seu procurador",
+    "vem, perante",
+    "vem, respeitosamente",
+    "nestes termos, pede deferimento",
+    "requer a v. exa",
+    "requer a vossa excelencia",
+    "por seu procurador infrafirmado",
+    "por sua procuradora infrafirmada",
+    "por seu procurador ao fim assinado",
+    "vem aduzir e requerer",
+    "reiterar pedido",
+    # Certidões do oficial de justiça
+    "certifico que",
+    "certifico, para os devidos fins",
+    "o referido e verdade e dou fe",
+    "o referido e verdade",
     # Atos cartorários
     "ato ordinatorio",
     "cumpra-se",
@@ -155,20 +174,42 @@ def fecha_ultima_movimentacao(text):
     """
     Reemplaza fecha_mas_reciente().
     Solo considera fechas cercanas a keywords de movimentación processual,
-    ignorando fechas de fichas cadastrais, extratos, consultas CNPJ, etc.
+    ignorando fechas de fichas cadastrais, extratos y consultas CNPJ.
+    Ahora:
+    - usa correctamente el texto normalizado para cortar fragmentos (evita desalineamiento de índices)
+    - descarta fechas que aparecen dentro de secciones de exclusión (fichas/extratos)
     """
     text_norm = normalizar(text)
     fechas = []
+
+    # Marcadores que delimitan secciones no processuales (misma lista que el fallback)
+    MARCADORES_EXCLUSION = [
+        "ficha cadastral",
+        "extrato fiscal",
+        "consulta de dados via cpf",
+        "dados do cnpj",
+        "dados de empresa via cnpj",
+        "posicao de debito",
+        "certidao de divida ativa",
+        "termo de confissao de divida",
+    ]
+    excl_norm = [normalizar(m) for m in MARCADORES_EXCLUSION]
 
     for keyword in KEYWORDS_MOVIMENTACAO_PROCESSUAL:
         keyword_norm = normalizar(keyword)
         for match in re.finditer(re.escape(keyword_norm), text_norm):
             start = max(0, match.start() - 300)
             end   = match.end() + 300
-            fragmento = text[start:end]
+            # Usar el texto normalizado (text_norm) para extraer el fragmento: evita desalineamiento
+            fragmento_norm = text_norm[start:end]
 
-            fechas_encontradas = _extraer_fechas_de_texto(normalizar(fragmento))
-            fechas.extend(fechas_encontradas)
+            # Si el fragmento contiene marcadores de exclusión, ignorarlo
+            if any(marker in fragmento_norm for marker in excl_norm):
+                continue
+
+            fechas_encontradas = _extraer_fechas_de_texto(fragmento_norm)
+            if fechas_encontradas:
+                fechas.extend(fechas_encontradas)
 
     if not fechas:
         # Fallback: si no encontró nada con keywords,
@@ -216,25 +257,76 @@ def _fecha_mas_reciente_fallback(text):
     return max(fechas) if fechas else None
     
 # Buscador de fechas cercanas a palabras clave específicas (como las relacionadas con citación)
-def extraer_fecha_cercana(text, keywords, ventana=500):
-    text_norm = normalizar(text)
+def _limpar_referencias_legais(text_norm):
+    """
+    [FIX fecha_intento] Remove datas de referencias legais (decretos, leis, resolucoes)
+    para evitar que sejam capturadas como datas de citacao.
+    Ex: "Decreto Judiciario nr 638, de 17 de setembro de 2018" → removido
+        "Lei nº 6.830, de 22 de setembro de 1980"             → removido
+    """
+    # Padrao generico: "palavra-chave legal ... numero ..., de DD de mes de AAAA"
+    padroes = [
+        # Decretos, leis, resolucoes, portarias
+        r'decreto\s+\w+\s+n\w*\s*\d+,?\s*de\s+\d{1,2}\s+de\s+\w+\s+de\s+\d{4}',
+        r'decreto\s+n\w*\s*[\d\.]+,?\s*de\s+\d{1,2}\s+de\s+\w+\s+de\s+\d{4}',
+        r'lei\s+n\w*\s*[\d\.]+,?\s*de\s+\d{1,2}\s+de\s+\w+\s+de\s+\d{4}',
+        r'resolucao\s+n\w*\s*\d+,?\s*de\s+\d{1,2}\s+de\s+\w+\s+de\s+\d{4}',
+        r'instrucao\s+normativa\s+\w*\s*[\d\.]+,?\s*de\s+\d{1,2}\s+de\s+\w+\s+de\s+\d{4}',
+        r'portaria\s+n\w*\s*[\d\.]+,?\s*de\s+\d{1,2}\s+de\s+\w+\s+de\s+\d{4}',
+        # [FIX RS Gesso Bug1] Datas de assinatura de Certidoes de Divida Ativa
+        # Ex: "Certifico que se acha inscrito na Divida Ativa... Salvador, 18 de setembro de 2012"
+        # Essas datas aparecem 4x (uma por CDA) e contaminam a fecha_intento
+        r'certifico que se acha inscrito[^S]{0,400}?salvador,?\s*\d{1,2}\s+de\s+\w+\s+de\s+\d{4}',
+        r'estes sao os elementos contidos[^S]{0,200}?salvador,?\s*\d{1,2}\s+de\s+\w+\s+de\s+\d{4}',
+        # Assinatura de coordenador/procurador na CDA (logo após a data)
+        r'salvador,?\s*\d{1,2}\s+de\s+\w+\s+de\s+\d{4}\s+raimundo\s+cordeiro',
+        r'salvador,?\s*\d{1,2}\s+de\s+\w+\s+de\s+\d{4}\s+\w+\s+cordeiro',
+        r'coordenador\s+da\s+cda',  # marca o contexto CDA
+    ]
+    result = text_norm
+    for pat in padroes:
+        result = re.sub(pat, ' [REF_LEGAL] ', result)
+    return result
+
+
+def extraer_fecha_cercana(text, keywords, ventana=500, prefer='latest', min_year=1990):
+    """
+    Busca fechas cerca de las ocurrencias de `keywords` en `text`.
+    - ventana: número de caracteres antes/después para buscar fechas.
+    - prefer: 'latest' (por defecto) devuelve la fecha más reciente entre las encontradas;
+              'earliest' devuelve la primera (la más antigua).
+    Esto permite priorizar la primera carta expedida (usar prefer='earliest').
+    """
+    # [FIX] limpar referencias legais antes de buscar datas
+    text_norm = _limpar_referencias_legais(normalizar(text))
     fechas = []
     for keyword in keywords:
         kw_norm = normalizar(keyword)
         for match in re.finditer(re.escape(kw_norm), text_norm):
             start = max(0, match.start() - ventana)
             end = match.end() + ventana
-            fechas.extend(_extraer_fechas_de_texto(text_norm[start:end]))
-    return max(fechas) if fechas else None
+            fechas_local = _extraer_fechas_de_texto(text_norm[start:end])
+            fechas_local = [f for f in fechas_local if f.year >= min_year]
+            if fechas_local:
+                fechas.extend(fechas_local)
+    if not fechas:
+        return None
+    if prefer == 'earliest':
+        return min(fechas)
+    return max(fechas)
 
 # Función específica para extraer fechas relacionadas con citación, usando diferentes conjuntos de keywords para intentar capturar distintos tipos de órdenes y resultados de citación.
 def extraer_fechas_citacion(text):
-    
-    KEYWORDS_ORDEN_ESPECIFICAS = [ #Keywords más específicas que indican una orden clara de citación, con menor riesgo de falso positivo, por eso se priorizan en la búsqueda
-        # Órdenes directas del juez
+    """
+    Extrae tres fechas relacionadas a la citación:
+      - fecha_orden: fecha de la primera orden/carta expedida (priorizar la primera)
+      - fecha_intento: fecha de la primera tentativa/AR
+      - fecha_efectiva: fecha próxima a evidencias de entrega/assinatura (firma/AR)
+    Separando la lógica se evita confundir una tentativa con una citación efectiva.
+    """
+    KEYWORDS_ORDEN_ESPECIFICAS = [
         "determino a citação",
         "ordeno a citação",
-        # Órdenes operativas (más específicas primero)
         "expeça-se o competente mandado de citação",
         "expeça-se carta de citação",
         "expeça-se mandado de citação",
@@ -243,64 +335,128 @@ def extraer_fechas_citacion(text):
         "expedir carta de citação",
         "diligencie-se para citação",
         "ao oficial de justiça, cite",
-        # Edital (tipo especial, pero sigue siendo orden)
         "cite-se por edital", "citação por edital",
         "converta-se em mandado de citação",
     ]
-    KEYWORDS_ORDEN_GENERICAS = [ #Keywords genericas que pueden indicar una orden de citación pero con mayor riesgo de falso positivo, por eso se dejan para el final 
-        # Más cortas → mayor riesgo de falso positivo
+    KEYWORDS_ORDEN_GENERICAS = [
         "expeça-se citação",
         "seja citado", "sejam citados",
         "citem-se",
         "cite-se",
+        "cite(m)-se",      # [FIX] variante com (m): despachos usam "Cite(m)-se."
+        "proceda-se a citacao",
+        "proceda-se a citação",
+        # [FIX Marcio] Despachos longos (~1000 chars): a data aparece após
+        # "Registre-se" ou "o presente despacho servira como mandado",
+        # keywords muito mais próximos da data do que "proceda-se a citacao"
+        "o presente despacho servira como mandado",
+        "registre-se.",
+        "publique-se. registre-se",
     ]
-    # Para usar en extraer_fechas_citacion:
     KEYWORDS_ORDEN = KEYWORDS_ORDEN_ESPECIFICAS + KEYWORDS_ORDEN_GENERICAS
 
-    KEYWORDS_INTENTO = [#Keywords que indican intento de citación, pero sin certeza de que se haya concretado, por eso se buscan por separado para extraer fechas relacionadas a intentos fallidos o en proceso.
-        "carta com ar", "aviso de recebimento", "tentativa"
+    # Keywords que aparecem ANTES da data (buscar apenas APÓS o keyword)
+    KEYWORDS_INTENTO_APOS = [
+        "conferi.",          # carta: "conferi. 23 de maio de 2013"
+        "digitei, eu",       # mandado: "digitei, ... conferi. DD de mes de AAAA"
+    ]
+    # Keywords que aparecem em contexto amplo (janela bidirecional)
+    KEYWORDS_INTENTO = [
+        "carta com ar", "aviso de recebimento", "tentativa",
+        "aviso de recebimento negativo",
     ]
 
-    KEYWORDS_EFECTIVA = [#Keywords que indican citación efectiva, con alta probabilidad de que el ejecutado haya sido notificado, por eso se buscan por separado para extraer fechas relacionadas a citaciones exitosas.
-        "recebido", "assinado", "assinatura"
+    KEYWORDS_EFECTIVA = [
+        "recebido", "assinado", "assinatura", "assinatura do recebedor", "recebido em", "recebido com"
     ]
-    #Logica de búsqueda: primero se buscan las keywords de intento y efectiva para capturar fechas relacionadas a esos eventos, y luego se buscan las keywords de orden para capturar fechas relacionadas a órdenes de citación, incluso si no hay evidencia clara de intento o efectividad.
-    text_norm = normalizar(text)
-    keywords_encontradas = [k for k in KEYWORDS_INTENTO if normalizar(k) in text_norm]
-    print(f"Keywords de intento encontradas: {keywords_encontradas}")
-    keywords_encontradas = [k for k in KEYWORDS_ORDEN if normalizar(k) in text_norm]
-    print(f"Keywords de orden encontradas: {keywords_encontradas}")
-    keywords_encontradas = [k for k in KEYWORDS_EFECTIVA if normalizar(k) in text_norm]
-    print(f"Keywords de efectiva encontradas: {keywords_encontradas}")
-    # Extraemos fechas relacionadas a cada tipo de evento (orden, intento, efectiva) usando las keywords correspondientes 
-    # y una ventana de texto para capturar fechas cercanas a esos eventos.
-    fecha_orden    = extraer_fecha_cercana(text, KEYWORDS_ORDEN, ventana=1500)
-    fecha_intento  = extraer_fecha_cercana(text, KEYWORDS_INTENTO, ventana=1500)
-    fecha_efectiva = extraer_fecha_cercana(text, KEYWORDS_EFECTIVA, ventana=1500)
-    # Imprimimos las fechas encontradas para cada tipo de evento para facilitar la depuración 
-    # y ver qué fechas se están capturando en relación a las keywords.
-    print(f"  fecha_orden:    {fecha_orden}")
-    print(f"  fecha_intento:  {fecha_intento}")
-    print(f"  fecha_efectiva: {fecha_efectiva}")
+
+    # Buscar la PRIMERA carta/orden expedida (earliest) para fecha_orden
+    # [FIX RS Gesso Bug2] ventana reduzida 1500->400: certidoes de publicacao
+    # republiquem o despacho sem a data original, ficando a ~1000 chars do keyword.
+    # Com ventana=400 capturamos o despacho real sem pegar as certidoes.
+    # [FIX Ministério Obra Santa] ventana 400→800: despachos longos (>500 chars)
+    # têm a data no final; 800 cobre sem pegar certidoes a 1000+ chars.
+    fecha_orden = extraer_fecha_cercana(text, KEYWORDS_ORDEN, ventana=800, prefer='earliest')
+
+    # Separar la lógica de intento: priorizar la primera tentativa/ar encontrada
+    # [FIX RS Gesso] Dois passes para fecha_intento:
+    # 1) Keywords que precedem a data (ex: "conferi.") → buscar só APÓS o keyword
+    #    usando ventana_antes=10 para não capturar datas anteriores no mesmo bloco
+    import re as _re
+    def _fecha_intento_apos(text_norm, keywords, min_year=1990):
+        """Busca data apenas APÓS o keyword (ventana_antes=10)."""
+        fechas = []
+        for kw in keywords:
+            kw_norm = normalizar(kw)
+            for m in _re.finditer(_re.escape(kw_norm), text_norm):
+                # janela: apenas 10 chars antes (para alguma margem) e 300 após
+                trecho = text_norm[max(0, m.start()-10): m.end()+300]
+                fs = [f for f in _extraer_fechas_de_texto(trecho) if f.year >= min_year]
+                fechas.extend(fs)
+        return min(fechas) if fechas else None
+
+    text_norm_clean = _limpar_referencias_legais(normalizar(text))
+    fecha_intento = _fecha_intento_apos(text_norm_clean, KEYWORDS_INTENTO_APOS)
+    if not fecha_intento:
+        fecha_intento = extraer_fecha_cercana(text, KEYWORDS_INTENTO, ventana=500, prefer='earliest')
+
+    # Fecha efectiva: buscar indicios de entrega/firmas (usar ventana menor)
+    fecha_efectiva = extraer_fecha_cercana(text, KEYWORDS_EFECTIVA, ventana=400, prefer='earliest')
+
+    # Depuración: mostrar las fechas detectadas por tipo
+    logging.debug(f"  fecha_orden (primera):    {fecha_orden}")
+    logging.debug(f"  fecha_intento (primera):  {fecha_intento}")
+    logging.debug(f"  fecha_efectiva (posible): {fecha_efectiva}")
 
     return fecha_orden, fecha_intento, fecha_efectiva
+
+# [FIX Bug A] KEYWORDS_AR_ENTREGUE removido — essas strings aparecem como campos
+# em branco em formularios AR nao entregues e causavam falso positivo sistematico.
+# A deteccao de citacao efetiva agora usa apenas KEYWORDS_CITACION_OK em
+# extract_citacion(), que so inclui expressoes que provam entrega real.
 
 
 # 4. Extraer estado de citación
 def extract_citacion(text):
+    # [FIX Bug A] Keywords que SO aparecem em certidoes de citacao efetiva.
+    # NAO incluir "assinatura do recebedor", "nome legivel do recebedor",
+    # "data de entrega" — sao boilerplate impresso em branco em todo formulario AR.
     KEYWORDS_CITACION_OK = [
+        # Certidao do oficial de justica confirmando citacao pessoal
         "certifico que procedi a citacao",
         "certifico que o executado foi citado",
         "certifico que citei",
         "certifico ter realizado a citacao",
         "fica citado",
-        "embargos a execucao",
-        "parcelamento de debitos",
+        "devidamente citado",
+        "ar positivo",
+        # [FIX Maria Gloria] Certidão de Decurso de Prazo = citação válida provada
+        # Só há prazo para correr se o executado foi efetivamente citado
+        "certidao de decurso de prazo",
+        "decorreu o prazo legal sem qualquer manifestacao",
+        "decorreu o prazo legal",
+        "decurso de prazo",
+        "nao se manifestou quanto ao pagamento",
+        # Defesa / embargos (executado compareceu)
+        #"embargos a execucao",
+        "apresentou embargos",
+        "embargos foram opostos",
         "citacao valida",
-        # ← "pagamento do debito" ELIMINADO
+        # Citacao espontanea — confissao de divida / parcelamento assinado
+        "instrumento de confissao de divida e compromisso de pagamento parcelado",
+        "instrumento de confissao de divida",
+        "confissao de divida e compromisso",
+        "exarou o ciente",
+        "aceitou a contrafe que lhe foi oferecida",
+        "ele aceitou a contrafe",
+        "citado nos autos",
+        # PAD assinado = ciencia inequivoca
+        "parcelamento de debitos",
     ]
 
+    # [FIX Bug A] Inclui motivos de devolucao do AR e certidoes negativas do OJ
     KEYWORDS_CITACION_NAO_OK = [
+        # Declaracoes judiciais explicitas
         "aviso de recebimento negativo",
         "intime-se a fazenda publica para que adote as providencias cabiveis",
         "o reu nao foi citado",
@@ -310,38 +466,44 @@ def extract_citacion(text):
         "ausencia de citacao",
         "nao logrando exito na citacao",
         "nao foi possivel realizar a citacao",
-        "a parte executada nao foi citada",   # ← nuevo: cubre sentença do G S Campos
-    ]
-
-    # Keywords que indican que el AR fue efectivamente entregado
-    # Solo cuenta si hay firma Y fecha de entrega en el mismo fragmento
-    KEYWORDS_AR_ENTREGUE = [
-        "assinatura do recebedor",
-        "nome legivel do recebedor",
+        "a parte executada nao foi citada",
+        # Certidao do oficial de justica de tentativa frustrada
+        "deixei de proceder a citacao",
+        "deixei de citar",
+        "nao encontrado o executado",
+        "nao foi localizado o executado",
+        "nao reside no endereco",
+        "nao mora no endereco",
+        "nao conhece o executado",
+        "nao sabe informar o seu paradeiro",
+        # Motivos de devolucao marcados no AR pelos Correios
+        "motivos de devolucao",   # cabecalho da secao = AR devolvido
+        "mudou-se",
+        "nao procurado",
+        "nao existe o numero",
+        "endereco insuficiente",
+        "desconhecido",
+        "falecido",
     ]
 
     text_norm = normalizar(text)
 
-    # Primero verificar negativo (tiene prioridad)
+    # Verificar negativo primeiro
     if any(normalizar(k) in text_norm for k in KEYWORDS_CITACION_NAO_OK):
+        # Se ha tambem evidencia positiva forte (ex: confissao assinada apos
+        # tentativa frustrada), o positivo prevalece
+        for k_ok in KEYWORDS_CITACION_OK:
+            if normalizar(k_ok) in text_norm:
+                return "HOUVE CITAÇÃO"
         return "NÃO HOUVE ou TENTATIVA FALHA"
 
-    # Verificar positivo con keywords específicas
+    # Verificar positivo
     if any(normalizar(k) in text_norm for k in KEYWORDS_CITACION_OK):
-        # Guardia extra: si "certifico" está presente pero sin contexto de citação,
-        # verificar que haya evidencia adicional
         return "HOUVE CITAÇÃO"
 
-    # Verificar AR entregue: buscar firma cerca de "data de entrega"
-    if any(normalizar(k) in text_norm for k in KEYWORDS_AR_ENTREGUE):
-        # Verificar que no esté en un AR devuelto (negativo)
-        if normalizar("motivos de devolucao") in text_norm:
-            # Hay AR pero con sección de devolución — verificar si fue firmado
-            # Si tiene "data de entrega" con valor real (no vacío), fue entregado
-            if normalizar("data de entrega") in text_norm:
-                return "HOUVE CITAÇÃO"
-        else:
-            return "HOUVE CITAÇÃO"
+    # [FIX Bug A] REMOVIDO: bloco de verificacao por "assinatura do recebedor" /
+    # "nome legivel do recebedor" — essas strings aparecem impressas em branco em
+    # todo formulario AR nao entregue e causavam falso positivo em 81% dos casos.
 
     return "Citação não encontrado"
 
@@ -366,6 +528,11 @@ def extract_penhora(text):
         "bloqueio de dinheiro/ativos financeiros",
         "bloqueio de ativos financeiros",
         "requer o bloqueio de dinheiro",
+        # [FIX] variantes com espaço: "BACEN JUD", "SISBAJUD", "SIS BAJUD"
+        "bacen jud",
+        "sis bajud",
+        "nos moldes do bacen jud",
+        "nos moldes do bacenjud",
     ]
     # Confirmed successful bloqueio (result document present)
     KEYWORDS_BACENJUD_CONFIRMADO = [
@@ -391,6 +558,19 @@ def extract_penhora(text):
         "diligencia sisbajud restou infrutifera",
         "bloqueio desbloqueado",
         "desbloqueio do valor",
+        # [FIX Maria Gloria] SisBajud resultado negativo na decisão judicial
+        "nao possui relacionamento com as instituicoes financeiras",
+        "cpf indicado nao possui relacionamento",
+        "cnpj indicado nao possui relacionamento",
+        # [FIX Ministério Obra Santa] "negativa Bacenjud" em decisão art.40 LEF
+        "negativa bacenjud",
+        "ar negativo e/ou negativa bacenjud",
+        "negativa do bacenjud",
+        "bacenjud negativo",
+        "resultado bacenjud negativo",
+        "nao possui relacionamentos com",
+        "cpf nao possui relacionamento",
+        "tentativa de penhora on-line",
     ]
 
     # --- RENAJUD (bloqueio veicular) ---
@@ -434,7 +614,9 @@ def extract_penhora(text):
         "decretada a indisponibilidade",
         "cnib",
         "cadastro nacional de indisponibilidade",
-        "bloqueio de bens",
+        # [FIX Felipao] "bloqueio de bens" REMOVIDO — aparece em
+        # decisões de RENAJUD ("imediato bloqueio de bens eventualmente
+        # encontrados"), causando falso positivo CNIB
     ]
 
     # --- Penhora de quotas / participação societária ---
@@ -474,14 +656,15 @@ def extract_penhora(text):
     text_norm = normalizar(text)
 
     # Indisponibilidade CNIB — bloqueio administrativo amplo
-    if any(normalizar(k) in text_norm for k in KEYWORDS_INDISPONIBILIDADE):
-        return "indisponibilidade de bens (CNIB)"
-
-    # RENAJUD — verifica positivo antes de negativo
+    # [FIX Felipao] RENAJUD verificado ANTES de CNIB —
+    # decisões RENAJUD usam "bloqueio de bens" que causava falso positivo CNIB
     if any(normalizar(k) in text_norm for k in KEYWORDS_RENAJUD_ATIVO):
         if any(normalizar(k) in text_norm for k in KEYWORDS_RENAJUD_NEGATIVO):
             return "tentativa de penhora renajud (negativa)"
         return "bloqueio renajud ativo"
+
+    if any(normalizar(k) in text_norm for k in KEYWORDS_INDISPONIBILIDADE):
+        return "indisponibilidade de bens (CNIB)"
 
     # Penhora de imóvel
     if any(normalizar(k) in text_norm for k in KEYWORDS_PENHORA_IMOVEL):
@@ -499,10 +682,14 @@ def extract_penhora(text):
     if any(normalizar(k) in text_norm for k in KEYWORDS_PENHORA_CREDITOS):
         return "penhora de créditos/direitos"
 
+    # [FIX 3a] BACENJUD_NEGATIVO verificado de forma INDEPENDENTE:
+    # Cobre casos onde o juiz indefere o bloqueio (sem keyword positivo)
+    # Ex: "CPF não possui relacionamento com as instituições financeiras"
+    if any(normalizar(k) in text_norm for k in KEYWORDS_BACENJUD_NEGATIVO):
+        return "tentativa de penhora bacenjud (negativa)"
+
     # BACENJUD / SISBAJUD — confirmed positive keywords (comprovante/despacho de bloqueio)
     if any(normalizar(k) in text_norm for k in KEYWORDS_BACENJUD_POSITIVO):
-        if any(normalizar(k) in text_norm for k in KEYWORDS_BACENJUD_NEGATIVO):
-            return "tentativa de penhora bacenjud (negativa)"
         return "penhora bacenjud/sisbajud"
 
     # BACENJUD / SISBAJUD — only a petition requesting it; result not in document
@@ -523,17 +710,80 @@ def extract_penhora(text):
     return "Penhora não encontrado"
 # Nueva función para detectar suspensión por parcelamento
 KEYWORDS_PARCELAMENTO_ATIVO = [
-    "suspensão do feito",
+    # ── DECISÕES DO JUIZ deferindo suspensão por parcelamento ──────────────
+    "defiro o pedido de suspensao",        # "Defiro o pedido de suspensão pelo prazo requerido"
+    "defiro a suspensao",
+    "determino a suspensao do feito",
+    "determino a suspensao da execucao",
+    "suspendo o feito",
     "suspendo o curso do feito",
     "suspendo/mantenho suspenso",
-    "parcelamento do débito exequendo",
-    "adesão ao pad",
-    "parcelamento administrativo de débitos",
+    "suspensao do feito",                  # em petições e decisões
+    "suspensao da execucao",
+    "suspensao do processo",
+
+    # ── PETIÇÕES requerendo suspensão por parcelamento ──────────────────────
+    "requerer a suspensao do feito",       # "vem requerer a suspensão do Feito"
+    "requer a suspensao do feito",
+    "requerer a suspensao da execucao",
+    "requer a suspensao da execucao",
+    "suspensao pelo parcelamento",
+    "pleiteou administrativamente o parcelamento",  # Antonildo
+    "adesao ao parcelamento",
+    "aderiu ao parcelamento",
+    "aderiu o executado",                  # "parcelamento a que aderiu o Executado"
+    "parcelamento a que aderiu",
+
+    # ── OBJETO do parcelamento ───────────────────────────────────────────────
+    "parcelamento do debito exequendo",
+    "parcelamento do credito tributario",
+    "parcelamento do debito tributario",
+    "parcelamento administrativo de debitos",
+    "parcelamento administrativo",
+    "parcelamento em",                     # "parcelamento em 38 parcelas"
+    "parcelas mensais e sucessivas",
+    "em 38 parcelas",                      # número explícito de parcelas
+    "em 12 parcelas",
+    "em 24 parcelas",
+    "em 36 parcelas",
+    "em 48 parcelas",
+    "em 60 parcelas",
+
+    # ── REFERÊNCIAS AO PAD (número ou sigla) ────────────────────────────────
+    "adesao ao pad",
     "pad homologado",
     "bloq pad",
-    "suspensão pelo parcelamento",
-    "art. 151, vi, do ctn",   # artigo que fundamenta suspensão por parcelamento
-    "art. 313, ii, do cpc",   # artigo processual da suspensão
+    "pad n",                               # "PAD n. 968002" / "PAD nº 3070"
+    "pad no",
+    "pad nr",
+    "parcelamento pad",
+    "pad internet",                        # "Tipo de Adesão: PAD Internet"
+
+    # ── INSTRUMENTO DE CONFISSÃO DE DÍVIDA ──────────────────────────────────
+    "instrumento de confissao de divida e compromisso de pagamento parcelado",
+    "compromisso de pagamento parcelado",
+    "instrumento de confissao",            # OCR pode garbling "de divida"
+
+    # ── ARTIGOS DO CTN (inciso I e VI) — várias grafias ─────────────────────
+    # Inciso VI — moratória / parcelamento
+    "art. 151, vi, do ctn",
+    "art. 151, inc. vi",
+    "art. 151, inciso vi",
+    "art. 151, inc. vi,",
+    # Inciso I — parcelamento (menos comum, mas usado em Antonildo)
+    "art. 151, i, do ctn",
+    "art. 151, inc. i, do ctn",
+    "art. 151, inc. i,",
+    "art. 151, inciso i",
+    # Numeral arábico "1" em vez de letra "i" (OCR / digitação)
+    "art. 151, inc. 1,",
+    "art. 151, 1, do ctn",
+    "art. 151, inc. 1, do",
+    "151, inc. 1,",
+    # Artigo processual de suspensão
+    "art. 313, ii, do cpc",
+    "art. 265, inc. ii, do cpc",           # CPC/1973 — código antigo
+    "art. 265, inc. ii",
 ]
 
 KEYWORDS_SUSPENSAO_ART40 = [
@@ -551,11 +801,269 @@ def extract_suspensao_art40(text):
         return "processo suspenso — art. 40 LEF (bens não localizados)"
     return None
 
+
+def extract_extincao(text):
+    """
+    [FIX Maria Gloria] Detecta se o processo foi extinto/sentenciado.
+    Retorna string descritiva ou None.
+    """
+    KEYWORDS_EXTINCAO = [
+        # Sentença de extinção por prescrição
+        "processo ja se encontra sentenciado",
+        "ja se encontra sentenciado",
+        "processo sentenciado",
+        "extingo o processo com resolucao do merito",
+        "declaro a prescricao",
+        "declaro extinto o processo",
+        "julgo extinta a execucao",
+        "julgo extinto o feito",
+        "extingo a execucao",
+        "extinção da execução",
+        "extincao da execucao",
+        "extinção do processo",
+        "extincao do processo",
+        "processo extinto",
+        "sentenca de extincao",
+        "sentenca transitada",
+        "transitada em julgado",
+        "transito em julgado",
+        "extinto por prescricao",
+        "extinta por prescricao",
+        "baixa definitiva nos autos",
+        "arquivem-se com baixa",
+        "cancelamento da distribuicao",
+    ]
+    text_norm = normalizar(text)
+    for k in KEYWORDS_EXTINCAO:
+        if normalizar(k) in text_norm:
+            return "processo extinto/sentenciado"
+    return None
+
+def extract_reforma_sentenca(text):
+    """
+    Detecta se uma sentença de extinção foi REFORMADA em apelação.
+    Se retornar algo, o resultado de extract_extincao() deve ser cancelado.
+    """
+    KEYWORDS_REFORMA = [
+        "dou provimento ao apelo",
+        "dou provimento ao recurso",
+        "reformo a sentenca",
+        "afasto a prescricao",
+        "afastando a prescricao",
+        "afastando-se a prescricao decretada",
+        "determinar o retorno dos autos",
+        "para prosseguimento da execucao fiscal",
+        "retornem ao juizo de origem",
+        "retorno dos autos a origem",
+        "anulo a sentenca",
+        "sentenca anulada",
+        "provimento ao apelo",
+        "reforma da sentenca",
+        "regular processamento da execucao",
+        "determino o retorno",
+    ]
+    text_norm = normalizar(text)
+    for k in KEYWORDS_REFORMA:
+        if normalizar(k) in text_norm:
+            return f"sentença reformada em apelação ({k})"
+    return None
+
+
+def _citacao_por_sinal_forte(text):
+    """
+    Retorna True se 'HOUVE CITAÇÃO' é suportado por evidência FORTE.
+    Rejeita sinais fracos como boilerplate e cabeçalhos de extrato.
+    """
+    STRONG_CITACAO = [
+        # Certidão do OJ confirmando pessoalmente
+        "certifico que procedi a citacao",
+        "certifico que o executado foi citado",
+        "certifico que citei",
+        "certifico ter realizado a citacao",
+        "devidamente citado",
+        "fica citado",
+        "ar positivo",
+        # Executado compareceu / defendeu-se
+        "apresentou embargos",
+        "embargos foram opostos",
+        "citacao valida",
+        "exarou o ciente",
+        "aceitou a contrafe",
+        # Instrumento de confissão ASSINADO pelo executado
+        "instrumento de confissao de divida e compromisso de pagamento parcelado",
+        "confissao de divida e compromisso",
+        # Comparecimento espontâneo (art. 239 §1º CPC)
+        "citacao espontanea",
+        "supriu a citacao",
+        "suprida a citacao",
+        "art. 239",
+    ]
+    text_norm = normalizar(text)
+    return any(normalizar(s) in text_norm for s in STRONG_CITACAO)
+
+def verificacao_dupla(extincao, citacion, parcelamento, full_text):
+    """
+    Segunda verificação para eliminar falsos NÃO APTO e HOUVE CITAÇÃO.
+
+    Evalúa cada resultado potencialmente problemático y lo corrige si
+    detecta evidencia contraria en el texto completo.
+
+    Retorna dict con los valores corregidos y una lista de alertas.
+    """
+    alertas = []
+
+    # ── Correção 1: extinção reformada em apelação ───────────────────────────
+    if extincao:
+        reforma = extract_reforma_sentenca(full_text)
+        if reforma:
+            alertas.append(f"EXTINÇÃO CANCELADA — {reforma}")
+            extincao = None   # ← processo não está mais extinto
+
+    # ── Correção 2: HOUVE CITAÇÃO sem sinal forte ────────────────────────────
+    if citacion == "HOUVE CITAÇÃO":
+        if not _citacao_por_sinal_forte(full_text):
+            alertas.append("CITAÇÃO REVERTIDA — apenas sinais fracos (boilerplate/cabeçalho)")
+            citacion = "Citação não encontrado"
+
+    # ── Correção 3: PAD detectado sem marcador forte ─────────────────────────
+    if parcelamento:
+        if not _parcelamento_por_sinal_forte(full_text):
+            alertas.append("PAD REVERTIDO — sem marcadores de PAD ativo confirmado")
+            parcelamento = None
+
+    return {
+        "extincao"    : extincao,
+        "citacion"    : citacion,
+        "parcelamento": parcelamento,
+        "alertas"     : alertas,
+    }
+
+
+
+def _parcelamento_por_sinal_forte(text):
+    """
+    Retorna True se a detecção de PAD tem pelo menos um marcador FORTE de PAD ativo.
+    Evita falsos positivos por keywords genéricos (art. 265, "suspensão do feito").
+    """
+    STRONG_PAD = [
+        # Extrato PAD com situação explícita
+        "situacao do parcelamento: homologado",
+        "situacao pad: homologado",
+        "situacao: homologado",
+        "bloq pad",
+        # Número específico de PAD no texto
+        "pad n.",
+        "pad no.",
+        "pad nr.",
+        "pad/ppi n",
+        # Instrumento assinado (texto completo do instrumento, não só menção)
+        "instrumento de confissao de divida e responsabilidade solidaria",
+        "instrumento de confissao de divida e compromisso de pagamento parcelado",
+        # Artigo CTN — inciso VI (parcelamento real, não genérico)
+        "art. 151, vi",
+        "art. 151, inc. vi",
+        "art. 151, inciso vi",
+        # Evidência de pagamento de parcela
+        "pagamento da primeira parcela",
+        "primeira parcela",
+    ]
+    text_norm = normalizar(text)
+    return any(normalizar(s) in text_norm for s in STRONG_PAD)
+
+
+
 def extract_parcelamento(text):
     text_norm = normalizar(text)
-    if any(normalizar(k) in text_norm for k in KEYWORDS_PARCELAMENTO_ATIVO):
+    if not any(normalizar(k) in text_norm for k in KEYWORDS_PARCELAMENTO_ATIVO):
+        return None
+
+    # [FIX Felipao Bug2] Verificar se o PAD está ROMPIDO/CANCELADO.
+    # Extrato PAD com "Situação: Rompido" ou extrato fiscal com
+    # "Cred. ref. ao cancel. do PAD" confirmam que o PAD foi encerrado.
+    # [FIX Ministério Obra Santa] Checar se "suspensão do feito" vem de
+    # contexto art.40 LEF (sem bens/devedor), NÃO de PAD.
+    # Art.40 usa "suspensão do feito" sem os marcadores específicos de PAD.
+    KEYWORDS_ART40_EXCLUSIVOS = [
+        "art. 40 da lef",
+        "art. 40 da lei 6.830",
+        "art. 40 - o juiz suspendera",
+        "enquanto nao for localizado o devedor",
+        "nao for localizado o devedor",
+        "ausencia de localizacao do executado",
+        "suspensao do feito pelo prazo de um ano",
+        "suspensao pelo prazo de 1 (um) ano",
+    ]
+    KEYWORDS_PAD_ESPECIFICOS = [
+        "art. 151",
+        "parcelamento do credito tributario",
+        "parcelamento do debito",
+        "instrumento de confissao",
+        "compromisso de pagamento parcelado",
+        "bloq pad",
+        "pad n",
+        "parcelas mensais e sucessivas",
+        "em 38 parcelas",
+        "em 12 parcelas",
+        "em 24 parcelas",
+        "em 36 parcelas",
+        "em 48 parcelas",
+        "em 60 parcelas",
+        "defiro o pedido de suspensao",    # juiz defere PAD explicitamente
+        "suspendo/mantenho suspenso",
+    ]
+    # Se o contexto é art.40 E não há marcadores específicos de PAD → não é PAD
+    is_art40_context = any(normalizar(k) in text_norm for k in KEYWORDS_ART40_EXCLUSIVOS)
+    has_pad_markers  = any(normalizar(k) in text_norm for k in KEYWORDS_PAD_ESPECIFICOS)
+    if is_art40_context and not has_pad_markers:
+        return None   # art.40 LEF — não confundir com PAD
+
+    # [FIX JJFM] Verificar primeiro se PAD está ATIVO (Homologado/Bloqueado).
+    # Se sim, retornar imediatamente sem checar rompido.
+    KEYWORDS_PAD_HOMOLOGADO = [
+        "situacao do parcelamento: homologado",
+        "situacao pad: homologado",
+        "situacao: homologado",
+        "bloq pad",                         # extrato: débito bloqueado pelo PAD
+        "suspendo/mantenho suspenso",        # decisão judicial deferindo PAD ativo
+        "suspendo e mantenho suspenso",
+    ]
+    if any(normalizar(k) in text_norm for k in KEYWORDS_PAD_HOMOLOGADO):
         return "processo suspenso por parcelamento (PAD)"
-    return None
+
+    KEYWORDS_PAD_ROMPIDO = [
+        "situacao do parcelamento: rompido",
+        "situacao: rompido",
+        "parcelamento rompido",
+        # [FIX JJFM] "parcelamento cancelado" era genérico — batia em
+        # PADs antigos mesmo com novo PAD ativo. Usar padrão com data.
+        "parcelamento cancelado em",
+        "cred. ref. ao cancel. do parc",
+        "cred. ref. ao cancel. do pad",
+        "motivo: pagamento em atraso",
+        "data de rompimento:",
+        # [FIX Marcio] Petição de NOVA CITAÇÃO após PAD assinado indica
+        # que parcelamento foi cancelado por inadimplência e processo reativado
+        "requerer a citacao da parte executada no seguinte endereco",
+        "requer a citacao da parte executada no seguinte endereco",
+        "citacao da parte executada no seguinte endereco",
+    ]
+    if any(normalizar(k) in text_norm for k in KEYWORDS_PAD_ROMPIDO):
+        # PAD rompido — checar se há NOVO PAD ativo (decisão judicial recente)
+        KEYWORDS_PAD_NOVO_ATIVO = [
+            "defiro o pedido de suspensao",
+            "determino a suspensao do feito",
+            "suspendo o feito",
+            "suspendo/mantenho suspenso",   # [FIX JJFM] grafia alternativa
+            "suspendo e mantenho suspenso",
+            "situacao pad: homologado",
+            "bloq pad",
+        ]
+        if any(normalizar(k) in text_norm for k in KEYWORDS_PAD_NOVO_ATIVO):
+            return "processo suspenso por parcelamento (PAD)"
+        # PAD rompido sem novo PAD ativo — não é situação especial ativa
+        return None
+
+    return "processo suspenso por parcelamento (PAD)"
 # 6. Crear el prompt
 def create_prompt(fecha_reciente, citacion, penhora):
     return PROMPT_TEMPLATE.format(
@@ -597,7 +1105,7 @@ def generate_prompts(input_dir):
             penhora        = extract_penhora(full_text)
             fecha_orden, fecha_intento, fecha_efectiva = extraer_fechas_citacion(full_text)
 
-            # Regla: fecha_citacion_efectiva debe ser None siempre que status_citacao != "HOUVE CITAÇÃO"
+            # Regla: fecha_citacion_efectiva debe ser None siempre que status_citacion != "HOUVE CITAÇÃO"
             if not citacion or normalizar(citacion) != normalizar("HOUVE CITAÇÃO"):
                 fecha_efectiva = None
 
@@ -761,8 +1269,19 @@ def process_prompts_to_excel(prompts, output_excel):
     hoy = datetime.now()
 
     for pdf_file, fecha_reciente, citacion, fecha_orden, fecha_intento, fecha_efectiva, penhora, prompt, respuesta_gpt, full_text in prompts:
-        parcelamento = extract_parcelamento(full_text)
+        extincao      = extract_extincao(full_text)      # [FIX] Passo 2: extinção
+        parcelamento  = extract_parcelamento(full_text)
         suspensao_art40 = extract_suspensao_art40(full_text)
+
+        # ← DOUBLE VERIFICATION ─────────────────────────────────────────────────
+        dv = verificacao_dupla(extincao, citacion, parcelamento, full_text)
+        extincao     = dv["extincao"]
+        citacion     = dv["citacion"]
+        parcelamento = dv["parcelamento"]
+        alertas_dv   = dv["alertas"]
+        # ────────────────────────────────────────────────────────────────────────
+
+
         # Inicializar siempre antes del bloque de decisión
         respuesta_gpt = None
         fonte = "Sistema automático"
@@ -773,7 +1292,10 @@ def process_prompts_to_excel(prompts, output_excel):
         elif (hoy - fecha_reciente).days < 365:
             decision = "NO APTO"
             motivo = "Movimentação recente (< 1 ano)"
-        elif parcelamento:                          # ← nuevo bloque
+        elif extincao:                              # [FIX] Passo 2: processo extinto
+            decision = "NO APTO"
+            motivo = f"{extincao} — execução encerrada por sentença ou prescrição"
+        elif parcelamento:
             decision = "NO APTO"
             motivo = f"Processo suspenso — {parcelamento}. Verificar status atual do PAD."
         elif suspensao_art40:
@@ -858,6 +1380,8 @@ def process_prompts_to_excel(prompts, output_excel):
             "Fecha citación efectiva" : fecha_efectiva.strftime("%Y-%m-%d") if fecha_efectiva else "Não especificado",
             "Resultado da penhora"    : penhora or "Não especificado",
             "Decisión"                : decision,
+            "Verificação Dupla"       : " | ".join(alertas_dv) if alertas_dv else "",
+            "Fonte da decisão"        : fonte,
             "Motivo"                  : motivo,
             "Fonte da decisão"        : fonte,
             "Respuesta GPT"           : respuesta_gpt or "",
