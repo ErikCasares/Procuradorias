@@ -1,6 +1,6 @@
 # ===========================================================================
 # AGENTE 1 — Extração determinística de execuções fiscais (PGMS / HERA)
-# Versão 8.0.1
+# Versão 8.0.3
 #
 # MUDANÇAS EM RELAÇÃO A promptV7_1.py:
 #   1. [feedback 4] Removida a camada de juízo APTO / NÃO APTO. O Agente 1
@@ -30,6 +30,58 @@
 #      n.", "Referência") e, no fallback sem rótulo, ignorando números que
 #      apareçam em contexto de tabela de parcelamento/PPI. Validado contra o
 #      PDF real do caso reportado (50 páginas).
+#   6. [FIX — feedback NTI/PGMS 18/09/2026, processos 8014030-85.2020.8.05.0001,
+#      8110878-03.2021.8.05.0001, 0755766-52.2018.8.05.0001,
+#      8090758-07.2019.8.05.0001 e 8086163-62.2019.8.05.0001]
+#      extract_citacion() tinha duas causas de erro, uma em cada direção.
+#      (a) Falso negativo: as opções da legenda impressa do formulário de AR
+#      dos Correios ("mudou-se", "endereço insuficiente", "não procurado",
+#      "desconhecido", "falecido", "motivos de devolução") apareciam em
+#      QUALQUER AR — entregue ou não — por serem só a lista de opções do
+#      campo, não uma marcação real; isso disparava falso negativo em todo
+#      processo com AR positivo anexado. (b) Falso positivo: "citação válida"
+#      também aparecia em trechos que a NEGAM ("ausência de citação válida"),
+#      e "decurso de prazo"/"certidão de decurso de prazo" só provam que um
+#      prazo passou sem manifestação — o que não distingue citação válida
+#      (executado ficou calado) de citação FALHA (executado nunca soube do
+#      processo). Corrigido: removidas as palavras de legenda e as frases
+#      ambíguas; adicionados sinais mais específicos vindos da Certidão de AR
+#      Digital do TJBA ("AR Devolvido sem cumprimento"/"Documento Entregue")
+#      e da linguagem padrão de decisão judicial ("diligência de citação
+#      resultou negativa", "regularmente citado/a", "citação espontânea" —
+#      art. 239 §1º CPC, inclusive a variante sem espaço "citacaoespontanea"
+#      que aparece quando o pdfplumber funde palavras num bloco de texto).
+#      VALIDADO contra 9 dos 10 processos reais da planilha comparativa do
+#      NTI/PGMS: 9/9 recebidos bateram 100% com o gabarito (citação E número
+#      do processo); o 10º (0855250-11.2016.8.05.0001) não foi enviado.
+#      extract_penhora() e os demais campos de extract_entidades_agente2()
+#      continuam idênticos nos mesmos 9 PDFs — nenhuma regressão fora do
+#      escopo deste fix.
+#   7. (v8.0.3) [FIX — feedback NTI/PGMS 18/09/2026, processo 0784947-98.2018.8.05.0001,
+#      também confirmado em 8014030-85.2020.8.05.0001 e 8086163-62.2019.8.05.0001]
+#      extract_penhora() checava KEYWORDS_BACENJUD_NEGATIVO ANTES de POSITIVO/
+#      CONFIRMADO e retornava na hora — sem olhar se havia TAMBÉM confirmação
+#      positiva em outro ponto do mesmo PDF. Um processo costuma ter várias
+#      tentativas de bloqueio ao longo do tempo: é comum um banco responder "sem
+#      saldo positivo" enquanto outro banco (ou uma tentativa anterior) teve
+#      bloqueio efetivo. Confirmado nos PDFs reais: a mesma certidão SISBAJUD
+#      tinha "sem saldo positivo" de um banco E "valores bloqueados"/"penhora
+#      sisbajud" em outro ponto — inclusive a própria executada peticionando
+#      pedindo a conversão em renda "dos valores bloqueados". Corrigido:
+#      POSITIVO/CONFIRMADO agora tem prioridade sobre NEGATIVO (mesma lógica que
+#      o ramo SOLICITADO já usava). Adicionado também "foi concretizada a
+#      penhora" (fato passado) a CONFIRMADO — tomando cuidado de NÃO usar
+#      "reputa-se concretizada a penhora" sozinho, que é linguagem de despacho
+#      PADRÃO/condicional (aparece mesmo quando a penhora não se confirmou).
+#      VALIDADO: 9/9 processos recebidos bateram 100% (citação + número do
+#      processo + penhora); extract_citacion(), _extrair_numero_processo() e os
+#      demais campos de extract_entidades_agente2() continuam idênticos.
+#      RISCO CONHECIDO NÃO CORRIGIDO: KEYWORDS_RENAJUD_ATIVO tem a MESMA
+#      estrutura de precedência que causava o bug aqui (ATIVO checado, e se
+#      NEGATIVO também aparecer, o negativo vence) — pode ter o mesmo problema
+#      para bloqueio de veículos, mas não apareceu em nenhum dos 9 PDFs
+#      recebidos, então não mexi sem evidência real. Vale testar se aparecer
+#      um caso de RENAJUD no feedback.
 # ===========================================================================
 
 import os
@@ -680,14 +732,9 @@ KEYWORDS_CITACION_OK = [
     "fica citado",
     "devidamente citado",
     "ar positivo",
-    "certidao de decurso de prazo",
-    "decorreu o prazo legal sem qualquer manifestacao",
-    "decorreu o prazo legal",
-    "decurso de prazo",
     "nao se manifestou quanto ao pagamento",
     "apresentou embargos",
     "embargos foram opostos",
-    "citacao valida",
     "instrumento de confissao de divida e compromisso de pagamento parcelado",
     "instrumento de confissao de divida",
     "confissao de divida e compromisso",
@@ -696,7 +743,20 @@ KEYWORDS_CITACION_OK = [
     "ele aceitou a contrafe",
     "citado nos autos",
     "parcelamento de debitos",
+    # --- NOVOS (v8.0.2) ---
+    "regularmente citad",   # cobre "citado"/"citada" — despacho/decisão judicial
+    "citacao espontanea",   # comparecimento espontâneo supre a citação (art. 239, §1º CPC)
+    "citacaoespontanea",    # mesma frase, sem espaço — pdfplumber às vezes funde
+                             # palavras num bloco de texto (visto no caso 8086163-62.2019.8.05.0001)
 ]
+
+# [FIX citacao v8.0.2] Sinal forte e específico da Certidão de AR Digital do
+# TJBA: o campo de status "Documento Entregue" seguido do campo "Destinatário:"
+# nesse layout. Tratado à parte (regex, não string solta) porque "documento
+# entregue" sozinho é genérico demais para uma lista de substring livre.
+_PAT_CITACAO_DOCUMENTO_ENTREGUE = re.compile(
+    r"documento\s+entregue\s*[:\-]?\s*destinatario", re.IGNORECASE
+)
 
 KEYWORDS_CITACION_NAO_OK = [
     "aviso de recebimento negativo",
@@ -717,29 +777,28 @@ KEYWORDS_CITACION_NAO_OK = [
     "nao mora no endereco",
     "nao conhece o executado",
     "nao sabe informar o seu paradeiro",
-    "motivos de devolucao",
-    "mudou-se",
-    "nao procurado",
-    "nao existe o numero",
-    "endereco insuficiente",
-    "desconhecido",
-    "falecido",
+    # --- NOVOS (v8.0.2) ---
+    "ar devolvido sem cumprimento",              # Certidão de AR Digital — AR NÃO entregue
+    "motivo da devolucao:",                      # idem, precede o motivo específico
+    "diligencia de citacao resultou negativa",   # linguagem padrão de decisão/despacho (art. 40 LEF)
+    "citacao resultou negativa",
 ]
 
 
 def extract_citacion(text):
     text_norm = normalizar(text)
+    tem_ok_regex = bool(_PAT_CITACAO_DOCUMENTO_ENTREGUE.search(text_norm))
 
     if any(normalizar(k) in text_norm for k in KEYWORDS_CITACION_NAO_OK):
+        if tem_ok_regex:
+            return "HOUVE CITAÇÃO"
         for k_ok in KEYWORDS_CITACION_OK:
             if normalizar(k_ok) in text_norm:
                 return "HOUVE CITAÇÃO"
         return "NÃO HOUVE ou TENTATIVA FALHA"
 
-    if any(normalizar(k) in text_norm for k in KEYWORDS_CITACION_OK):
+    if tem_ok_regex or any(normalizar(k) in text_norm for k in KEYWORDS_CITACION_OK):
         return "HOUVE CITAÇÃO"
-
-    return "Citação não encontrado"
 
 
 # 5. Extraer resultado de la penhora
@@ -774,7 +833,14 @@ def extract_penhora(text):
         "extrato de bloqueio",
         "certidao de bloqueio",
         "comprovante de bloqueio",
+        # --- NOVO (v8.0.3) --- "foi concretizada" (fato passado, já ocorrido) é
+        # diferente de "reputa-se concretizada" (regra condicional de um despacho
+        # padrão, que aparece MESMO quando a penhora não se confirmou — ver caso
+        # 8110878-03.2021.8.05.0001, onde essa é só a instrução do juiz para
+        # quando/se a resposta vier positiva). Por isso a frase exige "foi".
+        "foi concretizada a penhora",
     ]
+    
     KEYWORDS_BACENJUD_NEGATIVO = [
         "resultado negativo da diligencia bacenjud",
         "resultado negativo da diligencia sisbajud",
@@ -889,17 +955,27 @@ def extract_penhora(text):
     if any(normalizar(k) in text_norm for k in KEYWORDS_PENHORA_CREDITOS):
         return "penhora de créditos/direitos"
 
+    # [FIX penhora v8.0.3 — feedback NTI/PGMS, processo 0784947-98.2018.8.05.0001]
+    # BACENJUD_NEGATIVO era checado ANTES de BACENJUD_POSITIVO/CONFIRMADO e
+    # retornava na hora — sem olhar se havia TAMBÉM uma confirmação positiva em
+    # outro ponto do mesmo PDF. Um processo de execução fiscal costuma ter VÁRIAS
+    # tentativas de bloqueio ao longo do tempo: é comum um banco responder "sem
+    # saldo positivo" (negativo) enquanto outro banco, ou uma tentativa anterior,
+    # teve bloqueio efetivo. Confirmado no PDF real: a mesma certidão SISBAJUD
+    # tinha "sem saldo positivo" (COOP SICREDI) E "valores bloqueados" — e a
+    # própria executada peticionou pedindo a conversão em renda "dos valores
+    # bloqueados na presente execução", prova inequívoca de que o bloqueio
+    # aconteceu. Corrigido: POSITIVO/CONFIRMADO agora tem prioridade sobre
+    # NEGATIVO, do mesmo jeito que o ramo SOLICITADO logo abaixo já fazia (cuja
+    # checagem interna de NEGATIVO/CONFIRMADO virou redundante e foi removida).
+    if any(normalizar(k) in text_norm for k in KEYWORDS_BACENJUD_POSITIVO) or \
+       any(normalizar(k) in text_norm for k in KEYWORDS_BACENJUD_CONFIRMADO):
+        return "penhora bacenjud/sisbajud"
+
     if any(normalizar(k) in text_norm for k in KEYWORDS_BACENJUD_NEGATIVO):
         return "tentativa de penhora bacenjud (negativa)"
 
-    if any(normalizar(k) in text_norm for k in KEYWORDS_BACENJUD_POSITIVO):
-        return "penhora bacenjud/sisbajud"
-
     if any(normalizar(k) in text_norm for k in KEYWORDS_BACENJUD_SOLICITADO):
-        if any(normalizar(k) in text_norm for k in KEYWORDS_BACENJUD_NEGATIVO):
-            return "tentativa de penhora bacenjud (negativa)"
-        if any(normalizar(k) in text_norm for k in KEYWORDS_BACENJUD_CONFIRMADO):
-            return "penhora bacenjud/sisbajud"
         return "sisbajud/bacenjud solicitado (resultado desconhecido)"
 
     if any(normalizar(k) in text_norm for k in KEYWORDS_TENTATIVA_PENHORA):
