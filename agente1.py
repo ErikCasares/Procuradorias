@@ -1,6 +1,6 @@
 # ===========================================================================
 # AGENTE 1 — Extração determinística de execuções fiscais (PGMS / HERA)
-# Versão 8.0
+# Versão 8.0.1
 #
 # MUDANÇAS EM RELAÇÃO A promptV7_1.py:
 #   1. [feedback 4] Removida a camada de juízo APTO / NÃO APTO. O Agente 1
@@ -17,6 +17,19 @@
 #
 # As funções de extração (datas, citação, penhora, entidades, sinais) foram
 # mantidas VERBATIM do V7_1 — lógica já validada, para não introduzir regressão.
+#
+# MUDANÇAS EM RELAÇÃO A v8.0 (Versão 8.0.1):
+#   5. [FIX — feedback NTI/PGMS 18/09/2026, processo 8090758-07.2019.8.05.0001]
+#      _extrair_numero_processo() pegava o PRIMEIRO número em formato CNJ no
+#      PDF inteiro, sem checar contexto. PDFs de execução fiscal costumam trazer
+#      anexado um extrato do PPI (parcelamento incentivado) com uma coluna
+#      "Inscrição" no MESMO formato CNJ — e esse extrato às vezes aparece ANTES
+#      da capa do processo no arquivo. Resultado: o campo numero_processo saía
+#      com o número de inscrição de OUTRO débito, não o do processo. Corrigido
+#      priorizando match perto de rótulo de capa ("Processo:", "Execução Fiscal
+#      n.", "Referência") e, no fallback sem rótulo, ignorando números que
+#      apareçam em contexto de tabela de parcelamento/PPI. Validado contra o
+#      PDF real do caso reportado (50 páginas).
 # ===========================================================================
 
 import os
@@ -1426,11 +1439,60 @@ def _extrair_numero_cda(text):
     return None
 
 
+_PAT_NUM_CNJ = re.compile(r"\d{7}-\d{2}\.\d{4}\.\d\.\d{2}\.\d{4}")
+
+# [FIX numero_processo v8.1] Rótulo típico de capa/certidão de processo
+# ("Processo:", "Execução Fiscal n.", "Autos n.", "Referência"). Usado para
+# preferir o número que está de fato identificando o processo, em vez do
+# primeiro CNJ-like encontrado no PDF inteiro.
+_PAT_NUM_CNJ_COM_ROTULO = re.compile(
+    r"(?:processo|execu[cç][aã]o\s*fiscal|autos?|refer[eê]ncia)"
+    r"[^\n\d]{0,25}n?[º°oO.]{0,3}\s*[:\s]?\s*"
+    r"(\d{7}-\d{2}\.\d{4}\.\d\.\d{2}\.\d{4})",
+    re.IGNORECASE,
+)
+
+# [FIX numero_processo v8.1] Contexto de extrato de parcelamento/PPI (Programa
+# de Parcelamento Incentivado). Esses extratos listam, numa coluna "Inscrição",
+# números de dívida ativa NO MESMO FORMATO CNJ — de OUTROS débitos, não do
+# processo. Um número que apareça perto dessas palavras é descartado.
+_PAT_CONTEXTO_PARCELAMENTO = re.compile(
+    r"inscri[cç][aã]o|\bppi\b|parcelamento incentivado|d[eé]bitos declarados|"
+    r"custas judiciais|despesa de cita[cç][aã]o",
+    re.IGNORECASE,
+)
+
+
 def _extrair_numero_processo(text):
-    """Extrae el número CNJ (NNNNNNN-DD.AAAA.J.TT.OOOO)."""
-    m = re.search(r"\d{7}-\d{2}\.\d{4}\.\d\.\d{2}\.\d{4}", text)
-    if m:
+    """
+    Extrae el número CNJ (NNNNNNN-DD.AAAA.J.TT.OOOO) del processo.
+
+    [FIX numero_processo v8.1] Antes: pegava o primeiro match do formato CNJ
+    em qualquer lugar do PDF (sem contexto) — vulnerável a extratos de PPI
+    anexados que trazem números de inscrição no mesmo formato (caso real:
+    8090758-07.2019.8.05.0001 saía como 8069599-71.2020.8.05.0001, número de
+    uma linha de "Inscrição" do extrato PPI que vinha antes da capa do
+    processo no PDF). Agora:
+      A) prioriza o número que aparece perto de um rótulo de capa/certidão de
+         processo, descartando os que caiam em contexto de tabela de PPI;
+      B) se nenhum rótulo for encontrado, cai para a busca livre antiga, mas
+         ainda ignorando números em contexto de PPI/parcelamento.
+    Continua podendo devolver None — nunca inventa valor.
+    """
+    for m in _PAT_NUM_CNJ_COM_ROTULO.finditer(text):
+        contexto_antes = text[max(0, m.start() - 150):m.start()]
+        contexto_apos  = text[m.start():m.end() + 30]
+        if _PAT_CONTEXTO_PARCELAMENTO.search(contexto_antes) or \
+           _PAT_CONTEXTO_PARCELAMENTO.search(contexto_apos):
+            continue
+        return m.group(1)
+
+    for m in _PAT_NUM_CNJ.finditer(text):
+        contexto_antes = text[max(0, m.start() - 80):m.start()]
+        if _PAT_CONTEXTO_PARCELAMENTO.search(contexto_antes):
+            continue
         return m.group(0)
+
     return None
 
 
