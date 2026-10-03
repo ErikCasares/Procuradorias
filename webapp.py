@@ -621,6 +621,12 @@ def _publico(lote: dict, incluir_log=False, incluir_analises=False) -> dict:
         "avisos"       : lote.get("avisos", []),
         "erro"         : lote.get("erro"),
         "totais"       : lote.get("totais"),
+        # [Fase 4] Quantos processos deste lote tiveram um valor reaproveitado
+        # do estado anterior DIVERGENTE do que saiu agora para o MESMO PDF
+        # (hash igual). Não é erro de código — é o Agente 1 avisando que algo
+        # mudou de interpretação e pede revisão humana. Fica None quando o
+        # Agente 1 ainda não chegou a gerar o JSON de traspasse.
+        "conflitos_detectados": lote.get("conflitos_detectados"),
     }
     if incluir_log:
         saida["log"] = lote.get("log", [])
@@ -822,6 +828,20 @@ async def _processar_lote(lote: dict):
         traspasse = saida_json / "saida_agente1_V8.json"
         if not traspasse.exists():
             raise RuntimeError("O Agente 1 não gerou o JSON de traspasse")
+
+        # [Fase 3/4] Lê a metadata que o Agente 1 grava no próprio JSON de
+        # traspasse — é a CONFIRMAÇÃO do que de fato rodou (o campo "campos" do
+        # lote é só o que foi PEDIDO) e se o merge (Fase 4) achou conflito. Sem
+        # isto, extração parcial e conflito de reaproveitamento só apareciam
+        # soterrados no log bruto — nenhum campo estruturado avisava o consumidor.
+        try:
+            with open(traspasse, encoding="utf-8") as f:
+                _meta_a1 = json.load(f).get("metadata", {})
+            lote["campos_confirmados"]   = _meta_a1.get("campos_processados")
+            lote["conflitos_detectados"] = _meta_a1.get("conflitos_detectados")
+        except Exception:
+            log.exception(f"Lote {lote_id}: falha ao ler metadata do Agente 1")
+
         # ── [V7.2] Auditoria — anexa as classificações do lote ao histórico compartilhado ──
         # O Agente 1 grava um JSONL na sua pasta ISOLADA (saida_json); aqui anexamos
         # ao arquivo COMPARTILHADO (PASTA_JSON), que acumula TODAS as decisões —
@@ -903,6 +923,29 @@ async def _processar_lote(lote: dict):
 
     finally:
         resumo, avisos = _diagnosticar(lote.get("log", []))
+
+        # [Fase 3/4] Avisos estruturados a partir da metadata confirmada pelo
+        # Agente 1 (ver bloco acima) — não do texto do log, que o consumidor da
+        # API não lê por padrão.
+        # Só avisa com a CONFIRMAÇÃO do Agente 1 (campos_confirmados não-nulo) —
+        # se ele falhou antes de chegar lá, o aviso de erro já conta a história,
+        # e listar aqui os campos pedidos como se fossem "faltantes" confundiria.
+        if lote.get("campos") and lote.get("campos_confirmados") is not None:
+            faltantes = sorted(_ETAPAS_VALIDAS - set(lote["campos_confirmados"]))
+            avisos.append(
+                f"Extração parcial — campos pedidos: {lote['campos']}. Os demais "
+                f"({', '.join(faltantes) or 'nenhum'}) vêm do último valor conhecido "
+                "deste processo, ou ficam vazios se for a primeira vez que ele é "
+                "processado."
+            )
+        if lote.get("conflitos_detectados"):
+            avisos.append(
+                f"{lote['conflitos_detectados']} conflito(s) de reaproveitamento "
+                "detectado(s) — um valor extraído agora ficou diferente do estado "
+                "anterior para o MESMO PDF (hash igual). Confira o JSON do Agente 1 "
+                "antes de usar o resultado."
+            )
+
         lote["resumo"] = resumo
         lote["avisos"] = avisos
         lote["concluido_em"] = _agora()
@@ -1156,8 +1199,12 @@ class Lote(BaseModel):
     campos      : str | None = Field(
         "todas",
         description="Etapas extraídas neste lote (Fase 3): citacao, penhora, "
-                    "movimentacao, sinais, entidades, tipo — ou 'todas'. "
-                    "Etapas não pedidas são reaproveitadas do estado anterior (merge).",
+                    "movimentacao, sinais, entidades, tipo — ou 'todas'. Ao pedir "
+                    "qualquer subconjunto, entidades e tipo são sempre incluídos "
+                    "também, mesmo que não tenham sido pedidos (são a identificação "
+                    "básica do processo, necessária pra saber de qual processo é o "
+                    "resto). Etapas não pedidas são reaproveitadas do estado "
+                    "anterior (merge), ou saem null se for a primeira vez.",
         examples=["todas"],
     )
     etapa       : str | None = Field(None, description="Passo corrente, para exibir a quem espera")
@@ -1188,6 +1235,14 @@ class Lote(BaseModel):
     )
     erro  : str | None = Field(None, description="Preenchido quando status é 'erro'")
     totais: Totais | None = Field(None, description="Só depois de concluído")
+    conflitos_detectados: int | None = Field(
+        None,
+        description="Quantos processos deste lote tiveram, para o MESMO PDF (hash "
+                    "igual), um valor novo diferente do estado anterior — o Agente 1 "
+                    "manteve o valor antigo e marcou para revisão humana. Veja também "
+                    "em `avisos`. None até o Agente 1 terminar.",
+        examples=[0],
+    )
 
 
 class LoteComLog(Lote):
@@ -1406,20 +1461,29 @@ _ETAPAS_VALIDAS = {"citacao", "penhora", "movimentacao", "sinais", "entidades", 
 def _normalizar_campos(campos: str) -> str:
     """
     Valida/normaliza a seleção de etapas (Fase 3 do Agente 1). Devolve string
-    separada por vírgula com as etapas válidas, ou "" quando é 'todas' (ou vazio),
-    que é como o Agente 1 entende "processar tudo". Etapas inválidas são descartadas.
+    separada por vírgula com as etapas válidas, ou "" quando é 'todas' (ou
+    vazio), que é como o Agente 1 entende "processar tudo". Etapas inválidas
+    são descartadas; se nada sobrar, processa tudo (mesmo critério permissivo
+    que agente1.py usa em `_parse_campos` pro próprio CAMPOS malformado).
+
+    [MUDANÇA] entidades e tipo agora são FORÇADOS sempre que a seleção não é
+    vazia/"todas" — mesmo que não tenham sido pedidos, e mesmo que o pedido
+    tente excluí-los. São a identificação básica do processo (CPF/CNPJ, nome,
+    CDA, valor) e o filtro de escopo (é execução fiscal?): sem eles não dá pra
+    saber de QUAL processo é o dado de citação/penhora/movimentação/sinais que
+    voltou. Antes dava pra pedir, por ex., só "penhora" e nada mais — quem
+    dependia disso agora também recebe entidades+tipo.
     """
     if not campos:
         return ""
-    pedidos = [c.strip().lower() for c in campos.split(",") if c.strip()]
-    seen, out = set(), []
-    for c in pedidos:
-        if c in _ETAPAS_VALIDAS and c not in seen:
-            seen.add(c)
-            out.append(c)
-    if not out or set(out) == _ETAPAS_VALIDAS:
-        return ""          # tudo -> Agente 1 roda todas as etapas (default)
-    return ",".join(out)
+    pedidos = {c.strip().lower() for c in campos.split(",") if c.strip()}
+    validos = pedidos & _ETAPAS_VALIDAS
+    if not validos:
+        return ""          # nada reconhecido -> processa tudo, por segurança
+    validos |= {"entidades", "tipo"}
+    if validos == _ETAPAS_VALIDAS:
+        return ""          # a união deu tudo -> mesma convenção de "" = todas
+    return ",".join(sorted(validos))
 
 
 async def _gravar_lote(arquivos: list, origem: str, campos: str = "") -> dict:
@@ -1540,9 +1604,17 @@ async def health():
 )
 async def criar_lote(
     arquivos: list[UploadFile] = File(..., description="Um ou mais PDFs de processos"),
-    campos: str = Form("", description="Etapas a extrair, separadas por vírgula "
-                       "(citacao,penhora,movimentacao,sinais,entidades,tipo). "
-                       "Vazio = todas. Etapas não pedidas são reaproveitadas do estado anterior."),
+    campos: str = Form(
+        "",
+        description="Quais análises pedir, entre citacao, penhora, movimentacao, "
+                    "sinais — separadas por vírgula. Vazio = todas. "
+                    "entidades e tipo são SEMPRE extraídos junto, mesmo que não "
+                    "sejam pedidos aqui: sem eles não dá pra saber de QUAL "
+                    "processo é o dado de citação/penhora que voltou. "
+                    "Etapas não pedidas são reaproveitadas do estado anterior "
+                    "daquele processo (ou saem null, se for a primeira vez).",
+        examples=["penhora"],
+    ),
     consumidor: str = Depends(autenticar_api),
 ):
     """
@@ -1551,7 +1623,24 @@ async def criar_lote(
 
     Responde **202 na hora**: o processamento é assíncrono e leva minutos. Guarde o
     `lote_id` e acompanhe em `GET /api/v1/lotes/{lote_id}` até o status virar
-    `concluido` ou `erro`.
+    `concluido` ou `erro`. Para pegar só os campos extraídos, recortados ao que
+    foi pedido (sem as demais chaves com `null`), use
+    `GET /api/v1/lotes/{lote_id}/dados`.
+
+    ### Pedindo só uma ou algumas etapas
+
+    Útil para reprocessar, por exemplo, só a penhora depois de uma correção,
+    sem pagar o custo de reler citação/movimentação/sinais que já estavam
+    certos: `-F campos=penhora`. entidades e tipo vêm sempre, por cima do que
+    foi pedido — não precisa (nem dá pra) excluir os dois.
+
+    O Agente 1 reaproveita, para as etapas NÃO pedidas, o último valor
+    conhecido daquele número de processo (Fase 4 — merge), guardado num estado
+    **compartilhado entre todos os lotes e consumidores** desta instância.
+    Para um processo nunca visto antes, as etapas não pedidas saem `null` — não
+    há de onde reaproveitar. Se o Agente 1 encontrar, para o MESMO PDF, um
+    valor diferente do que tinha guardado, isso vira um "conflito": confira
+    `conflitos_detectados` e `avisos` na resposta de `GET /api/v1/lotes/{lote_id}`.
 
     ### Mandando muitos PDFs de uma vez
 
@@ -1643,6 +1732,94 @@ def _lote_do_consumidor(lote_id: str, consumidor: str) -> dict:
     if not lote or lote.get("origem") != consumidor:
         raise HTTPException(404, "Lote não encontrado")
     return lote
+
+
+# Mantido em sincronia manual com _CAMPOS_POR_ETAPA em agente1.py — mapeia
+# cada etapa de CAMPOS para as chaves do JSON de saída que ela preenche.
+# Usado só para RECORTAR a resposta de GET /api/v1/lotes/{lote_id}/dados; o
+# arquivo bruto (agente1_json) nunca é tocado, e o Agente 2 sempre recebe o
+# JSON completo — o recorte é só uma projeção para quem pediu extração parcial.
+_CHAVES_POR_ETAPA = {
+    "citacao"     : ["status_citacao", "data_ordem_citacao",
+                      "data_tentativa_citacao", "data_citacao_efetiva"],
+    "penhora"     : ["resultado_penhora"],
+    "movimentacao": ["ultima_movimentacao", "dias_desde_ultima_movimentacao"],
+    "sinais"      : ["sinais_processuais"],
+}
+
+# Sempre presentes, pedidas ou não: identificam o processo e dizem se a
+# leitura do PDF deu certo. Sem isto, a resposta recortada não diria nem de
+# QUAL processo nem se o que falta é "não pedido" ou "PDF não pôde ser lido".
+_CHAVES_SEMPRE = ["arquivo", "numero_processo", "extracao_ok", "erro_extracao",
+                  "entidades", "tipo_processo"]
+
+
+def _recortar_processo(pr: dict, campos: str) -> dict:
+    """
+    Mantém só as chaves de _CHAVES_SEMPRE mais as da(s) etapa(s) pedida(s) em
+    `campos` ("" == todas as etapas de citação/penhora/movimentação/sinais,
+    sem recorte nenhum — mesmo conteúdo de sempre).
+    """
+    recortado = {k: pr.get(k) for k in _CHAVES_SEMPRE}
+    etapas = set(campos.split(",")) if campos else set(_CHAVES_POR_ETAPA)
+    for etapa in etapas:
+        for chave in _CHAVES_POR_ETAPA.get(etapa, []):
+            recortado[chave] = pr.get(chave)
+    if pr.get("conflitos"):
+        recortado["conflitos"] = pr["conflitos"]
+    return recortado
+
+
+@app.get(
+    "/api/v1/lotes/{lote_id}/dados",
+    tags=["Lotes"],
+    summary="Dados extraídos do lote, recortados ao que foi pedido",
+    responses={
+        200: {"description": "Um item por processo, só com as chaves pedidas"},
+        409: {"model": Erro, "description": "Lote ainda não concluído — continue o polling"},
+        **_ERROS_AUTH,
+        **_ERRO_LOTE,
+    },
+)
+async def dados_lote(lote_id: str, consumidor: str = Depends(autenticar_api)):
+    """
+    Um item por processo, com **só** as chaves que fazem sentido para o que foi
+    pedido neste lote: `arquivo`, `numero_processo`, `extracao_ok`,
+    `erro_extracao`, `entidades` e `tipo_processo` sempre vêm; as demais
+    (`status_citacao` + 3 datas, `resultado_penhora`, `ultima_movimentacao` +
+    `dias_desde_ultima_movimentacao`, `sinais_processuais`) só vêm se a etapa
+    correspondente estava em `campos` quando o lote foi criado em
+    `POST /api/v1/lotes` (ex.: `campos=penhora`). Um lote sem `campos`
+    (extração completa) devolve tudo, sem recorte nenhum.
+
+    Diferente de `GET .../arquivos/agente1_json` (o JSON **bruto**, sempre com
+    TODAS as chaves, usando `null` tanto para "não pedido" quanto para "pedido
+    e não encontrado"): aqui, uma chave ausente é inequivocamente "não foi
+    pedida nesta corrida" — sem a ambiguidade do `null`.
+
+    Só responde com status `concluido`; antes disso devolve `409`.
+    """
+    lote = _lote_do_consumidor(lote_id, consumidor)
+    if lote["status"] != "concluido":
+        raise HTTPException(409, f"Lote ainda em '{lote['status']}' — aguarde 'concluido'")
+
+    caminho = _dir_lote(lote_id) / "json" / "saida_agente1_V8.json"
+    if not caminho.exists():
+        raise HTTPException(
+            404,
+            "Este lote não tem dados do Agente 1 — pode ter falhado antes de "
+            "gerar o JSON de traspasse. Veja 'erro' em GET /api/v1/lotes/{lote_id}.",
+        )
+
+    with open(caminho, encoding="utf-8") as f:
+        bruto = json.load(f)
+
+    campos = lote.get("campos") or ""
+    return {
+        "lote_id"  : lote_id,
+        "campos"   : campos or "todas",
+        "processos": [_recortar_processo(pr, campos) for pr in bruto.get("processos", [])],
+    }
 
 
 def _resposta_arquivo(lote: dict, tipo: str, consumidor: str | None = None) -> FileResponse:
