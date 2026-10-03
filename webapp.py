@@ -2931,6 +2931,22 @@ _ENVIO_DOCS = ("""
 
   <div class="fila" id="hera-fila"></div>
 
+  <details style="margin-top:.9rem">
+    <summary style="cursor:pointer;font-size:.9rem;color:#5c6b7a">
+      Etapas a extrair (avançado) — por padrão, todas</summary>
+    <div id="hera-campos-box" style="display:flex;flex-wrap:wrap;gap:.8rem;margin-top:.6rem;font-size:.9rem">
+      <label><input type="checkbox" class="hera-campo" value="citacao" checked> Citação</label>
+      <label><input type="checkbox" class="hera-campo" value="penhora" checked> Penhora</label>
+      <label><input type="checkbox" class="hera-campo" value="movimentacao" checked> Movimentação</label>
+      <label><input type="checkbox" class="hera-campo" value="sinais" checked> Sinais (extinção/parcelamento/art.40)</label>
+    </div>
+    <p style="font-size:.85rem;color:#8b98a5;margin-top:.4rem">Entidades (CPF/CNPJ, CDA, valor…) e
+      Tipo (é execução fiscal?) vêm sempre junto, mesmo desmarcando tudo aqui — são a
+      identificação básica do processo. As etapas não marcadas são <b>reaproveitadas</b> do
+      que já foi extraído antes (ou saem vazias, se for a primeira vez). Útil para
+      reprocessar só uma etapa (ex.: só penhora) sem refazer o resto.</p>
+  </details>
+
   <div style="display:flex;gap:.6rem;align-items:center;flex-wrap:wrap;margin-top:.9rem">
     <button id="hera-enviar" disabled>Enviar e processar</button>
     <button class="g" id="hera-limpar" hidden>Limpar</button>
@@ -3077,8 +3093,13 @@ const MAX_MB = __MAX_MB__;
     estado.textContent = `Enviando ${quantos} PDF(s)…`;
 
     try {
+      // [Fase 3] etapas marcadas; se todas (ou nenhuma) -> "" = todas.
+      const marcados = Array.from(document.querySelectorAll('.hera-campo:checked')).map(c => c.value);
+      const todas = document.querySelectorAll('.hera-campo').length;
+      const campos = (marcados.length === 0 || marcados.length === todas) ? '' : marcados.join(',');
       const r = await enviarLote('/api/v1/lotes', Arquivos.itens, cab,
-                                 (env, tot) => { estado.textContent = textoProgresso(env, tot); });
+                                 (env, tot) => { estado.textContent = textoProgresso(env, tot); },
+                                 campos);
       if (!r.ok) {
         // Antes, um 413 do proxy (que responde HTML) fazia o r.json() estourar
         // e a tela mostrava "Falha de rede: Unexpected token '<'".
