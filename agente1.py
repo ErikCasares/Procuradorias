@@ -1,6 +1,6 @@
 # ===========================================================================
 # AGENTE 1 — Extração determinística de execuções fiscais (PGMS / HERA)
-# Versão 8.1.1
+# Versão 8.1.2
 #
 # MUDANÇAS EM RELAÇÃO A promptV7_1.py:
 #   1. [feedback 4] Removida a camada de juízo APTO / NÃO APTO. O Agente 1
@@ -125,6 +125,32 @@
 #      que a liberação "deverá" ocorrer após a expedição do alvará, no
 #      futuro). Preciso de um processo real em que o levantamento já tenha
 #      sido confirmado para validar essa metade.
+#
+# MUDANÇAS EM RELAÇÃO A v8.1.1 (Versão 8.1.2):
+#  10. [FIX x6 — comparação da saída do Agente 1 com a leitura manual do PDF
+#      real do processo 8086970-82.2019.8.05.0001 (40 págs.)]. Antes → depois:
+#      a) cpf_cnpj: 13.927.801/0001-49 (CNPJ do Município, exequente) → CPF do
+#         executado. O CNPJ do exequente agora é descartado direto
+#         (_CNPJS_EXEQUENTE; ampliável por env CNPJS_EXEQUENTE).
+#      b) valor_original/valor_atualizado: R$ 603,20 / R$ 1.182,50 → R$ 1.695,63 /
+#         R$ 3.330,35 (= valor da petição inicial). A dedup "1 CDA por exercício"
+#         descartava metade das CDAs quando havia 2 tributos no mesmo ano
+#         (IPTU + TRSD); a chave agora inclui o prefixo do número da certidão.
+#         [SUPOSIÇÃO — CONFIRMAR COM A PGMS] prefixo NN = tributo (60 IPTU, 61 TRSD).
+#      c) tipo_tributo: "inexistente registro aquisicao" (cabeçalho da Ficha da
+#         Propriedade) → "IPTU — …; TRSD — …". Lê a linha "Tributo …" de cada
+#         CDA, devolve todos os tributos distintos; TRSD adicionado à lista.
+#      d) exercicio: 2024 (da Ficha: IPTU do ano corrente) → 2015/2017. Prefere
+#         "exercício(s) de …" da petição e os exercícios das CDAs. IMPORTANTE:
+#         o Agente 2 usa este campo no alerta de prescrição (CTN art. 174).
+#      e) numero_cda: vazio → as 6 certidões ("Certidão de Débito n. …"),
+#         separadas por "; ". [SUPOSIÇÃO — CONFIRMAR] formato multi-valor.
+#      f) resultado_penhora: "sisbajud solicitado (resultado desconhecido)" →
+#         "penhora bacenjud/sisbajud" (bloqueio efetivo de R$ 7.490,36). Novas
+#         keywords de CONFIRMADO com a redação real do juízo.
+#      Testes de regressão (dados fictícios): tests/test_extracao_agente1.py.
+#      NÃO CORRIGIDO (depende de decisão da PGMS): data_tentativa_citacao /
+#      data_citacao_efetiva — ver resposta no chat.
 # ===========================================================================
 
 import os
@@ -882,6 +908,19 @@ def extract_penhora(text):
         # 8110878-03.2021.8.05.0001, onde essa é só a instrução do juiz para
         # quando/se a resposta vier positiva). Por isso a frase exige "foi".
         "foi concretizada a penhora",
+        # --- NOVOS (v8.1.2) --- [FIX penhora — PDF real, processo 8086970-82.2019.8.05.0001]
+        # O bloqueio Sisbajud foi efetivo (R$ 7.490,36, depositado em conta judicial),
+        # mas o resultado saía "sisbajud solicitado (resultado desconhecido)" porque
+        # nenhuma keyword de CONFIRMADO batia com a redação REAL do juízo:
+        #   - decisão: "...diligência que resultou integralmente exitosa, conforme
+        #     extrato acostado" (+ "Dê-se ciência ao Exequente acerca da penhora");
+        #   - carta de intimação: "a parte executada fica INTIMADA DA PENHORA
+        #     realizada via RENAJUD e SISBAJUD".
+        # Só entram frases de fato consumado. [SUPOSIÇÃO — CONFIRMAR] "parcialmente
+        # exitosa" (bloqueio parcial) provavelmente existe, mas não apareceu em
+        # nenhum PDF até agora, então não foi incluída.
+        "resultou integralmente exitosa",
+        "intimada da penhora realizada via",
     ]
     
     KEYWORDS_BACENJUD_NEGATIVO = [
@@ -1307,6 +1346,21 @@ _CTX_REJEITAR = (
     "signed by", "assinado por", "procurador ", "oab",
 )
  
+# [FIX cpf_cnpj v8.1.2 — PDF real, processo 8086970-82.2019.8.05.0001] O CNPJ do
+# MUNICÍPIO DO SALVADOR (o EXEQUENTE, que aparece em toda petição e CDA) saía
+# como se fosse o do executado: numa linha "Titular: Município de Salvador –
+# CNPJ: 13.927.801/0001-49" o rótulo "cnpj:" fica mais perto do número que o
+# "município de salvador", e o rótulo mais próximo vence (ver _rotulo_mais_
+# proximo) -> classificado como 'forte'; e no desempate CNPJ > CPF ele ganhava
+# do CPF real do executado. Rótulo por contexto nunca vai cobrir todos os
+# layouts; o CNPJ do exequente é um dado institucional fixo, então é descartado
+# direto, sem depender do rótulo. Ampliável por env (CNPJS_EXEQUENTE, só
+# dígitos, separados por vírgula) se a PGMS precisar incluir outros exequentes.
+_CNPJS_EXEQUENTE = {"13927801000149"} | {
+    _d for _d in (re.sub(r"\D", "", x) for x in
+                  os.environ.get("CNPJS_EXEQUENTE", "").split(",")) if _d
+}
+
 # Token candidato: começa e termina em dígito, só admite . - / no meio
 # (não cruza espaços, para não fundir "CEP 40230731 - 713", telefone, etc.).
 _RE_CANDIDATO = re.compile(r"\d[\d./-]{9,16}\d")
@@ -1356,6 +1410,8 @@ def _extrair_cpf_cnpj(text):
             tipo = "cpf"
         if not tipo:
             continue
+        if tipo == "cnpj" and dig in _CNPJS_EXEQUENTE:
+            continue   # CNPJ do exequente (Município) — nunca é o do executado
  
         ctx = tn[max(0, m.start() - _CTX_JANELA): m.start()]
         rotulo = _rotulo_mais_proximo(ctx)
@@ -1435,6 +1491,9 @@ def _float_to_brl(v):
  
  
 _RE_CDA_EXERCICIO   = re.compile(r"certidao de debito n\.?\s*\d{2}\.(\d{4})\.")
+# [v8.1.2] Número completo da Certidão de Débito (ex.: NN.AAAA.NNNNNN.NNNNN). O
+# prefixo de 2 dígitos distingue CDAs do MESMO exercício (ex.: IPTU x taxa).
+_RE_CDA_NUMERO      = re.compile(r"certidao de debito n[o°º.]?\s*(\d{2}\.\d{4}\.[\d.]+)")
 _RE_EXERCICIO_LABEL = re.compile(r"exercicio\s+(\d{4})")
 _RE_DATA_INSCR      = re.compile(r"data de inscricao\s*:?\s*(\d{2}/\d{2}/\d{4})")
 _RE_TOTAL_CDA       = re.compile(r"\btotal\s+r\$\s*([\d.,]+)")
@@ -1464,14 +1523,32 @@ def _coletar_cdas(tn):
         bloco = tn[marcadores[i]:marcadores[i + 1]]
         m_ex = _RE_CDA_EXERCICIO.search(bloco) or _RE_EXERCICIO_LABEL.search(bloco)
         exercicio = m_ex.group(1) if m_ex else None
+        m_num = _RE_CDA_NUMERO.search(bloco)
+        numero = m_num.group(1).rstrip(".") if m_num else None
+        prefixo = numero.split(".")[0] if numero else None
         m_dt  = _RE_DATA_INSCR.search(bloco)
         m_tot = _RE_TOTAL_CDA.search(bloco)
         m_ori = _RE_ORIGINARIO.search(bloco)
         if not m_tot and not m_ori:
             continue
         cdas.append({
-            # blocos sem exercício NÃO se fundem entre si (chave única por bloco)
-            "chave"         : exercicio or f"_bloco{i}",
+            # blocos sem exercício NÃO se fundem entre si (chave única por bloco).
+            # [FIX valores v8.1.2 — PDF real, processo 8086970-82.2019.8.05.0001]
+            # A chave era só o exercício, então 2 CDAs do MESMO exercício mas de
+            # tributos diferentes (aqui: IPTU 60.AAAA e TRSD 61.AAAA, 6 CDAs em 3
+            # exercícios) eram tratadas como "a mesma CDA reemitida" e só 1 de
+            # cada par entrava na soma: valor atualizado saía R$ 1.182,50 em vez
+            # de R$ 3.330,35 (o valor da própria petição inicial) e o original
+            # R$ 603,20 em vez de R$ 1.695,63. A chave agora inclui o prefixo
+            # do número da certidão (NN.AAAA.…); a reemissão da MESMA CDA
+            # (mesmo prefixo+exercício) continua sendo deduplicada.
+            # [SUPOSIÇÃO — CONFIRMAR COM A PGMS] que o prefixo de 2 dígitos
+            # identifica o tributo/natureza do débito (60=IPTU, 61=TRSD nos 6
+            # CDAs deste PDF); só isso o torna parte da chave.
+            "chave"         : (f"{prefixo}.{exercicio}" if (prefixo and exercicio)
+                               else (exercicio or f"_bloco{i}")),
+            "exercicio"     : exercicio,
+            "numero"        : numero,
             "data_inscricao": _parse_data(m_dt.group(1)) if m_dt else None,
             "total"         : _brl_to_float(m_tot.group(1)) if m_tot else None,
             "originario"    : _brl_to_float(m_ori.group(1)) if m_ori else None,
@@ -1559,6 +1636,8 @@ def _extrair_tipo_tributo(text):
         ("imposto predial territorial urbano",  "IPTU — Imposto Predial e Territorial Urbano"),
         ("imposto predial e territorial urbano", "IPTU — Imposto Predial e Territorial Urbano"),
         ("taxa de licenciamento",               "Taxa de Licenciamento de Estabelecimento"),
+        # [v8.1.2] TRSD aparece nas CDAs reais da PGMS (processo 8086970-82.2019.8.05.0001)
+        ("taxa de coleta de residuos solidos domiciliares", "TRSD — Taxa de Coleta de Resíduos Sólidos Domiciliares"),
         ("taxa de fiscalizacao de funcionamento","TFF — Taxa de Fiscalização de Funcionamento"),
         ("tff",                                  "TFF — Taxa de Fiscalização de Funcionamento"),
         ("cosip",                                "COSIP — Contribuição de Iluminação Pública"),
@@ -1580,10 +1659,33 @@ def _extrair_tipo_tributo(text):
         "credor",
         "municipio de salvador reu",
         "parte ativa",
+        # [FIX tipo_tributo v8.1.2] A "Ficha da Propriedade" anexada traz o
+        # cabeçalho "Espécie Inexistente  Registro Aquisição" (dados de
+        # aquisição do imóvel), e o 1º padrão abaixo ("espécie: ...") o
+        # devolvia como se fosse o tributo ("inexistente registro aquisicao").
+        "inexistente",
+        "registro aquisicao",
     ]
     _RUIDO_LEGAL = ["art.", "lei n", "lei no", "inciso", "paragrafo", "ans."]
 
     text_norm = normalizar(text)
+
+    # [FIX tipo_tributo v8.1.2] Cada Certidão de Débito traz uma linha própria
+    # "Tributo <nome>". Quando há CDAs de mais de um tributo no mesmo processo
+    # (caso real: IPTU + TRSD), devolve TODOS, na ordem em que aparecem, em vez
+    # do primeiro que casar. Só vale para linhas que COMEÇAM com "Tributo" (a
+    # linha "Do Tributo  Lei 7.186/2006…" da fundamentação legal não entra).
+    # [SUPOSIÇÃO — CONFIRMAR] formato do campo com vários tributos: "A; B".
+    achados = []
+    for m_tr in re.finditer(r"(?m)^[ \t]*tributo[ \t]+([^\n\r]{3,80})", text_norm):
+        frag = m_tr.group(1)
+        for kw, label in _TRIBUTOS:
+            if kw in frag:
+                if label not in achados:
+                    achados.append(label)
+                break
+    if achados:
+        return "; ".join(achados)
 
     for pat in [
         r"esp[eé]cie\s*[:\s]+([^\n\r]{3,60})",
@@ -1622,6 +1724,20 @@ def _extrair_numero_cda(text):
             valor = m.group(1).strip().rstrip(".")
             if len(re.sub(r"\D", "", valor)) >= 5:
                 return valor
+
+    # [FIX numero_cda v8.1.2] As CDAs da PGMS se intitulam "Certidão de Débito
+    # n. NN.AAAA.NNNNNN.NNNNN" (não "CDA n."), então os padrões acima nunca
+    # casavam e o campo saía vazio (e o Agente 2 avisava "CDA não extraída").
+    # Um processo costuma ter várias (caso real: 6) — devolve todas, sem
+    # repetir, na ordem do PDF. [SUPOSIÇÃO — CONFIRMAR] formato "A; B; C".
+    numeros = []
+    for m in re.finditer(r"certid[aã]o de d[eé]bito n[o°º.]?\s*(\d{2}\.\d{4}\.[\d.]+)",
+                         text, re.IGNORECASE):
+        n = m.group(1).rstrip(".")
+        if n not in numeros:
+            numeros.append(n)
+    if numeros:
+        return "; ".join(numeros)
     return None
 
 
@@ -1728,6 +1844,26 @@ def _extrair_exercicio(text):
         )
     if m_cda:
         return m_cda.group(1).strip()
+
+    # [FIX exercicio v8.1.2 — PDF real, processo 8086970-82.2019.8.05.0001]
+    # O padrão genérico logo abaixo pega o PRIMEIRO "exercício AAAA" do PDF
+    # inteiro — que aqui era o da "Ficha da Propriedade" (cálculo do IPTU do ano
+    # corrente: "Exercício 2024"), não o do débito cobrado (2015 a 2017).
+    # Efeito colateral grave: o Agente 2 usa o exercício para o alerta de
+    # prescrição (CTN art. 174), então um ano recente apaga o alerta.
+    # Antes do genérico, prefere-se as fontes que descrevem o DÉBITO:
+    #   (a) a petição inicial: "...exercício(s) de 2015/2016/2017...";
+    #   (b) os exercícios das Certidões de Débito anexas.
+    def _fmt_anos(anos):
+        anos = sorted(set(anos))
+        return anos[0] if len(anos) == 1 else f"{anos[0]}/{anos[-1]}"
+
+    m_pet = re.search(r"exerc[ií]cio\(?s?\)?\s+de\s+((?:\d{4}\s*/\s*)*\d{4})", text_norm)
+    if m_pet:
+        return _fmt_anos(re.findall(r"\d{4}", m_pet.group(1)))
+    anos_cda = [c["exercicio"] for c in _coletar_cdas(text_norm) if c.get("exercicio")]
+    if anos_cda:
+        return _fmt_anos(anos_cda)
 
     m = re.search(r"exerc[ií]cio\s*[:\s]*(\d{4}(?:[/\-]\d{4})?)", text_norm)
     if m:
@@ -2106,6 +2242,8 @@ def construir_evidencias(pages_text, status_citacao, status_penhora, entidades, 
         valor = ent.get(campo)
         if valor is None or str(valor).strip() == "":
             continue
+        if campo == "numero_cda" and "; " in str(valor):
+            valor = str(valor).split("; ")[0]   # várias CDAs: página da 1ª
         pag, trecho = _localizar_pagina_por_valor(pages_text, valor)
         ent_evid[campo] = _meta(pag, trecho)
     if ent_evid:
@@ -2769,7 +2907,7 @@ def exportar_json_agente2(prompts, output_json, total_ignorados=None):
     import json
     from datetime import datetime as _dt
 
-    VERSION_AGENTE1 = "8.1.1"
+    VERSION_AGENTE1 = "8.1.2"
 
     def _nulo(val):
         if val is None:
