@@ -1,3502 +1,2980 @@
-"""
-API e painel — Triagem de Execuções Fiscais
-HERA Tecnologia / PGMS — Contrato nº 01/2026
-
-Duas superfícies sobre o mesmo pipeline (Agente 1 → Agente 2):
-
-    /api/v1/*   API para sistemas externos (SIAP). Autenticação por token
-                Bearer. Assíncrona: o lote é aceito na hora e processado numa
-                fila; o consumidor acompanha por polling.
-
-    /painel     Interface do procurador. Autenticação por senha, sessão em
-                cookie. Mesmo pipeline, uso manual.
-
-    /api/docs   Swagger — o contrato que o integrador lê e testa. ReDoc em
-                /api/redoc, OpenAPI cru em /api/openapi.json.
-
-AUTENTICAÇÃO FALHA FECHADA — sem API_TOKENS configurado a API recusa tudo com
-503, e sem SENHA_PAINEL o painel não abre. É deliberado: uma configuração
-incompleta deixa o serviço inacessível, nunca aberto. Os relatórios carregam
-nome, CPF/CNPJ e valor de dívida, então o modo degradado seguro é negar.
-
-Por que assíncrono: OCR + GPT levam minutos por lote e qualquer proxy derruba
-a conexão antes do fim. O lote entra numa fila serial — um por vez, porque o
-OCR já satura a CPU.
-
-Isolamento: cada lote recebe pastas próprias em dados/lotes/<id>/, passadas
-aos agentes por variável de ambiente. Sem isso, dois lotes simultâneos se
-sobrescreveriam — o JSON de traspasse do Agente 1 tem nome fixo.
-
-Uso:
-    uvicorn webapp:app --host 0.0.0.0 --port 3000
-"""
+# ===========================================================================
+# AGENTE 1 — Extração determinística de execuções fiscais (PGMS / HERA)
+# Versão 8.1.1
+#
+# MUDANÇAS EM RELAÇÃO A promptV7_1.py:
+#   1. [feedback 4] Removida a camada de juízo APTO / NÃO APTO. O Agente 1
+#      agora SÓ EXTRAI e REPORTA fatos (datas, citação, penhora, sinais
+#      processuais, entidades). Não emite mais veredito jurídico — isso evita
+#      o "overread" apontado e mantém a decisão legal com o humano / Agente 2.
+#   2. [feedback 1] O JSON de saída agora inclui TODOS os processos (sem filtro
+#      por decisão) e TODOS os campos que aparecem na planilha.
+#   3. Removida a dependência da OpenAI. O Agente 1 é 100% determinístico e
+#      offline (ver bloco "LLM / GEMINI — NOTA DE ARQUITETURA" abaixo).
+#   4. Imports pesados (pdfplumber/pandas/openpyxl/pytesseract/pdf2image) são
+#      carregados sob demanda (lazy) para permitir testes unitários das
+#      funções puras sem exigir OCR/Poppler/Tesseract.
+#
+# As funções de extração (datas, citação, penhora, entidades, sinais) foram
+# mantidas VERBATIM do V7_1 — lógica já validada, para não introduzir regressão.
+#
+# MUDANÇAS EM RELAÇÃO A v8.0 (Versão 8.0.1):
+#   5. [FIX — feedback NTI/PGMS 18/09/2026, processo 8090758-07.2019.8.05.0001]
+#      _extrair_numero_processo() pegava o PRIMEIRO número em formato CNJ no
+#      PDF inteiro, sem checar contexto. PDFs de execução fiscal costumam trazer
+#      anexado um extrato do PPI (parcelamento incentivado) com uma coluna
+#      "Inscrição" no MESMO formato CNJ — e esse extrato às vezes aparece ANTES
+#      da capa do processo no arquivo. Resultado: o campo numero_processo saía
+#      com o número de inscrição de OUTRO débito, não o do processo. Corrigido
+#      priorizando match perto de rótulo de capa ("Processo:", "Execução Fiscal
+#      n.", "Referência") e, no fallback sem rótulo, ignorando números que
+#      apareçam em contexto de tabela de parcelamento/PPI. Validado contra o
+#      PDF real do caso reportado (50 páginas).
+#   6. [FIX — feedback NTI/PGMS 18/09/2026, processos 8014030-85.2020.8.05.0001,
+#      8110878-03.2021.8.05.0001, 0755766-52.2018.8.05.0001,
+#      8090758-07.2019.8.05.0001 e 8086163-62.2019.8.05.0001]
+#      extract_citacion() tinha duas causas de erro, uma em cada direção.
+#      (a) Falso negativo: as opções da legenda impressa do formulário de AR
+#      dos Correios ("mudou-se", "endereço insuficiente", "não procurado",
+#      "desconhecido", "falecido", "motivos de devolução") apareciam em
+#      QUALQUER AR — entregue ou não — por serem só a lista de opções do
+#      campo, não uma marcação real; isso disparava falso negativo em todo
+#      processo com AR positivo anexado. (b) Falso positivo: "citação válida"
+#      também aparecia em trechos que a NEGAM ("ausência de citação válida"),
+#      e "decurso de prazo"/"certidão de decurso de prazo" só provam que um
+#      prazo passou sem manifestação — o que não distingue citação válida
+#      (executado ficou calado) de citação FALHA (executado nunca soube do
+#      processo). Corrigido: removidas as palavras de legenda e as frases
+#      ambíguas; adicionados sinais mais específicos vindos da Certidão de AR
+#      Digital do TJBA ("AR Devolvido sem cumprimento"/"Documento Entregue")
+#      e da linguagem padrão de decisão judicial ("diligência de citação
+#      resultou negativa", "regularmente citado/a", "citação espontânea" —
+#      art. 239 §1º CPC, inclusive a variante sem espaço "citacaoespontanea"
+#      que aparece quando o pdfplumber funde palavras num bloco de texto).
+#      VALIDADO contra 9 dos 10 processos reais da planilha comparativa do
+#      NTI/PGMS: 9/9 recebidos bateram 100% com o gabarito (citação E número
+#      do processo); o 10º (0855250-11.2016.8.05.0001) não foi enviado.
+#      extract_penhora() e os demais campos de extract_entidades_agente2()
+#      continuam idênticos nos mesmos 9 PDFs — nenhuma regressão fora do
+#      escopo deste fix.
+#   7. (v8.0.3) [FIX — feedback NTI/PGMS 18/09/2026, processo 0784947-98.2018.8.05.0001,
+#      também confirmado em 8014030-85.2020.8.05.0001 e 8086163-62.2019.8.05.0001]
+#      extract_penhora() checava KEYWORDS_BACENJUD_NEGATIVO ANTES de POSITIVO/
+#      CONFIRMADO e retornava na hora — sem olhar se havia TAMBÉM confirmação
+#      positiva em outro ponto do mesmo PDF. Um processo costuma ter várias
+#      tentativas de bloqueio ao longo do tempo: é comum um banco responder "sem
+#      saldo positivo" enquanto outro banco (ou uma tentativa anterior) teve
+#      bloqueio efetivo. Confirmado nos PDFs reais: a mesma certidão SISBAJUD
+#      tinha "sem saldo positivo" de um banco E "valores bloqueados"/"penhora
+#      sisbajud" em outro ponto — inclusive a própria executada peticionando
+#      pedindo a conversão em renda "dos valores bloqueados". Corrigido:
+#      POSITIVO/CONFIRMADO agora tem prioridade sobre NEGATIVO (mesma lógica que
+#      o ramo SOLICITADO já usava). Adicionado também "foi concretizada a
+#      penhora" (fato passado) a CONFIRMADO — tomando cuidado de NÃO usar
+#      "reputa-se concretizada a penhora" sozinho, que é linguagem de despacho
+#      PADRÃO/condicional (aparece mesmo quando a penhora não se confirmou).
+#      VALIDADO: 9/9 processos recebidos bateram 100% (citação + número do
+#      processo + penhora); extract_citacion(), _extrair_numero_processo() e os
+#      demais campos de extract_entidades_agente2() continuam idênticos.
+#      RISCO CONHECIDO NÃO CORRIGIDO: KEYWORDS_RENAJUD_ATIVO tem a MESMA
+#      estrutura de precedência que causava o bug aqui (ATIVO checado, e se
+#      NEGATIVO também aparecer, o negativo vence) — pode ter o mesmo problema
+#      para bloqueio de veículos, mas não apareceu em nenhum dos 9 PDFs
+#      recebidos, então não mexi sem evidência real. Vale testar se aparecer
+#      um caso de RENAJUD no feedback.
+#
+# MUDANÇAS EM RELAÇÃO A v8.0.3 (Versão 8.1.0):
+#   8. [NOVO] Nova etapa selecionável 'alvara' (CAMPOS=alvara): detecta se há
+#      PEDIDO de expedição de alvará de levantamento e se há LEVANTAMENTO
+#      confirmado (extrato/comprovante) — ver extract_pedido_alvara() e
+#      extract_levantamento_alvara(). Saída em "status_alvara": {"pedido":
+#      ..., "levantamento": ...}, mesmo padrão de sinais_processuais — mas
+#      COM rastreamento de página (evidências), no mesmo nível de citação/
+#      penhora: evid['alvara']['pedido'/'levantamento'] traz
+#      encontrado_em_pagina/trecho/via_ocr, e isso também entra no merge/
+#      reaproveitamento (Fase 4) como as demais evidências.
+#      [SUPOSIÇÃO NÃO VALIDADA — PRECISA DE CONFIRMAÇÃO] As keywords foram
+#      inferidas do PADRÃO de linguagem já usado em citação/penhora/sinais
+#      (termos como "requer a expedição de alvará", "alvará de levantamento
+#      expedido"), mas NÃO foram testadas contra processos reais de alvará da
+#      PGMS — diferente dos fixes acima, que vieram do quadro comparativo do
+#      NTI/PGMS com PDFs de verdade. Preciso de exemplos reais (mascarados,
+#      sem dados pessoais) de processos com pedido/levantamento de alvará
+#      para validar e ajustar antes de considerar isto pronto.
+#      Regra do Agente 2 (como isso afeta prioridade/ação recomendada) ainda
+#      NÃO foi definida — fica para quando a extração estiver validada.
+#
+# MUDANÇAS EM RELAÇÃO A v8.1.0 (Versão 8.1.1):
+#   9. [FIX — primeiro PDF real de alvará testado, processo
+#      8086970-82.2019.8.05.0001] KEYWORDS_PEDIDO_ALVARA não batia com a
+#      redação real da petição da PGMS: "...vem, perante V. Exa., requerer
+#      a expedição de alvará eletrônico, para levantamento do montante
+#      depositado à disposição desse Juízo...". Duas causas: (a) a petição
+#      usa o INFINITIVO "requerer", e a keyword só cobria o presente
+#      "requer"; (b) a palavra "eletrônico" é intercalada entre "alvará" e
+#      a vírgula, quebrando o casamento de substring. Adicionadas variantes
+#      cobrindo "requerer a expedição de alvará" e "alvará eletrônico, para
+#      levantamento", além de "a fim de ser expedido o respectivo alvará
+#      judicial" (o Ato Ordinatório do cartório que precede a petição,
+#      pedindo os dados bancários ao Exequente — primeiro sinal de que o
+#      alvará está em curso). VALIDADO: pedido agora é detectado tanto na
+#      petição quanto no Ato Ordinatório desse processo real.
+#      LEVANTAMENTO continua [SUPOSIÇÃO NÃO VALIDADA] — o processo testado
+#      ainda não chegou a essa fase (os extratos anexados mostram saldo
+#      disponível mas "Retiradas: R$ 0,00" em todos, e o próprio texto diz
+#      que a liberação "deverá" ocorrer após a expedição do alvará, no
+#      futuro). Preciso de um processo real em que o levantamento já tenha
+#      sido confirmado para validar essa metade.
+# ===========================================================================
 
 import os
 import re
-import sys
-import json
-import shutil
-import hashlib
 import tempfile
-import secrets
-import asyncio
+import unicodedata
+from datetime import datetime
 import logging
-from collections import deque
-from contextlib import asynccontextmanager
-from datetime import datetime, timedelta
-from enum import Enum
-from pathlib import Path
-from typing import Any
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from fastapi import (
-    Cookie, Depends, FastAPI, File, Form, HTTPException,
-    Query, Request, Security, UploadFile,
-)
-from fastapi.openapi.docs import get_swagger_ui_html
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from pydantic import BaseModel, ConfigDict, Field
+# Dependências pesadas são importadas DENTRO das funções que as usam (lazy
+# import). Assim o módulo pode ser importado para testes das funções puras de
+# extração sem exigir OCR/Poppler/Tesseract/pandas instalados — e, se faltar
+# alguma, o erro aparece de forma visível no ponto de uso, dizendo qual falta.
 
-import buscar_processo
 
-# A rota /api/v1/processos executa `buscar_processo.py` como subprocess (Opção A):
-# roda o arquivo inteiro e devolve a saída formatada do main(), para a API e o
-# terminal nunca divergirem.
+# Função para normalizar texto (remover acentos, convertir a minúsculas)
+def normalizar(text):
+    if not text:
+        return ""
+    return unicodedata.normalize('NFKD', text).encode('ASCII', 'ignore').decode('ASCII').lower()
+
+# Función para extraer fechas de un texto normalizado
+def _extraer_fechas_de_texto(text_norm):
+    # Patrones para extraer fechas (tanto con meses completos como abreviados)
+    _MESES_COMPLETOS = {
+        "janeiro": 1, "fevereiro": 2, "marco": 3, "abril": 4,
+        "maio": 5, "junho": 6, "julho": 7, "agosto": 8,
+        "setembro": 9, "outubro": 10, "novembro": 11, "dezembro": 12
+    }
+    _MESES_ABREV = {
+        "jan": 1, "fev": 2, "mar": 3, "abr": 4,
+        "mai": 5, "jun": 6, "jul": 7, "ago": 8,
+        "set": 9, "out": 10, "nov": 11, "dez": 12
+    }
+    _PATRON_COMPLETO = r"(\d{1,2}) de (janeiro|fevereiro|marco|abril|maio|junho|julho|agosto|setembro|outubro|novembro|dezembro) de (\d{4})"
+    _PATRON_ABREV    = r"(\d{1,2})\s+(jan|fev|mar|abr|mai|jun|jul|ago|set|out|nov|dez)\.?\s+(\d{4})"
+    fechas = []
+    for dia, mes_txt, anio in re.findall(_PATRON_COMPLETO, text_norm):
+        fechas.append(datetime(int(anio), _MESES_COMPLETOS[mes_txt], int(dia)))
+    for dia, mes_txt, anio in re.findall(_PATRON_ABREV, text_norm):
+        if mes_txt in _MESES_ABREV:
+            fechas.append(datetime(int(anio), _MESES_ABREV[mes_txt], int(dia)))
+    return fechas
+
+
+# Esto silencia los logs internos de la librería que genera esos mensajes
+logging.getLogger('pdfminer').setLevel(logging.ERROR)
+logging.basicConfig(level=logging.INFO)
+
+# Directorio de entrada y salida
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Las tres carpetas son sobreescribibles por variable de entorno para que la
+# infraestructura (o cada lote) pueda dar su propio espacio aislado.
+input_directory  = os.environ.get("PASTA_ENTRADA")    or os.path.join(CURRENT_DIR, "processos pra analiser")
+PASTA_JSON       = os.environ.get("PASTA_JSON")       or os.path.join(CURRENT_DIR, "JSON")
+PASTA_RESULTADOS = os.environ.get("PASTA_RESULTADOS") or os.path.join(CURRENT_DIR, "resultados")
+
+# [Fase 2] Cache do texto/OCR por hash do PDF. Fica junto ao script (CURRENT_DIR),
+# NÃO em PASTA_JSON — porque PASTA_JSON pode ser isolada por lote e o cache precisa
+# ser COMPARTILHADO entre execuções/lotes para valer a pena. Sobrescrevível por env.
+#   USAR_CACHE=0     desliga o cache (sempre reextrai).
+#   CACHE_REFRESH=1  ignora o cache existente e regrava (forçar releitura).
+# Docker: montar PASTA_CACHE num volume persistente, senão o cache some ao sair.
+PASTA_CACHE   = os.environ.get("PASTA_CACHE") or os.path.join(CURRENT_DIR, "cache_ocr")
+USAR_CACHE    = os.environ.get("USAR_CACHE", "1").strip().lower() not in ("0", "false", "nao", "não", "off")
+CACHE_REFRESH = os.environ.get("CACHE_REFRESH", "0").strip().lower() in ("1", "true", "sim", "on")
+
+
+# --- Configuração do OCR (usado só nas páginas digitalizadas) ---
 #
-# [V7.3] A rota de atalho /api/v1/lotes/{lote_id}/processo (1 PDF por lote), lá
-# embaixo, já importa `buscar_dados` direto: a resposta dela é JSON estruturado
-# (ProcessoConsultado), não o texto do CLI, então não há o que formatar e depois
-# desformatar — e chamar a função é mais barato que abrir um subprocesso.
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [web] %(levelname)s — %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-log = logging.getLogger("webapp")
-
-
-# ════════════════════════════════════════════════════════════════
-# CONFIGURAÇÃO
-# ════════════════════════════════════════════════════════════════
-
-BASE_DIR      = Path(__file__).resolve().parent
-
-# Compartilhadas — o histórico acumulativo do procurador vive aqui
-PASTA_JSON    = BASE_DIR / "JSON"
-PASTA_RESULT  = BASE_DIR / "resultados"
-
-# Por lote
-PASTA_DADOS   = BASE_DIR / "dados"
-PASTA_LOTES   = PASTA_DADOS / "lotes"
-ARQ_REGISTRO  = PASTA_DADOS / "registro.json"
-
-# Planilhas recortadas por consumidor, montadas sob demanda. Não é histórico:
-# pode ser apagada a qualquer momento que a próxima chamada refaz.
-PASTA_RECORTES = PASTA_DADOS / "recortes"
-
-
-# Pasta de entrada do uso manual por linha de comando (compatibilidade)
-PASTA_ENTRADA_PADRAO = BASE_DIR / "processos pra analiser"
-
-# Prefixos que somem do log devolvido ao consumidor: ele não precisa da árvore
-# de diretórios do servidor, e mostrá-la só ajuda quem for atacar o serviço.
-# Os mais longos primeiro, para o prefixo maior casar antes do menor.
-_PREFIXOS_INTERNOS = tuple(sorted(
-    (str(PASTA_LOTES), str(PASTA_DADOS), str(PASTA_JSON), str(PASTA_RESULT),
-     str(PASTA_ENTRADA_PADRAO), str(BASE_DIR)),
-    key=len, reverse=True,
-))
-
-MAX_MB_LOTE    = int(os.getenv("MAX_MB_LOTE", "500"))
-
-# Teto por etapa (Agente 1, depois Agente 2). A fila é serial: sem teto, um
-# agente travado segura todos os lotes seguintes para sempre. Uma hora é folga
-# suficiente para um lote grande e ainda assim destrava o serviço sozinho.
-TIMEOUT_AGENTE_S = int(os.getenv("TIMEOUT_AGENTE_S", "3600"))
-
-# Retenção em disco. Os PDFs recebidos são o que pesa — o do cliente tem 100 MB
-# cada. Zero desliga a limpeza (mantém tudo, como era antes).
-RETENCAO_PDF_DIAS  = int(os.getenv("RETENCAO_PDF_DIAS", "7"))
-RETENCAO_LOTE_DIAS = int(os.getenv("RETENCAO_LOTE_DIAS", "90"))
-
-# Quantas linhas de log ficam GRAVADAS por lote. Em memória vale MAX_LINHAS_LOG;
-# no arquivo, menos: o registro é reserializado inteiro a cada salvamento.
-MAX_LINHAS_LOG_DISCO = 120
-MAX_LINHAS_LOG = 500
-HORAS_SESSAO   = int(os.getenv("HORAS_SESSAO", "12"))
-COOKIE_SEGURO  = os.getenv("COOKIE_SEGURO", "0") == "1"
-
-
-# ── Credenciais ──────────────────────────────────────────────────
+# Tudo ajustável por variável de ambiente: é isto que o operador precisa mexer
+# quando falta memória no container, e recompilar a imagem para trocar uma
+# constante não é opção em produção.
 #
-# O ambiente guarda HASHES, não segredos. Variável de ambiente não é cofre:
-# o valor aparece na UI do Easypanel, em `docker inspect`, em /proc/<pid>/environ
-# e em dump de erro. Com hash, quem ler qualquer um desses caminhos não autentica.
-#
-# Os segredos são emitidos por gerar_credencial.py, que mostra o valor uma única
-# vez e nunca o grava.
-#
-# SHA-256 direto basta para os tokens da API — são 256 bits aleatórios, sem
-# força bruta viável. A senha do painel é escolhida por gente, entropia baixa,
-# atacável por dicionário: essa usa scrypt, lento de propósito.
-
-SCRYPT_MAXMEM = 64 * 1024 * 1024
-PREFIXO_TOKEN = "pgms_live_"   # marca dos segredos emitidos por gerar_credencial.py
-
-_tokens_legado = []    # rótulos ainda configurados em texto puro
-_erros_config  = []    # credenciais malformadas — nunca autenticariam ninguém
-
-
-def _hash_valido(valor: str) -> bool:
-    """SHA-256 em hexadecimal: 64 caracteres de 0-9a-f."""
-    return len(valor) == 64 and all(c in "0123456789abcdef" for c in valor)
-
-
-def _carregar_tokens() -> dict:
-    """
-    API_TOKENS no formato "rotulo:sha256:<hash>", separado por vírgula.
-    Devolve {hash: rotulo}.
-
-    Aceita ainda "rotulo:<token>" em texto puro — formato antigo, mantido para
-    não trancar um serviço já configurado. Nesse caso o hash é calculado aqui e
-    o rótulo entra em _tokens_legado, que vira aviso no startup.
-
-    Um hash malformado é DESCARTADO com erro em _erros_config, não aceito
-    silenciosamente. Guardar um hash que nenhum token gera faria a API recusar
-    todo mundo com 401 sem explicar por quê — o erro mais caro de diagnosticar.
-    """
-    bruto = os.getenv("API_TOKENS", "").strip()
-    tokens = {}
-    for parte in bruto.split(","):
-        parte = parte.strip()
-        if not parte:
-            continue
-
-        # O segredo emitido pelo gerador começa com o prefixo. Se ele aparece
-        # aqui, o par foi invertido: colaram o token no lugar do hash.
-        if parte.startswith(PREFIXO_TOKEN) or f":{PREFIXO_TOKEN}" in parte:
-            _erros_config.append(
-                "API_TOKENS contém o TOKEN em vez do hash — o valor que começa "
-                f"com '{PREFIXO_TOKEN}' é o segredo que vai para o consumidor, não "
-                "para o ambiente. Use a linha 'API_TOKENS=...' que o gerador "
-                "imprime no passo 2."
-            )
-            continue
-
-        if ":" not in parte:
-            _erros_config.append(
-                f"API_TOKENS: a entrada {parte[:20]!r}... não tem ':' separando "
-                "o rótulo do hash. O formato é 'rotulo:sha256:<hash>'."
-            )
-            continue
-
-        rotulo, _, resto = parte.partition(":")
-        rotulo, resto = rotulo.strip(), resto.strip()
-        if not rotulo or not resto:
-            _erros_config.append(f"API_TOKENS: entrada incompleta em {parte[:30]!r}")
-            continue
-
-        if resto.lower().startswith("sha256:"):
-            digest = resto[7:].strip().lower()
-            if not _hash_valido(digest):
-                _erros_config.append(
-                    f"API_TOKENS['{rotulo}']: o hash tem {len(digest)} caractere(s) e "
-                    f"deveria ter 64 em hexadecimal. Parece estar em base64 ou truncado. "
-                    f"Gere de novo com 'python gerar_credencial.py api {rotulo}'."
-                )
-                continue
-        else:
-            digest = hashlib.sha256(resto.encode()).hexdigest()
-            _tokens_legado.append(rotulo)
-
-        tokens[digest] = rotulo
-    return tokens
-
-
-def _conferir_scrypt(senha: str, guardado: str) -> bool:
-    """Valida contra 'scrypt$n$r$p$salt_hex$hash_hex'."""
+# Custo medido por página: 300dpi≈1,27s · 200dpi≈0,73s · 150dpi≈0,52s. Antes de
+# baixar o DPI, compare a "Confiança OCR (%)" da planilha contra uma amostra
+# real digitalizada.
+def _env_int(nome, padrao, minimo=1):
+    bruto = os.environ.get(nome)
+    if bruto is None or str(bruto).strip() == "":
+        return padrao
     try:
-        alg, n, r, p, salt_hex, hash_hex = guardado.split("$")
-        if alg != "scrypt":
-            return False
-        calc = hashlib.scrypt(
-            senha.encode(), salt=bytes.fromhex(salt_hex),
-            n=int(n), r=int(r), p=int(p), maxmem=SCRYPT_MAXMEM, dklen=32,
-        )
-        return secrets.compare_digest(calc.hex(), hash_hex)
-    except Exception:
-        return False
-
-
-def _validar_hash_senha(valor: str) -> bool:
-    """Confere o formato scrypt$n$r$p$salt_hex$hash_hex antes de aceitar."""
-    if not valor:
-        return False
-    partes = valor.split("$")
-    if len(partes) != 6 or partes[0] != "scrypt":
-        _erros_config.append(
-            "SENHA_PAINEL_HASH não está no formato esperado "
-            "'scrypt$n$r$p$salt$hash'. Gere de novo com "
-            "'python gerar_credencial.py painel'."
-        )
-        return False
-    try:
-        int(partes[1]), int(partes[2]), int(partes[3])
-        bytes.fromhex(partes[4]), bytes.fromhex(partes[5])
+        return max(minimo, int(str(bruto).strip()))
     except ValueError:
-        _erros_config.append(
-            "SENHA_PAINEL_HASH tem o formato certo mas conteúdo inválido. "
-            "Gere de novo com 'python gerar_credencial.py painel'."
+        logging.warning(f"{nome}={bruto!r} não é um número — usando o padrão {padrao}")
+        return padrao
+
+
+OCR_DPI       = _env_int("OCR_DPI", 200)
+OCR_MIN_CHARS = _env_int("OCR_MIN_CHARS", 20)
+OCR_IDIOMA    = os.environ.get("OCR_IDIOMA") or "por"
+
+# Agrupamento das páginas de OCR em lotes, para reduzir chamadas ao Poppler.
+OCR_CLUSTER_GAP = _env_int("OCR_CLUSTER_GAP", 5)
+
+# Lote e paralelismo governam o PICO DE MEMÓRIA. Uma página A4 a 200 DPI ocupa
+# ~12 MB descomprimida; o padrão anterior (40 páginas × 4 workers) chegava a
+# vários GB e era morto pelo OOM num container de 1-2 GB.
+OCR_MAX_LOTE    = _env_int("OCR_MAX_LOTE", 10)
+OCR_MAX_WORKERS = _env_int("OCR_MAX_WORKERS", 2)
+
+
+def _pagina_necesita_ocr(texto_pagina, min_chars=OCR_MIN_CHARS):
+    """
+    pdfplumber devuelve None o una cadena muy corta cuando la página
+    es una imagen escaneada sin capa de texto digital.
+    """
+    if texto_pagina is None:
+        return True
+    return len(texto_pagina.strip()) < min_chars
+
+
+def _agrupar_paginas_en_lotes(paginas_ocr, gap_maximo=OCR_CLUSTER_GAP, max_lote=OCR_MAX_LOTE):
+    """
+    Agrupa números de página que necesitan OCR en rangos (inicio, fin)
+    inclusive, para minimizar la cantidad de llamadas a Poppler.
+    """
+    if not paginas_ocr:
+        return []
+    paginas_ordenadas = sorted(paginas_ocr)
+    lotes_brutos = []
+    inicio = anterior = paginas_ordenadas[0]
+    for p in paginas_ordenadas[1:]:
+        if p - anterior > gap_maximo:
+            lotes_brutos.append((inicio, anterior))
+            inicio = p
+        anterior = p
+    lotes_brutos.append((inicio, anterior))
+
+    lotes_finales = []
+    for ini, fin in lotes_brutos:
+        cursor = ini
+        while cursor <= fin:
+            sub_fin = min(cursor + max_lote - 1, fin)
+            lotes_finales.append((cursor, sub_fin))
+            cursor = sub_fin + 1
+    return lotes_finales
+
+
+def _ocr_lote(pdf_path, inicio, fin, paginas_necesarias, dpi=OCR_DPI, idioma=OCR_IDIOMA):
+    """
+    Renderiza o intervalo [inicio, fin] numa única chamada ao Poppler e aplica
+    OCR apenas nas páginas de `paginas_necesarias` dentro desse intervalo.
+    Devolve {numero_pagina: (texto_extraido, confianca_0_a_100)}.
+
+    As páginas são renderizadas para ARQUIVOS num diretório temporário e
+    abertas UMA POR VEZ. A versão anterior recebia a lista de imagens do lote
+    inteiro na memória: 40 páginas a 300 DPI ≈ 1 GB por lote, multiplicado
+    pelos lotes em paralelo — era o que matava o container em PDF grande.
+    """
+    # Import preguiçoso, e falha visível: a ausência de OCR não derruba o lote
+    # inteiro — devolve texto vazio para essas páginas e registra o motivo.
+    try:
+        import pytesseract
+        from pytesseract import Output
+        from pdf2image import convert_from_path
+        from PIL import Image
+    except ImportError as e:
+        logging.error(
+            f"Dependência de OCR ausente ({e}). Página(s) {sorted(paginas_necesarias)} "
+            f"de {os.path.basename(pdf_path)} ficarão sem texto. "
+            f"Instale pytesseract/pdf2image + tesseract-ocr-por + poppler-utils.",
+            exc_info=True,
         )
-        return False
-    return True
+        return {p: ("", 0.0) for p in paginas_necesarias}
+
+    resultados = {}
+    nome_pdf = os.path.basename(pdf_path)
+
+    with tempfile.TemporaryDirectory(prefix="ocr-") as tmp:
+        try:
+            caminhos = convert_from_path(
+                pdf_path, dpi=dpi, first_page=inicio, last_page=fin,
+                output_folder=tmp, paths_only=True, fmt="png",
+            )
+        except Exception as e:
+            logging.error(
+                f"Erro ao renderizar as páginas {inicio}-{fin} de {nome_pdf}: {e}",
+                exc_info=True,
+            )
+            return {p: ("", 0.0) for p in paginas_necesarias}
+
+        for offset, caminho_img in enumerate(caminhos):
+            numero_pagina = inicio + offset
+            if numero_pagina not in paginas_necesarias:
+                continue          # esta página do intervalo já tinha texto digital
+            try:
+                with Image.open(caminho_img) as imagem:
+                    dados = pytesseract.image_to_data(
+                        imagem, lang=idioma, output_type=Output.DICT
+                    )
+                palavras, confiancas = [], []
+                for texto, conf in zip(dados["text"], dados["conf"]):
+                    if not (texto or "").strip():
+                        continue
+                    palavras.append(texto)
+                    try:
+                        valor = float(conf)
+                    except (TypeError, ValueError):
+                        continue
+                    if valor >= 0:    # o tesseract usa -1 quando não calcula
+                        confiancas.append(valor)
+                resultados[numero_pagina] = (
+                    " ".join(palavras),
+                    sum(confiancas) / len(confiancas) if confiancas else 0.0,
+                )
+            except Exception as e:
+                logging.error(
+                    f"Erro de OCR na página {numero_pagina} de {nome_pdf}: {e}",
+                    exc_info=True,
+                )
+                resultados[numero_pagina] = ("", 0.0)
+
+    # Página que o Poppler nem chegou a entregar entra como vazia, para o
+    # chamador nunca receber um dicionário incompleto.
+    for pagina in paginas_necesarias:
+        resultados.setdefault(pagina, ("", 0.0))
+    return resultados
 
 
-TOKENS            = _carregar_tokens()
-_hash_senha_bruto = os.getenv("SENHA_PAINEL_HASH", "").strip()
-SENHA_PAINEL_HASH = _hash_senha_bruto if _validar_hash_senha(_hash_senha_bruto) else ""
-SENHA_PAINEL      = os.getenv("SENHA_PAINEL", "").strip()   # legado, em texto puro
-PAINEL_ATIVO      = bool(SENHA_PAINEL_HASH or SENHA_PAINEL)
+# --- Filtro de tipo de documento: ¿es una execução fiscal de dívida ativa? ---
+KEYWORDS_CLASSE_EXECUCAO_FISCAL = [
+    "execucao fiscal",
+    "execucoes fiscais",
+    "cobranca da divida ativa",
+    "cobranca de divida ativa",
+    "execucao da divida ativa",
+]
+
+KEYWORDS_CLASSE_NAO_FISCAL = [
+    "obrigacao de fazer",
+    "mandado de seguranca",
+    "acao civil publica",
+    "fornecimento de medicamento",
+    "sem registro na anvisa",
+    "indenizacao por dano",
+    "alvara judicial",
+    "usucapiao",
+    "interdicao",
+    "acao popular",
+    "desapropriacao",
+]
+
+KEYWORDS_TEXTO_EXECUCAO_FISCAL = [
+    "execucao fiscal",
+    "exequente",
+    "certidao de divida ativa",
+    "cda no", "cda n.", "cda no.",
+    "lei 6.830", "lei n. 6.830", "lei no 6.830",
+    "divida ativa",
+    "embargos a execucao fiscal",
+    "penhora",
+]
+
+KEYWORDS_TEXTO_NAO_FISCAL = [
+    "obrigacao de fazer",
+    "fornecimento de medicamento",
+    "tratamento medico",
+    "anvisa",
+    "sistema unico de saude",
+    "alimentos",
+    "guarda do menor",
+    "uniao estavel",
+    "usucapiao",
+    "mandado de seguranca",
+]
 
 
-def _senha_confere(enviada: str) -> bool:
-    if SENHA_PAINEL_HASH:
-        return _conferir_scrypt(enviada, SENHA_PAINEL_HASH)
-    if SENHA_PAINEL:
-        return secrets.compare_digest(enviada, SENHA_PAINEL)
-    return False
+def _extraer_classe_assunto(text_norm):
+    """
+    Busca el campo 'Classe - Assunto:' típico de las capas administrativas del PJe.
+    """
+    m = re.search(r"classe\s*[-/]?\s*assunto\s*:?\s*(.{0,300})", text_norm, re.DOTALL)
+    if not m:
+        return None
+    fragmento = re.sub(r"\s+", " ", m.group(1))
+    corte = re.split(
+        r"reclamante|requerente|autor|orgao julgador|exequente|executado|reclamado",
+        fragmento
+    )[0]
+    return corte.strip()
 
 
-# ════════════════════════════════════════════════════════════════
-# AUTENTICAÇÃO
-# ════════════════════════════════════════════════════════════════
+def detectar_tipo_processo(text):
+    """
+    Determina si el texto corresponde a una execução fiscal de dívida ativa.
+    Devuelve dict con es_execucao_fiscal, confianza, motivo, classe_assunto.
+    """
+    text_norm = normalizar(text)
+    classe_assunto = _extraer_classe_assunto(text_norm)
 
-_sessoes = {}   # token de sessão → validade (datetime)
+    if classe_assunto:
+        if any(normalizar(k) in classe_assunto for k in KEYWORDS_CLASSE_NAO_FISCAL):
+            return {
+                "es_execucao_fiscal": False,
+                "confianza": "alta",
+                "motivo": f"Classe-Assunto indica outro tipo de ação: '{classe_assunto[:150]}'",
+                "classe_assunto": classe_assunto,
+            }
+        if any(normalizar(k) in classe_assunto for k in KEYWORDS_CLASSE_EXECUCAO_FISCAL):
+            return {
+                "es_execucao_fiscal": True,
+                "confianza": "alta",
+                "motivo": f"Classe-Assunto confirma execução fiscal: '{classe_assunto[:150]}'",
+                "classe_assunto": classe_assunto,
+            }
+        # Campo encontrado pero ambiguo: cae a la heurística por conteo
 
-# Falhas de login POR IP. Global e sem IP, dez senhas erradas de qualquer origem
-# trancavam o painel para todo mundo por cinco minutos — inclusive para o
-# procurador que sabe a senha. Num serviço publicado, isso é negação de serviço
-# de graça.
-_falhas_login = {}          # ip → deque de timestamps
-MAX_FALHAS_LOGIN = 10
-JANELA_FALHAS_MIN = 5
+    score_fiscal = sum(1 for k in KEYWORDS_TEXTO_EXECUCAO_FISCAL if normalizar(k) in text_norm)
+    score_nao_fiscal = sum(1 for k in KEYWORDS_TEXTO_NAO_FISCAL if normalizar(k) in text_norm)
 
-# Declarado como esquema de segurança para o Swagger mostrar o botão Authorize —
-# o integrador cola o token uma vez e testa todas as rotas. auto_error=False
-# porque as mensagens de erro daqui explicam o que fazer; as do FastAPI não.
-_bearer = HTTPBearer(
-    scheme_name="Token do consumidor",
-    description=(
-        "Token emitido por `python gerar_credencial.py api <rotulo>`. "
-        "Cole só o token — o Swagger acrescenta o prefixo `Bearer`."
-    ),
-    auto_error=False,
+    if score_fiscal == 0 and score_nao_fiscal == 0:
+        # [FIX escopo] Sem NENHUM marcador fiscal, o mais provável é que NÃO seja
+        # execução fiscal (ex.: PDF de outra matéria). Antes o padrão era True/baixa,
+        # o que fazia PDFs sem relação aparecerem como "Sim/baixa".
+        return {
+            "es_execucao_fiscal": False,
+            "confianza": "baixa",
+            "motivo": "Nenhum marcador de execução fiscal encontrado — provavelmente fora de escopo",
+            "classe_assunto": classe_assunto,
+        }
+
+    es_fiscal = score_fiscal >= score_nao_fiscal
+    return {
+        "es_execucao_fiscal": es_fiscal,
+        "confianza": "media",
+        "motivo": f"Heurística por contagem de palavras-chave: fiscal={score_fiscal}, não-fiscal={score_nao_fiscal}",
+        "classe_assunto": classe_assunto,
+    }
+
+
+# 1. Extraer texto de PDF por páginas
+def extract_text_by_page(pdf_path):
+    """
+    Extrae texto de cada página. Páginas sin texto digital suficiente se agrupan
+    en lotes y se procesan con OCR en paralelo.
+    Devuelve (list[str], metadata_dict).
+    """
+    import pdfplumber  # lazy import — falla visible aquí si no está instalado
+
+    textos = {}
+    with pdfplumber.open(pdf_path) as pdf:
+        total_paginas = len(pdf.pages)
+        paginas_que_necesitan_ocr = []
+        for i, page in enumerate(pdf.pages, start=1):
+            texto = page.extract_text()
+            if _pagina_necesita_ocr(texto):
+                paginas_que_necesitan_ocr.append(i)
+                textos[i] = None  # completado na fase de OCR
+            else:
+                textos[i] = texto
+            # O pdfplumber guarda o parse de cada página lida. Sem liberar,
+            # um PDF de mil páginas retém vários GB antes mesmo do OCR — era
+            # metade do estouro de memória nos processos grandes.
+            page.flush_cache()
+            limpar = getattr(getattr(page, "get_textmap", None), "cache_clear", None)
+            if limpar:
+                limpar()
+
+    metadata = {"paginas_ocr": [], "confianza_ocr": {}}
+
+    if paginas_que_necesitan_ocr:
+        lotes = _agrupar_paginas_en_lotes(paginas_que_necesitan_ocr)
+        necesarias_por_lote = {
+            (ini, fin): set(p for p in paginas_que_necesitan_ocr if ini <= p <= fin)
+            for ini, fin in lotes
+        }
+        logging.info(
+            f"  {os.path.basename(pdf_path)}: {len(paginas_que_necesitan_ocr)} página(s) "
+            f"precisam de OCR, agrupadas em {len(lotes)} lote(s) (até {OCR_MAX_WORKERS} em paralelo)"
+        )
+        with ThreadPoolExecutor(max_workers=OCR_MAX_WORKERS) as executor:
+            futuros = {
+                executor.submit(_ocr_lote, pdf_path, ini, fin, necesarias_por_lote[(ini, fin)]): (ini, fin)
+                for ini, fin in lotes
+            }
+            concluidos = 0
+            for futuro in as_completed(futuros):
+                ini, fin = futuros[futuro]
+                concluidos += 1
+                try:
+                    resultado_lote = futuro.result()
+                    for numero_pagina, (texto_ocr, confianza) in resultado_lote.items():
+                        textos[numero_pagina] = texto_ocr
+                        metadata["paginas_ocr"].append(numero_pagina)
+                        metadata["confianza_ocr"][numero_pagina] = round(confianza, 1)
+                    logging.info(f"  Lote {concluidos}/{len(lotes)} concluído (páginas {ini}-{fin})")
+                except Exception as e:
+                    logging.error(f"Lote {ini}-{fin} de {pdf_path} falhou: {e}", exc_info=True)
+
+    metadata["paginas_ocr"].sort()
+    lista_textos = [textos[i] for i in range(1, total_paginas + 1)]
+    return lista_textos, metadata
+
+
+# 2. Filtrar texto relevante con palabras clave
+def filter_text_by_keywords(text, keywords):
+    relevant_lines = []
+    norm_keywords = [normalizar(k) for k in keywords]
+    for line in text.splitlines():
+        if any(kw in normalizar(line) for kw in norm_keywords):
+            relevant_lines.append(line)
+    return " ".join(relevant_lines)
+
+
+# 3. Obtener la fecha más reciente en el texto
+KEYWORDS_MOVIMENTACAO_PROCESSUAL = [
+    "despacho", "decisao interlocutoria", "decisao",
+    "sentenca", "acordao",
+    "conferi.", "digitei, eu",
+    "certidao de publicacao de relacao",
+    "certidao de remessa da intimacao",
+    "certidao de intimacao",
+    "ciencia da intimacao",
+    "certidao de publicacao",
+    "pede deferimento",
+    "pede juntada",
+    "vem requerer",
+    "vem expor e requerer",
+    "vem, por seu procurador",
+    "vem, perante",
+    "vem, respeitosamente",
+    "nestes termos, pede deferimento",
+    "requer a v. exa",
+    "requer a vossa excelencia",
+    "por seu procurador infrafirmado",
+    "por sua procuradora infrafirmada",
+    "por seu procurador ao fim assinado",
+    "vem aduzir e requerer",
+    "reiterar pedido",
+    "certifico que",
+    "certifico, para os devidos fins",
+    "o referido e verdade e dou fe",
+    "o referido e verdade",
+    "ato ordinatorio",
+    "cumpra-se",
+    "publique-se. intime-se",
+    "salvador (ba),",
+    "salvador, ba,",
+    "data da intimacao",
+    "encaminhado para intimacao no portal eletronico",
+]
+
+def fecha_ultima_movimentacao(text):
+    """
+    Solo considera fechas cercanas a keywords de movimentación processual,
+    ignorando fechas de fichas cadastrais, extratos y consultas CNPJ.
+    """
+    text_norm = normalizar(text)
+    fechas = []
+
+    MARCADORES_EXCLUSION = [
+        "ficha cadastral",
+        "extrato fiscal",
+        "consulta de dados via cpf",
+        "dados do cnpj",
+        "dados de empresa via cnpj",
+        "posicao de debito",
+        "certidao de divida ativa",
+        "termo de confissao de divida",
+    ]
+    excl_norm = [normalizar(m) for m in MARCADORES_EXCLUSION]
+
+    for keyword in KEYWORDS_MOVIMENTACAO_PROCESSUAL:
+        keyword_norm = normalizar(keyword)
+        for match in re.finditer(re.escape(keyword_norm), text_norm):
+            start = max(0, match.start() - 300)
+            end   = match.end() + 300
+            fragmento_norm = text_norm[start:end]
+
+            if any(marker in fragmento_norm for marker in excl_norm):
+                continue
+
+            fechas_encontradas = _extraer_fechas_de_texto(fragmento_norm)
+            if fechas_encontradas:
+                fechas.extend(fechas_encontradas)
+
+    if not fechas:
+        return _fecha_mas_reciente_fallback(text)
+
+    return max(fechas)
+
+
+def _fecha_mas_reciente_fallback(text):
+    """
+    Fallback: escanea todo el texto pero excluye secciones de fichas cadastrais,
+    extratos y consultas CNPJ.
+    """
+    MARCADORES_EXCLUSION = [
+        "ficha cadastral",
+        "extrato fiscal",
+        "consulta de dados via cpf",
+        "dados do cnpj",
+        "dados de empresa via cnpj",
+        "posicao de debito",
+        "certidao de divida ativa",
+        "termo de confissao de divida",
+    ]
+
+    lineas = text.split("\n")
+    lineas_filtradas = []
+    excluir = False
+
+    for linea in lineas:
+        linea_norm = normalizar(linea)
+        if any(normalizar(m) in linea_norm for m in MARCADORES_EXCLUSION):
+            excluir = True
+        if any(kw in linea_norm for kw in ["poder judiciario", "comarca de salvador", "despacho", "decisao", "certidao"]):
+            excluir = False
+        if not excluir:
+            lineas_filtradas.append(linea)
+
+    texto_filtrado = "\n".join(lineas_filtradas)
+    fechas = _extraer_fechas_de_texto(normalizar(texto_filtrado))
+    return max(fechas) if fechas else None
+
+
+def _limpar_referencias_legais(text_norm):
+    """
+    Remove datas de referencias legais (decretos, leis, resolucoes) e datas de
+    assinatura de CDAs para evitar que sejam capturadas como datas de citacao.
+    """
+    padroes = [
+        r'decreto\s+\w+\s+n\w*\s*\d+,?\s*de\s+\d{1,2}\s+de\s+\w+\s+de\s+\d{4}',
+        r'decreto\s+n\w*\s*[\d\.]+,?\s*de\s+\d{1,2}\s+de\s+\w+\s+de\s+\d{4}',
+        r'lei\s+n\w*\s*[\d\.]+,?\s*de\s+\d{1,2}\s+de\s+\w+\s+de\s+\d{4}',
+        r'resolucao\s+n\w*\s*\d+,?\s*de\s+\d{1,2}\s+de\s+\w+\s+de\s+\d{4}',
+        r'instrucao\s+normativa\s+\w*\s*[\d\.]+,?\s*de\s+\d{1,2}\s+de\s+\w+\s+de\s+\d{4}',
+        r'portaria\s+n\w*\s*[\d\.]+,?\s*de\s+\d{1,2}\s+de\s+\w+\s+de\s+\d{4}',
+        r'certifico que se acha inscrito[^S]{0,400}?salvador,?\s*\d{1,2}\s+de\s+\w+\s+de\s+\d{4}',
+        r'estes sao os elementos contidos[^S]{0,200}?salvador,?\s*\d{1,2}\s+de\s+\w+\s+de\s+\d{4}',
+        r'salvador,?\s*\d{1,2}\s+de\s+\w+\s+de\s+\d{4}\s+raimundo\s+cordeiro',
+        r'salvador,?\s*\d{1,2}\s+de\s+\w+\s+de\s+\d{4}\s+\w+\s+cordeiro',
+        r'coordenador\s+da\s+cda',
+    ]
+    result = text_norm
+    for pat in padroes:
+        result = re.sub(pat, ' [REF_LEGAL] ', result)
+    return result
+
+
+def extraer_fecha_cercana(text, keywords, ventana=500, prefer='latest', min_year=1990):
+    """
+    Busca fechas cerca de las ocurrencias de `keywords`.
+    prefer='latest' devuelve la más reciente; 'earliest' la más antigua.
+    """
+    text_norm = _limpar_referencias_legais(normalizar(text))
+    fechas = []
+    for keyword in keywords:
+        kw_norm = normalizar(keyword)
+        for match in re.finditer(re.escape(kw_norm), text_norm):
+            start = max(0, match.start() - ventana)
+            end = match.end() + ventana
+            fechas_local = _extraer_fechas_de_texto(text_norm[start:end])
+            fechas_local = [f for f in fechas_local if f.year >= min_year]
+            if fechas_local:
+                fechas.extend(fechas_local)
+    if not fechas:
+        return None
+    if prefer == 'earliest':
+        return min(fechas)
+    return max(fechas)
+
+
+def extraer_fechas_citacion(text):
+    """
+    Extrae fecha_orden, fecha_intento y fecha_efectiva relacionadas a la citación.
+    """
+    KEYWORDS_ORDEN_ESPECIFICAS = [
+        "determino a citação",
+        "ordeno a citação",
+        "expeça-se o competente mandado de citação",
+        "expeça-se carta de citação",
+        "expeça-se mandado de citação",
+        "proceda-se à citação",
+        "promova-se a citação",
+        "expedir carta de citação",
+        "diligencie-se para citação",
+        "ao oficial de justiça, cite",
+        "cite-se por edital", "citação por edital",
+        "converta-se em mandado de citação",
+    ]
+    KEYWORDS_ORDEN_GENERICAS = [
+        "expeça-se citação",
+        "seja citado", "sejam citados",
+        "citem-se",
+        "cite-se",
+        "cite(m)-se",
+        "proceda-se a citacao",
+        "proceda-se a citação",
+        "o presente despacho servira como mandado",
+        "registre-se.",
+        "publique-se. registre-se",
+    ]
+    KEYWORDS_ORDEN = KEYWORDS_ORDEN_ESPECIFICAS + KEYWORDS_ORDEN_GENERICAS
+
+    KEYWORDS_INTENTO_APOS = [
+        "conferi.",
+        "digitei, eu",
+    ]
+    KEYWORDS_INTENTO = [
+        "carta com ar", "aviso de recebimento", "tentativa",
+        "aviso de recebimento negativo",
+    ]
+
+    KEYWORDS_EFECTIVA = [
+        "recebido", "assinado", "assinatura", "assinatura do recebedor", "recebido em", "recebido com"
+    ]
+
+    fecha_orden = extraer_fecha_cercana(text, KEYWORDS_ORDEN, ventana=800, prefer='earliest')
+
+    import re as _re
+    def _fecha_intento_apos(text_norm, keywords, min_year=1990):
+        """Busca data apenas APÓS o keyword (ventana_antes=10)."""
+        fechas = []
+        for kw in keywords:
+            kw_norm = normalizar(kw)
+            for m in _re.finditer(_re.escape(kw_norm), text_norm):
+                trecho = text_norm[max(0, m.start()-10): m.end()+300]
+                fs = [f for f in _extraer_fechas_de_texto(trecho) if f.year >= min_year]
+                fechas.extend(fs)
+        return min(fechas) if fechas else None
+
+    text_norm_clean = _limpar_referencias_legais(normalizar(text))
+    fecha_intento = _fecha_intento_apos(text_norm_clean, KEYWORDS_INTENTO_APOS)
+    if not fecha_intento:
+        fecha_intento = extraer_fecha_cercana(text, KEYWORDS_INTENTO, ventana=500, prefer='earliest')
+
+    fecha_efectiva = extraer_fecha_cercana(text, KEYWORDS_EFECTIVA, ventana=400, prefer='earliest')
+
+    logging.debug(f"  fecha_orden (primera):    {fecha_orden}")
+    logging.debug(f"  fecha_intento (primera):  {fecha_intento}")
+    logging.debug(f"  fecha_efectiva (posible): {fecha_efectiva}")
+
+    return fecha_orden, fecha_intento, fecha_efectiva
+
+
+# 4. Extraer estado de citación
+# [Fase 1] Listas movidas ao nível de módulo — MESMA fonte usada pelo extractor
+# (veredito) e pelo localizador de evidência (página/trecho), sem divergência.
+KEYWORDS_CITACION_OK = [
+    "certifico que procedi a citacao",
+    "certifico que o executado foi citado",
+    "certifico que citei",
+    "certifico ter realizado a citacao",
+    "fica citado",
+    "devidamente citado",
+    "ar positivo",
+    "nao se manifestou quanto ao pagamento",
+    "apresentou embargos",
+    "embargos foram opostos",
+    "instrumento de confissao de divida e compromisso de pagamento parcelado",
+    "instrumento de confissao de divida",
+    "confissao de divida e compromisso",
+    "exarou o ciente",
+    "aceitou a contrafe que lhe foi oferecida",
+    "ele aceitou a contrafe",
+    "citado nos autos",
+    "parcelamento de debitos",
+    # --- NOVOS (v8.0.2) ---
+    "regularmente citad",   # cobre "citado"/"citada" — despacho/decisão judicial
+    "citacao espontanea",   # comparecimento espontâneo supre a citação (art. 239, §1º CPC)
+    "citacaoespontanea",    # mesma frase, sem espaço — pdfplumber às vezes funde
+                             # palavras num bloco de texto (visto no caso 8086163-62.2019.8.05.0001)
+]
+
+# [FIX citacao v8.0.2] Sinal forte e específico da Certidão de AR Digital do
+# TJBA: o campo de status "Documento Entregue" seguido do campo "Destinatário:"
+# nesse layout. Tratado à parte (regex, não string solta) porque "documento
+# entregue" sozinho é genérico demais para uma lista de substring livre.
+_PAT_CITACAO_DOCUMENTO_ENTREGUE = re.compile(
+    r"documento\s+entregue\s*[:\-]?\s*destinatario", re.IGNORECASE
 )
 
-
-def autenticar_api(
-    credencial: HTTPAuthorizationCredentials = Security(_bearer),
-) -> str:
-    """Valida o Bearer token e devolve o rótulo do consumidor."""
-    if not TOKENS:
-        raise HTTPException(
-            503,
-            "API sem credenciais configuradas. Defina API_TOKENS no ambiente "
-            "do serviço no formato 'rotulo:token'.",
-        )
-
-    if not credencial or credencial.scheme.lower() != "bearer":
-        raise HTTPException(
-            401,
-            "Envie o token no cabeçalho: Authorization: Bearer <token>",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-
-    enviado = credencial.credentials.strip()
-    # Hash do que chegou, comparado com os hashes guardados. compare_digest é
-    # de tempo constante — o tempo de resposta não vaza quanto do token acertou.
-    digest = hashlib.sha256(enviado.encode()).hexdigest()
-    for guardado, rotulo in TOKENS.items():
-        if secrets.compare_digest(digest, guardado):
-            return rotulo
-
-    raise HTTPException(401, "Token inválido", headers={"WWW-Authenticate": "Bearer"})
+KEYWORDS_CITACION_NAO_OK = [
+    "aviso de recebimento negativo",
+    "intime-se a fazenda publica para que adote as providencias cabiveis",
+    "o reu nao foi citado",
+    "executado nao foi citado",
+    "sem citacao do executado",
+    "nao houve citacao",
+    "ausencia de citacao",
+    "nao logrando exito na citacao",
+    "nao foi possivel realizar a citacao",
+    "a parte executada nao foi citada",
+    "deixei de proceder a citacao",
+    "deixei de citar",
+    "nao encontrado o executado",
+    "nao foi localizado o executado",
+    "nao reside no endereco",
+    "nao mora no endereco",
+    "nao conhece o executado",
+    "nao sabe informar o seu paradeiro",
+    # --- NOVOS (v8.0.2) ---
+    "ar devolvido sem cumprimento",              # Certidão de AR Digital — AR NÃO entregue
+    "motivo da devolucao:",                      # idem, precede o motivo específico
+    "diligencia de citacao resultou negativa",   # linguagem padrão de decisão/despacho (art. 40 LEF)
+    "citacao resultou negativa",
+]
 
 
-def _sessao_valida(cookie: str) -> bool:
-    if not cookie:
-        return False
-    validade = _sessoes.get(cookie)
-    if not validade:
-        return False
-    if datetime.now() > validade:
-        _sessoes.pop(cookie, None)
-        return False
-    return True
+def extract_citacion(text):
+    text_norm = normalizar(text)
+    tem_ok_regex = bool(_PAT_CITACAO_DOCUMENTO_ENTREGUE.search(text_norm))
+
+    if any(normalizar(k) in text_norm for k in KEYWORDS_CITACION_NAO_OK):
+        if tem_ok_regex:
+            return "HOUVE CITAÇÃO"
+        for k_ok in KEYWORDS_CITACION_OK:
+            if normalizar(k_ok) in text_norm:
+                return "HOUVE CITAÇÃO"
+        return "NÃO HOUVE ou TENTATIVA FALHA"
+
+    if tem_ok_regex or any(normalizar(k) in text_norm for k in KEYWORDS_CITACION_OK):
+        return "HOUVE CITAÇÃO"
 
 
-def exigir_painel(sessao: str = Cookie(None)):
-    if not PAINEL_ATIVO:
-        raise HTTPException(
-            503,
-            "Painel sem senha configurada. Gere o hash com "
-            "'python gerar_credencial.py painel' e defina SENHA_PAINEL_HASH.",
-        )
-    if not _sessao_valida(sessao):
-        raise HTTPException(401, "Sessão expirada ou ausente")
-    return True
+# 5. Extraer resultado de la penhora
+def extract_penhora(text):
+    KEYWORDS_BACENJUD_POSITIVO = [
+        "bloqueio bacenjud", "penhora bacenjud",
+        "bloqueio sisbajud", "penhora sisbajud",
+        "penhora on-line", "penhora online",
+    ]
+    KEYWORDS_BACENJUD_SOLICITADO = [
+        "via sistema sisbajud",
+        "via sistema bacenjud",
+        "via bacenjud",
+        "via sisbajud",
+        "sistema sisbajud",
+        "sistema bacenjud",
+        "bloqueio de dinheiro/ativos financeiros",
+        "bloqueio de ativos financeiros",
+        "requer o bloqueio de dinheiro",
+        "bacen jud",
+        "sis bajud",
+        "nos moldes do bacen jud",
+        "nos moldes do bacenjud",
+    ]
+    KEYWORDS_BACENJUD_CONFIRMADO = [
+        "valores bloqueados",
+        "bloqueio efetuado",
+        "bloqueio realizado",
+        "dinheiro bloqueado",
+        "penhora on-line efetuada",
+        "penhora online efetuada",
+        "extrato de bloqueio",
+        "certidao de bloqueio",
+        "comprovante de bloqueio",
+        # --- NOVO (v8.0.3) --- "foi concretizada" (fato passado, já ocorrido) é
+        # diferente de "reputa-se concretizada" (regra condicional de um despacho
+        # padrão, que aparece MESMO quando a penhora não se confirmou — ver caso
+        # 8110878-03.2021.8.05.0001, onde essa é só a instrução do juiz para
+        # quando/se a resposta vier positiva). Por isso a frase exige "foi".
+        "foi concretizada a penhora",
+    ]
+    
+    KEYWORDS_BACENJUD_NEGATIVO = [
+        "resultado negativo da diligencia bacenjud",
+        "resultado negativo da diligencia sisbajud",
+        "suspensao pelo art. 40 da lef",
+        "sem saldo positivo",
+        "nao ha saldo",
+        "bacenjud sem exito",
+        "sisbajud sem exito",
+        "diligencia bacenjud restou infrutifera",
+        "diligencia sisbajud restou infrutifera",
+        "bloqueio desbloqueado",
+        "desbloqueio do valor",
+        "nao possui relacionamento com as instituicoes financeiras",
+        "cpf indicado nao possui relacionamento",
+        "cnpj indicado nao possui relacionamento",
+        "negativa bacenjud",
+        "ar negativo e/ou negativa bacenjud",
+        "negativa do bacenjud",
+        "bacenjud negativo",
+        "resultado bacenjud negativo",
+        "nao possui relacionamentos com",
+        "cpf nao possui relacionamento",
+        "tentativa de penhora on-line",
+    ]
+
+    KEYWORDS_RENAJUD_ATIVO = [
+        "comprovante de inclusao de restricao veicular",
+        "insercao de restricao veicular",
+        "bloqueio renajud",
+        "restricao renajud",
+        "penhora de veiculo",
+        "auto de penhora de veiculo",
+    ]
+    KEYWORDS_RENAJUD_NEGATIVO = [
+        "renajud sem exito",
+        "restricao renajud cancelada",
+        "nao foram localizados veiculos",
+        "pesquisa renajud negativa",
+    ]
+
+    KEYWORDS_PENHORA_IMOVEL = [
+        "penhora de imovel",
+        "penhora do imovel",
+        "registro de penhora",
+        "matricula do imovel penhorado",
+        "imovel penhorado",
+        "termo de penhora de imovel",
+        "penhora sobre imovel",
+    ]
+
+    KEYWORDS_PENHORA_FATURAMENTO = [
+        "penhora de faturamento",
+        "penhora sobre faturamento",
+        "penhora sobre o faturamento",
+        "deposito de percentual do faturamento",
+    ]
+
+    KEYWORDS_INDISPONIBILIDADE = [
+        "indisponibilidade de bens",
+        "decretada a indisponibilidade",
+        "cnib",
+        "cadastro nacional de indisponibilidade",
+    ]
+
+    KEYWORDS_PENHORA_QUOTAS = [
+        "penhora de quotas",
+        "penhora de cotas",
+        "penhora de participacao societaria",
+        "penhora de acoes",
+    ]
+
+    KEYWORDS_PENHORA_CREDITOS = [
+        "penhora de creditos",
+        "penhora de precatorio",
+        "penhora de direitos",
+        "penhora de direitos hereditarios",
+        "penhora de aplicacao financeira",
+    ]
+
+    KEYWORDS_TENTATIVA_PENHORA = [
+        "termo de penhora",
+        "auto de penhora e avaliacao",
+        "diligencia de penhora",
+        "tentativa de penhora",
+        "intimado da penhora",
+        "intimados da penhora",
+        "oficial de justica nao localizou bens",
+        "nao foram localizados bens",
+        "nao encontrou bens",
+        "sem bens a penhorar",
+        "bens insuficientes",
+    ]
+    text_norm = normalizar(text)
+
+    if any(normalizar(k) in text_norm for k in KEYWORDS_RENAJUD_ATIVO):
+        if any(normalizar(k) in text_norm for k in KEYWORDS_RENAJUD_NEGATIVO):
+            return "tentativa de penhora renajud (negativa)"
+        return "bloqueio renajud ativo"
+
+    if any(normalizar(k) in text_norm for k in KEYWORDS_INDISPONIBILIDADE):
+        return "indisponibilidade de bens (CNIB)"
+
+    if any(normalizar(k) in text_norm for k in KEYWORDS_PENHORA_IMOVEL):
+        return "penhora de imóvel"
+
+    if any(normalizar(k) in text_norm for k in KEYWORDS_PENHORA_FATURAMENTO):
+        return "penhora de faturamento"
+
+    if any(normalizar(k) in text_norm for k in KEYWORDS_PENHORA_QUOTAS):
+        return "penhora de quotas/ações"
+
+    if any(normalizar(k) in text_norm for k in KEYWORDS_PENHORA_CREDITOS):
+        return "penhora de créditos/direitos"
+
+    # [FIX penhora v8.0.3 — feedback NTI/PGMS, processo 0784947-98.2018.8.05.0001]
+    # BACENJUD_NEGATIVO era checado ANTES de BACENJUD_POSITIVO/CONFIRMADO e
+    # retornava na hora — sem olhar se havia TAMBÉM uma confirmação positiva em
+    # outro ponto do mesmo PDF. Um processo de execução fiscal costuma ter VÁRIAS
+    # tentativas de bloqueio ao longo do tempo: é comum um banco responder "sem
+    # saldo positivo" (negativo) enquanto outro banco, ou uma tentativa anterior,
+    # teve bloqueio efetivo. Confirmado no PDF real: a mesma certidão SISBAJUD
+    # tinha "sem saldo positivo" (COOP SICREDI) E "valores bloqueados" — e a
+    # própria executada peticionou pedindo a conversão em renda "dos valores
+    # bloqueados na presente execução", prova inequívoca de que o bloqueio
+    # aconteceu. Corrigido: POSITIVO/CONFIRMADO agora tem prioridade sobre
+    # NEGATIVO, do mesmo jeito que o ramo SOLICITADO logo abaixo já fazia (cuja
+    # checagem interna de NEGATIVO/CONFIRMADO virou redundante e foi removida).
+    if any(normalizar(k) in text_norm for k in KEYWORDS_BACENJUD_POSITIVO) or \
+       any(normalizar(k) in text_norm for k in KEYWORDS_BACENJUD_CONFIRMADO):
+        return "penhora bacenjud/sisbajud"
+
+    if any(normalizar(k) in text_norm for k in KEYWORDS_BACENJUD_NEGATIVO):
+        return "tentativa de penhora bacenjud (negativa)"
+
+    if any(normalizar(k) in text_norm for k in KEYWORDS_BACENJUD_SOLICITADO):
+        return "sisbajud/bacenjud solicitado (resultado desconhecido)"
+
+    if any(normalizar(k) in text_norm for k in KEYWORDS_TENTATIVA_PENHORA):
+        return "tentativa de penhora (sem resultado)"
+
+    if "penhora nao realizada" in text_norm:
+        return "penhora não realizada"
+
+    return "Penhora não encontrado"
 
 
-# ════════════════════════════════════════════════════════════════
-# REGISTRO DE LOTES
-# ════════════════════════════════════════════════════════════════
+# --- Detección de parcelamento / suspensión ---
+KEYWORDS_PARCELAMENTO_ATIVO = [
+    "defiro o pedido de suspensao",
+    "defiro a suspensao",
+    "determino a suspensao do feito",
+    "determino a suspensao da execucao",
+    "suspendo o feito",
+    "suspendo o curso do feito",
+    "suspendo/mantenho suspenso",
+    "suspensao do feito",
+    "suspensao da execucao",
+    "suspensao do processo",
+    "requerer a suspensao do feito",
+    "requer a suspensao do feito",
+    "requerer a suspensao da execucao",
+    "requer a suspensao da execucao",
+    "suspensao pelo parcelamento",
+    "pleiteou administrativamente o parcelamento",
+    "adesao ao parcelamento",
+    "aderiu ao parcelamento",
+    "aderiu o executado",
+    "parcelamento a que aderiu",
+    "parcelamento do debito exequendo",
+    "parcelamento do credito tributario",
+    "parcelamento do debito tributario",
+    "parcelamento administrativo de debitos",
+    "parcelamento administrativo",
+    "parcelamento em",
+    "parcelas mensais e sucessivas",
+    "em 38 parcelas",
+    "em 12 parcelas",
+    "em 24 parcelas",
+    "em 36 parcelas",
+    "em 48 parcelas",
+    "em 60 parcelas",
+    "adesao ao pad",
+    "pad homologado",
+    "bloq pad",
+    "pad n",
+    "pad no",
+    "pad nr",
+    "parcelamento pad",
+    "pad internet",
+    "instrumento de confissao de divida e compromisso de pagamento parcelado",
+    "compromisso de pagamento parcelado",
+    "instrumento de confissao",
+    "art. 151, vi, do ctn",
+    "art. 151, inc. vi",
+    "art. 151, inciso vi",
+    "art. 151, inc. vi,",
+    "art. 151, i, do ctn",
+    "art. 151, inc. i, do ctn",
+    "art. 151, inc. i,",
+    "art. 151, inciso i",
+    "art. 151, inc. 1,",
+    "art. 151, 1, do ctn",
+    "art. 151, inc. 1, do",
+    "151, inc. 1,",
+    "art. 313, ii, do cpc",
+    "art. 265, inc. ii, do cpc",
+    "art. 265, inc. ii",
+]
 
-_lotes = {}          # id → dict
-_fila = None         # asyncio.Queue, criada no lifespan
-_lock = asyncio.Lock()
+KEYWORDS_SUSPENSAO_ART40 = [
+    "resultado negativo da diligencia bacenjud",
+    "resultado negativo da diligencia sisbajud",
+    "suspendo a presente execucao fiscal",
+    "art. 40, caput, da lei n. 6.830",
+    "arquive-se o feito nos termos do art. 40",
+    "suspensao da execucao fiscal pelo prazo de 01",
+]
+
+def extract_suspensao_art40(text):
+    text_norm = normalizar(text)
+    if any(normalizar(k) in text_norm for k in KEYWORDS_SUSPENSAO_ART40):
+        return "processo suspenso — art. 40 LEF (bens não localizados)"
+    return None
 
 
-def _agora() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-
-def _garantir_pastas():
-    for p in (PASTA_JSON, PASTA_RESULT, PASTA_LOTES, PASTA_ENTRADA_PADRAO):
-        p.mkdir(parents=True, exist_ok=True)
-
-
-def _salvar_registro():
+def extract_extincao(text):
     """
-    Persiste o registro para os lotes sobreviverem a um restart.
-
-    Grava uma projeção enxuta: o log vai aparado nas últimas
-    MAX_LINHAS_LOG_DISCO linhas. O registro é reserializado INTEIRO a cada
-    salvamento, então cada linha guardada é multiplicada pelo número de lotes —
-    com mil lotes, um log completo por lote vira dezenas de MB reescritos a cada
-    mudança de estado.
+    Detecta se o processo foi extinto/sentenciado. Retorna string ou None.
+    Camadas: 1) reversão (extinção reformada por acórdão) → None;
+    2) keywords fortes (sozinhas bastam); 3) keywords fracas (só com forte).
     """
-    try:
-        enxuto = {}
-        for lid, lote in _lotes.items():
-            copia = dict(lote)
-            registro_log = lote.get("log") or []
-            if len(registro_log) > MAX_LINHAS_LOG_DISCO:
-                copia["log"] = registro_log[-MAX_LINHAS_LOG_DISCO:]
-            enxuto[lid] = copia
+    KEYWORDS_REVERSAO = [
+        "dar provimento",
+        "dou provimento",
+        "da-se provimento",
+        "recurso provido",
+        "provimento ao recurso",
+        "reforma a sentenca",
+        "reforma-se a sentenca",
+        "reformando a sentenca",
+        "anulando a sentenca",
+        "anulo a sentenca",
+        "retorno dos autos ao primeiro grau",
+        "retornem os autos ao juizo de origem",
+        "retornem-se os autos",
+        "retorno ao juizo de origem",
+        "regular tramitacao",
+        "para regular tramitacao",
+        "redirecionamento da execucao",
+        "redirecionar a execucao",
+        "desconsideracao da personalidade juridica",
+        "incluir o socio",
+        "citar o socio",
+    ]
 
-        tmp = ARQ_REGISTRO.with_suffix(".tmp")
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(enxuto, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, ARQ_REGISTRO)
-    except Exception as e:
-        log.error(f"Não foi possível salvar o registro de lotes: {e}")
+    KEYWORDS_FORTES = [
+        "processo ja se encontra sentenciado",
+        "ja se encontra sentenciado",
+        "processo sentenciado",
+        "extingo o processo com resolucao do merito",
+        "declaro a prescricao",
+        "declaro extinto o processo",
+        "julgo extinta a execucao",
+        "julgo extinto o feito",
+        "extingo a execucao",
+        "extincao da execucao",
+        "extincao do processo",
+        "sentenca de extincao",
+        "extinto por prescricao",
+        "extinta por prescricao",
+        "processo extinto",
+    ]
 
+    KEYWORDS_FRACAS = [
+        "sentenca transitada",
+        "transitada em julgado",
+        "transito em julgado",
+        "processo arquivado",
+        "arquivem-se",
+        "dando-se baixa",
+        "extinção da execução",
+        "extinção do processo",
+    ]
 
-async def _salvar_registro_async():
-    """
-    Mesmo salvamento, fora do event loop.
+    text_norm = normalizar(text)
 
-    json.dump do registro inteiro é síncrono e, com muitos lotes, segura o
-    servidor por centenas de milissegundos — enquanto isso nenhuma outra
-    requisição é atendida.
-    """
-    await asyncio.to_thread(_salvar_registro)
-
-
-def _limpar_antigos() -> None:
-    """
-    Aplica a retenção: primeiro os PDFs recebidos, depois o lote inteiro.
-
-    Os PDFs são o volume: o original continua com quem enviou, e o que o serviço
-    produziu (planilha, JSON) fica até a retenção do lote. Sem isto, nada nunca
-    era apagado e o volume enchia em silêncio.
-    """
-    if not (RETENCAO_PDF_DIAS or RETENCAO_LOTE_DIAS):
-        return
-
-    agora = datetime.now()
-    pdfs_apagados = lotes_apagados = 0
-
-    for lote_id, lote in list(_lotes.items()):
-        if lote.get("status") in ("na_fila", "processando"):
-            continue
-        marca = lote.get("concluido_em") or lote.get("criado_em")
-        if not marca:
-            continue
-        try:
-            quando = datetime.strptime(marca, "%Y-%m-%d %H:%M:%S")
-        except (ValueError, TypeError):
-            continue
-        idade = (agora - quando).days
-
-        if RETENCAO_LOTE_DIAS and idade >= RETENCAO_LOTE_DIAS:
-            shutil.rmtree(_dir_lote(lote_id), ignore_errors=True)
-            _lotes.pop(lote_id, None)
-            lotes_apagados += 1
-            continue
-
-        if RETENCAO_PDF_DIAS and idade >= RETENCAO_PDF_DIAS:
-            entrada = _dir_lote(lote_id) / "entrada"
-            if entrada.exists():
-                shutil.rmtree(entrada, ignore_errors=True)
-                pdfs_apagados += 1
-
-    if pdfs_apagados or lotes_apagados:
-        log.info(
-            f"Retenção: PDFs de {pdfs_apagados} lote(s) apagados "
-            f"(> {RETENCAO_PDF_DIAS} dias), {lotes_apagados} lote(s) removidos "
-            f"(> {RETENCAO_LOTE_DIAS} dias)"
-        )
-        _salvar_registro()
-
-
-def _carregar_registro():
-    global _lotes
-    if not ARQ_REGISTRO.exists():
-        return
-    try:
-        with open(ARQ_REGISTRO, encoding="utf-8") as f:
-            _lotes = json.load(f)
-        # Um lote que ficou "processando" num restart não vai retomar sozinho
-        for lote in _lotes.values():
-            if lote.get("status") in ("na_fila", "processando"):
-                lote["status"] = "erro"
-                lote["erro"] = "Serviço reiniciado durante o processamento — reenvie o lote"
-        log.info(f"Registro carregado: {len(_lotes)} lote(s)")
-    except Exception as e:
-        log.error(f"Registro ilegível, começando vazio: {e}")
-        _lotes = {}
-
-
-def _dir_lote(lote_id: str) -> Path:
-    return PASTA_LOTES / lote_id
-
-
-def _decorrido(inicio: str | None, fim: str | None = None) -> int | None:
-    """Segundos entre dois timestamps do registro. Sem 'fim', conta até agora."""
-    if not inicio:
+    if any(normalizar(k) in text_norm for k in KEYWORDS_REVERSAO):
         return None
+
+    tem_forte = any(normalizar(k) in text_norm for k in KEYWORDS_FORTES)
+    if tem_forte:
+        return "processo extinto/sentenciado"
+
+    return None
+
+
+# --- Detección de alvará (pedido / levantamento) ---------------------------
+# [SUPOSIÇÃO NÃO VALIDADA] Keywords inferidas do padrão de linguagem já usado
+# em citação/penhora/sinais — ainda não conferidas contra processos reais de
+# alvará da PGMS. Ajustar assim que houver exemplos reais (mascarados).
+KEYWORDS_PEDIDO_ALVARA = [
+    "requer a expedicao de alvara",
+    "requeiro a expedicao de alvara",
+    "requer expedicao de alvara",
+    "requer-se a expedicao de alvara",
+    "pedido de alvara de levantamento",
+    "requerimento de alvara",
+    "solicita alvara de levantamento",
+    "requer o levantamento dos valores",
+    "requeiro o levantamento dos valores",
+    "requer alvara judicial",
+    "expedicao de alvara de levantamento",
+    # --- NOVOS (v8.1.1) — [FIX achado em PDF real da PGMS, processo
+    # 8086970-82.2019.8.05.0001] A petição real do Município usa o INFINITIVO
+    # ("requerer", não "requer") e intercala "eletrônico" antes da vírgula —
+    # nenhuma keyword antiga batia: "...vem, perante V. Exa., requerer a
+    # expedição de alvará eletrônico, para levantamento do montante
+    # depositado à disposição desse Juízo...". Também existe um Ato
+    # Ordinatório anterior, do próprio cartório, pedindo ao Exequente os
+    # dados bancários "a fim de ser expedido o respectivo alvará judicial" —
+    # sinal de que o procedimento de alvará já está em curso.
+    "requerer a expedicao de alvara",
+    "expedicao de alvara eletronico",
+    "alvara eletronico, para levantamento",
+    "a fim de ser expedido o respectivo alvara judicial",
+]
+
+KEYWORDS_LEVANTAMENTO_ALVARA = [
+    "alvara de levantamento expedido",
+    "expeca-se alvara de levantamento",
+    "defiro a expedicao de alvara",
+    "defiro o levantamento",
+    "extrato de levantamento",
+    "comprovante de levantamento",
+    "alvara eletronico de levantamento",
+    "valores levantados",
+    # [FIX — achado em teste próprio, não em feedback real] "levantamento dos
+    # valores depositados" (sem verbo de confirmação) foi removido daqui: é
+    # texto genérico que também aparece no PEDIDO ("requer... levantamento
+    # dos valores depositados"), então marcava falso positivo de levantamento
+    # CONFIRMADO na mesma página de um mero pedido. Mantidas só frases com
+    # sinal de confirmação explícito (expedido, defiro, extrato, comprovante,
+    # levantados, transferência).
+    "transferencia dos valores para a conta",
+    "alvara expedido e levantado",
+    "alvara cumprido",
+]
+
+
+def extract_pedido_alvara(text):
+    text_norm = normalizar(text)
+    if any(normalizar(k) in text_norm for k in KEYWORDS_PEDIDO_ALVARA):
+        return "PEDIDO DE ALVARÁ"
+    return None
+
+
+def extract_levantamento_alvara(text):
+    text_norm = normalizar(text)
+    if any(normalizar(k) in text_norm for k in KEYWORDS_LEVANTAMENTO_ALVARA):
+        return "LEVANTAMENTO CONFIRMADO (EXTRATO)"
+    return None
+
+
+# ===========================================================================
+# EXTRACCIÓN DE ENTIDADES (datos estructurados del processo)
+# ===========================================================================
+
+
+def _so_digitos(s):
+    return re.sub(r"\D", "", s or "")
+ 
+ 
+def validar_cpf(cpf):
+    """True se `cpf` (com ou sem máscara) tem 11 dígitos e DVs válidos."""
+    cpf = _so_digitos(cpf)
+    if len(cpf) != 11 or cpf == cpf[0] * 11:
+        return False
+    for fim in (9, 10):
+        soma = sum(int(cpf[i]) * (fim + 1 - i) for i in range(fim))
+        dv = (soma * 10) % 11
+        if dv == 10:
+            dv = 0
+        if dv != int(cpf[fim]):
+            return False
+    return True
+ 
+ 
+def validar_cnpj(cnpj):
+    """True se `cnpj` (com ou sem máscara) tem 14 dígitos e DVs válidos."""
+    cnpj = _so_digitos(cnpj)
+    if len(cnpj) != 14 or cnpj == cnpj[0] * 14:
+        return False
+    pesos = [6, 5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2]
+    for fim in (12, 13):
+        w = pesos[1:] if fim == 12 else pesos
+        r = sum(int(cnpj[i]) * w[i] for i in range(fim)) % 11
+        dv = 0 if r < 2 else 11 - r
+        if dv != int(cnpj[fim]):
+            return False
+    return True
+ 
+ 
+def _fmt_cpf(d):
+    return f"{d[:3]}.{d[3:6]}.{d[6:9]}-{d[9:]}"
+ 
+ 
+def _fmt_cnpj(d):
+    return f"{d[:2]}.{d[2:5]}.{d[5:8]}/{d[8:12]}-{d[12:]}"
+ 
+ 
+# Rótulos que indicam que o número pertence ao EXECUTADO / contribuinte / sócio.
+_CTX_FORTE_EXECUTADO = (
+    "executad", "contra ", "devedor", "reu", "contribuinte", "cpf/cnpj",
+    "cnpj/cpf", "cpf do responsavel", "nome do responsavel", "socio",
+    "responsavel", "cpf:", "cnpj:", "cpf ", "cnpj ",
+)
+# Rótulos que indicam EXEQUENTE / assinante / procurador -> NÃO é o executado.
+_CTX_REJEITAR = (
+    "cnpj/mf", "exequente", "credor",
+    "municipio do salvador", "municipio de salvador",
+    "signed by", "assinado por", "procurador ", "oab",
+)
+ 
+# Token candidato: começa e termina em dígito, só admite . - / no meio
+# (não cruza espaços, para não fundir "CEP 40230731 - 713", telefone, etc.).
+_RE_CANDIDATO = re.compile(r"\d[\d./-]{9,16}\d")
+_CTX_JANELA = 80  # nº de caracteres de contexto anterior analisados
+ 
+ 
+def _rotulo_mais_proximo(ctx):
+    """
+    Decide pelo rótulo MAIS PRÓXIMO do número (maior posição em `ctx`):
+    'rejeitar' se o rótulo colado ao número é de exequente/assinatura;
+    'forte' se é de executado/contribuinte/sócio; None se não há rótulo.
+    Evita rejeitar um CPF legítimo só porque um 'cnpj/mf' de outra entidade
+    aparece longe, mas dentro da janela.
+    """
+    pos_forte = max((ctx.rfind(k) for k in _CTX_FORTE_EXECUTADO), default=-1)
+    pos_rej = max((ctx.rfind(k) for k in _CTX_REJEITAR), default=-1)
+    if pos_rej > pos_forte:
+        return "rejeitar"
+    if pos_forte > -1:
+        return "forte"
+    return None
+ 
+ 
+def _extrair_cpf_cnpj(text):
+    """
+    Extrai o CPF/CNPJ do EXECUTADO (prioriza CNPJ). Devolve str formatado ou None.
+    Robustez V8.1: valida DV, aceita CNPJ sem zero à esquerda/sem pontos, aceita
+    CPF cru só com rótulo forte, e rejeita por contexto exequente/assinaturas.
+    """
+    if not text:
+        return None
+    tn = normalizar(text)  # normalizar() já existe no agente1
+    melhor = None  # (chave_ordenacao, tipo, digitos)
+ 
+    for m in _RE_CANDIDATO.finditer(tn):
+        token = m.group(0)
+        dig = _so_digitos(token)
+        formatado = any(c in token for c in "./-")
+ 
+        # Classifica CPF vs CNPJ com validação de DV.
+        tipo = None
+        if len(dig) == 14 and validar_cnpj(dig):
+            tipo = "cnpj"
+        elif len(dig) == 13 and validar_cnpj("0" + dig):  # zero à esquerda perdido
+            tipo, dig = "cnpj", "0" + dig
+        elif len(dig) == 11 and validar_cpf(dig):
+            tipo = "cpf"
+        if not tipo:
+            continue
+ 
+        ctx = tn[max(0, m.start() - _CTX_JANELA): m.start()]
+        rotulo = _rotulo_mais_proximo(ctx)
+        if rotulo == "rejeitar":
+            continue
+        forte = (rotulo == "forte")
+ 
+        # Número CRU (sem máscara) sem rótulo forte é arriscado (telefone/
+        # registro que passe o DV por acaso) -> descarta.
+        if not formatado and not forte:
+            continue
+ 
+        chave = (
+            (10 if forte else 0) + (3 if formatado else 0),  # 1º: rótulo/forma
+            1 if tipo == "cnpj" else 0,                       # 2º: CNPJ > CPF
+            -m.start(),                                       # 3º: 1ª ocorrência
+        )
+        if melhor is None or chave > melhor[0]:
+            melhor = (chave, tipo, dig)
+ 
+    if melhor is None:
+        return None
+    _, tipo, dig = melhor
+    return _fmt_cnpj(dig) if tipo == "cnpj" else _fmt_cpf(dig)
+ 
+
+def _extrair_nome_executado(text):
+    """Extrae el nombre/razón social del executado."""
+    _PATRONES = [
+        r"executad[oa]\s*:\s*([^\n\r]{3,80})",
+        r"r[eé]u\s*:\s*([^\n\r]{3,80})",
+        r"contribuinte\s*:\s*([^\n\r]{3,80})",
+        r"nome[\/\s]?raz[aã]o social\s*:\s*([^\n\r]{3,80})",
+    ]
+    for pat in _PATRONES:
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            nome = m.group(1).strip().rstrip(".,;")
+            if len(nome) >= 4 and not nome.replace(" ", "").isdigit():
+                return nome[:100]
+    return None
+
+
+def _extrair_nome_exequente(text):
+    """Extrae el nombre del exequente. Limpia comillas OCR al inicio."""
+    _PATRONES = [
+        r"exequente\s*:\s*([^\n\r]{3,80})",
+        r"credor\s*:\s*([^\n\r]{3,80})",
+        r"autor\s*:\s*([^\n\r]{3,80})",
+    ]
+    for pat in _PATRONES:
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            nome = m.group(1).strip().rstrip(".,;")
+            nome = nome.lstrip("'\"\u201c\u201d\u2018\u2019").strip()
+            if len(nome) >= 4:
+                return nome[:80]
+    return None
+
+
+
+def _brl_to_float(s):
+    """'1.143,74' -> 1143.74. Tolerante a lixo de OCR; nunca lança."""
+    s = (s or "").strip().rstrip(".").rstrip(",")
+    if not s:
+        return 0.0
+    s = s.replace(".", "").replace(",", ".")
     try:
-        i = datetime.strptime(inicio, "%Y-%m-%d %H:%M:%S")
-        f = datetime.strptime(fim, "%Y-%m-%d %H:%M:%S") if fim else datetime.now()
+        return float(s)
+    except ValueError:
+        return 0.0
+ 
+ 
+def _float_to_brl(v):
+    """1143.74 -> '1.143,74'."""
+    return f"{v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+ 
+ 
+_RE_CDA_EXERCICIO   = re.compile(r"certidao de debito n\.?\s*\d{2}\.(\d{4})\.")
+_RE_EXERCICIO_LABEL = re.compile(r"exercicio\s+(\d{4})")
+_RE_DATA_INSCR      = re.compile(r"data de inscricao\s*:?\s*(\d{2}/\d{2}/\d{4})")
+_RE_TOTAL_CDA       = re.compile(r"\btotal\s+r\$\s*([\d.,]+)")
+_RE_ORIGINARIO      = re.compile(r"valor originari[oa]\s*r\$?\s*([\d.,]+)")
+ 
+ 
+def _parse_data(s):
+    try:
+        return datetime.strptime(s, "%d/%m/%Y")
     except (ValueError, TypeError):
         return None
-    return max(0, int((f - i).total_seconds()))
-
-
-def _lotes_na_frente(lote: dict) -> int:
+ 
+ 
+def _coletar_cdas(tn):
     """
-    Quantos lotes precisam terminar antes deste começar.
-
-    A fila é serial, então o que está processando também conta — quem espera
-    quer saber quantas rodadas faltam, não a posição numa lista.
+    Divide o texto normalizado em blocos de Certidão de Débito e extrai por
+    bloco: exercício, Data de Inscrição, Valor Originário e Total.
+    Só retorna blocos que tenham ao menos um dos valores.
     """
-    criado = lote.get("criado_em") or ""
-    return sum(
-        1
-        for outro in _lotes.values()
-        if outro.get("id") != lote.get("id")
-        and (
-            outro.get("status") == "processando"
-            or (outro.get("status") == "na_fila" and (outro.get("criado_em") or "") < criado)
-        )
-    )
-
-
-_XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-
-# Nome fixo do relatório do Agente 2 (REPORTE_XLSX em agente2.py). É ACUMULATIVO:
-# regerado do histórico inteiro a cada lote, então traz também os lotes anteriores.
-_XLSX_AGENTE2 = "historial_agente2.xlsx"
-
-# Histórico acumulativo do Agente 2 (HISTORIAL_JSONL em agente2.py) — é a fonte
-# a partir da qual se monta o recorte de cada consumidor.
-_JSONL_AGENTE2 = "historial_agente2.jsonl"
-
-
-def _arquivos_do_lote(lote: dict) -> dict:
+    marcadores = [m.start() for m in re.finditer(r"certidao de debito", tn)]
+    if not marcadores:
+        return []
+    marcadores.append(len(tn))
+ 
+    cdas = []
+    for i in range(len(marcadores) - 1):
+        bloco = tn[marcadores[i]:marcadores[i + 1]]
+        m_ex = _RE_CDA_EXERCICIO.search(bloco) or _RE_EXERCICIO_LABEL.search(bloco)
+        exercicio = m_ex.group(1) if m_ex else None
+        m_dt  = _RE_DATA_INSCR.search(bloco)
+        m_tot = _RE_TOTAL_CDA.search(bloco)
+        m_ori = _RE_ORIGINARIO.search(bloco)
+        if not m_tot and not m_ori:
+            continue
+        cdas.append({
+            # blocos sem exercício NÃO se fundem entre si (chave única por bloco)
+            "chave"         : exercicio or f"_bloco{i}",
+            "data_inscricao": _parse_data(m_dt.group(1)) if m_dt else None,
+            "total"         : _brl_to_float(m_tot.group(1)) if m_tot else None,
+            "originario"    : _brl_to_float(m_ori.group(1)) if m_ori else None,
+        })
+    return cdas
+ 
+ 
+def _dedup_por_exercicio(cdas):
     """
-    Artefatos deste lote que existem em disco: tipo → (caminho, nome, media_type).
-
-    Chave fixa em vez de nome de arquivo na URL — o consumidor nunca escolhe o
-    caminho, então não há como escapar da pasta.
+    Mantém 1 CDA por exercício: a de Data de Inscrição mais recente (a vigente).
+    Sem data perde para quem tem data; entre iguais, fica a última vista.
     """
-    lid  = lote["id"]
-    d    = _dir_lote(lid)
-    mapa = {}
-
-    if lote.get("planilha"):
-        p = d / "resultados" / lote["planilha"]
-        if p.exists():
-            mapa["agente1_planilha"] = (p, f"lote_{lid}_agente1.xlsx", _XLSX)
-
-    p = d / "json" / "saida_agente1_V8.json"
-    if p.exists():
-        mapa["agente1_json"] = (p, f"lote_{lid}_agente1.json", "application/json")
-
-    p = PASTA_JSON / f"lote_{lid}_agente2_resultado.json"
-    if p.exists():
-        mapa["agente2_json"] = (p, f"lote_{lid}_agente2.json", "application/json")
-
-    p = PASTA_RESULT / _XLSX_AGENTE2
-    if p.exists():
-        mapa["agente2_planilha"] = (p, "priorizacao_acumulada.xlsx", _XLSX)
-
-    return mapa
-
-
-DESCRICAO_ARQUIVO = {
-    "agente1_planilha": "Planilha de revisão do Agente 1 (Excel) — só deste lote",
-    "agente1_json"    : "Extração e classificação do Agente 1 (JSON) — só deste lote",
-    "agente2_json"    : "Priorização do Agente 2 (JSON) — só deste lote",
-    "agente2_planilha": "Relatório de priorização do Agente 2 (Excel) — ACUMULADO: "
-                        "todos os processos dos SEUS lotes, não só os deste",
-}
-
-
-def _origens_do_consumidor(consumidor: str) -> set:
+    vigentes = {}
+    for c in cdas:
+        k = c["chave"]
+        atual = vigentes.get(k)
+        if atual is None:
+            vigentes[k] = c
+            continue
+        d_novo, d_atual = c["data_inscricao"], atual["data_inscricao"]
+        if d_atual is None and d_novo is not None:
+            vigentes[k] = c
+        elif d_novo is not None and d_atual is not None and d_novo >= d_atual:
+            vigentes[k] = c
+        elif d_atual is None and d_novo is None:
+            vigentes[k] = c
+    return list(vigentes.values())
+ 
+ 
+def _extrair_valor(text):
     """
-    Nomes de arquivo que o Agente 2 grava no campo 'origem_lote' dos lotes deste
-    consumidor. É a chave que recorta o histórico compartilhado.
+    Devuelve (valor_original, valor_atualizado) como 'R$ X.XXX,XX' o None.
+    Ver cabeçalho do bloco para a regra de soma/dedup por exercício.
     """
-    return {
-        f"lote_{lote['id']}_agente2.json"
-        for lote in _lotes.values()
-        if lote.get("origem") == consumidor
-    }
+    if not text:
+        return None, None
+    tn = normalizar(text)  # normalizar() já existe no agente1
+ 
+    valor_original = None
+    valor_atualizado = None
+ 
+    # --- Fonte primária: Certidões de Débito, 1 por exercício (a vigente) ---
+    cdas = _dedup_por_exercicio(_coletar_cdas(tn))
+    if cdas:
+        totais = [c["total"] for c in cdas if c["total"] is not None]
+        origs  = [c["originario"] for c in cdas if c["originario"] is not None]
+        if totais:
+            valor_atualizado = f"R$ {_float_to_brl(sum(totais))}"
+        if origs:  # [SUPOSIÇÃO A REVISAR] remova estas 2 linhas p/ voltar ao 1º só
+            valor_original = f"R$ {_float_to_brl(sum(origs))}"
+ 
+    # --- Fallbacks para documentos SEM certidões (outros formatos) ---
+    if valor_original is None:
+        for pat in [r"valor origin[aá]ri[oa]\s*[r\$:\s]+([\d.,]+)",
+                    r"valor original\s*[r\$:\s]+([\d.,]+)",
+                    r"vl\.?\s*original\s*[r\$:\s]+([\d.,]+)"]:
+            m = re.search(pat, tn)
+            if m:
+                valor_original = f"R$ {m.group(1).strip()}"
+                break
+ 
+    if valor_atualizado is None:
+        for pat in [r"valor total da divida parcelada\s*[:\s]*([\d.,]+)",
+                    r"total a pagar\s*[:\s]*([\d.,]+)",
+                    r"valor atualizado\s*[:\s]*([\d.,]+)",
+                    r"valor atual\s*[:\s]*([\d.,]+)",
+                    r"total em r\$\s*[:\s]*([\d.,]+)",
+                    r"vl\.?\s*corrigido\s*[:\s]*([\d.,]+)",
+                    r"total\s*geral\s*[-:>\s]*([\d.,]+)"]:
+            m = re.search(pat, tn)
+            if m:
+                valor_atualizado = f"R$ {m.group(1).strip()}"
+                break
+ 
+    if valor_original is None:
+        m = re.search(r"r\$\s*([\d.,]+)", tn)
+        if m:
+            valor_original = f"R$ {m.group(1).strip()}"
+ 
+    return valor_original, valor_atualizado
+
+def _extrair_tipo_tributo(text):
+    """Extrae el tipo de tributo de la CDA o del Classe-Assunto."""
+    _TRIBUTOS = [
+        ("imposto predial territorial urbano",  "IPTU — Imposto Predial e Territorial Urbano"),
+        ("imposto predial e territorial urbano", "IPTU — Imposto Predial e Territorial Urbano"),
+        ("taxa de licenciamento",               "Taxa de Licenciamento de Estabelecimento"),
+        ("taxa de fiscalizacao de funcionamento","TFF — Taxa de Fiscalização de Funcionamento"),
+        ("tff",                                  "TFF — Taxa de Fiscalização de Funcionamento"),
+        ("cosip",                                "COSIP — Contribuição de Iluminação Pública"),
+        ("contribuicao de iluminacao publica",   "COSIP — Contribuição de Iluminação Pública"),
+        ("imposto sobre servicos",               "ISS — Imposto sobre Serviços"),
+        ("iss",                                  "ISS — Imposto sobre Serviços"),
+        ("itbi",                                 "ITBI — Imposto sobre Transmissão de Bens Imóveis"),
+        ("imposto sobre transmissao",            "ITBI — Imposto sobre Transmissão de Bens Imóveis"),
+        ("iptu",                                 "IPTU — Imposto Predial e Territorial Urbano"),
+        ("multa",                                "Multa"),
+    ]
+    _FRAGMENTOS_IGNORAR = [
+        "divida ativa",
+        "divida municipal",
+        "credito tributario",
+        "execucao fiscal",
+        "devedor",
+        "requerendo",
+        "credor",
+        "municipio de salvador reu",
+        "parte ativa",
+    ]
+    _RUIDO_LEGAL = ["art.", "lei n", "lei no", "inciso", "paragrafo", "ans."]
+
+    text_norm = normalizar(text)
+
+    for pat in [
+        r"esp[eé]cie\s*[:\s]+([^\n\r]{3,60})",
+        r"tributo\s*[:\s]+([^\n\r]{3,60})",
+        r"classe\s*[-]?\s*assunto\s*[:\s]+([^\n\r]{3,80})",
+        r"execu[cç][aã]o fiscal\s*[-\s/]+([^\n\r]{3,30})",
+    ]:
+        m = re.search(pat, text_norm)
+        if m:
+            fragmento = normalizar(m.group(1).strip())
+            if any(ig in fragmento for ig in _FRAGMENTOS_IGNORAR):
+                continue
+            for kw, label in _TRIBUTOS:
+                if kw in fragmento:
+                    return label
+            if not any(r in fragmento for r in _RUIDO_LEGAL) and len(fragmento) > 3:
+                return fragmento[:60].strip()
+
+    for kw, label in _TRIBUTOS:
+        if kw in text_norm:
+            return label
+
+    return None
 
 
-def _planilha_a2_recortada(consumidor: str):
-    """
-    Monta a planilha de priorização com APENAS os lotes deste consumidor e
-    devolve o caminho, ou None se ele ainda não tem processo no histórico.
-
-    Existe porque resultados/historial_agente2.xlsx é único, global e
-    acumulativo: entregá-lo direto a um consumidor da API vazaria nome,
-    CPF/CNPJ e valor de dívida dos processos de todos os outros.
-    """
-    historico = PASTA_JSON / _JSONL_AGENTE2
-    origens = _origens_do_consumidor(consumidor)
-    if not historico.exists() or not origens:
-        return None
-    try:
-        import agente2
-        PASTA_RECORTES.mkdir(parents=True, exist_ok=True)
-        destino = PASTA_RECORTES / f"priorizacao_{consumidor}.xlsx"
-        gerado = agente2.gerar_reporte_xlsx(str(historico), str(destino), origens=origens)
-        return Path(gerado) if gerado else None
-    except Exception:
-        log.exception(f"Falha ao montar a planilha do consumidor '{consumidor}'")
-        return None
+def _extrair_numero_cda(text):
+    """Extrae el número de la CDA. Descarta valores < 5 dígitos (evita CGA)."""
+    _PATRONES = [
+        r"cda\s*n[o°º.]?\s*([\d/.\-]+)",
+        r"certid[aã]o de d[ií]vida ativa\s*[-\s]*n[o°º.]?\s*([\d/.\-]+)",
+        r"n[o°º.]?\s+da\s+cda\s*[:\s]*([\d/.\-]+)",
+    ]
+    for pat in _PATRONES:
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            valor = m.group(1).strip().rstrip(".")
+            if len(re.sub(r"\D", "", valor)) >= 5:
+                return valor
+    return None
 
 
-def _publico(lote: dict, incluir_log=False, incluir_analises=False) -> dict:
-    """Projeção do lote para resposta — esconde caminhos internos."""
-    status = lote["status"]
-    saida = {
-        "lote_id"      : lote["id"],
-        "status"       : status,
-        "origem"       : lote.get("origem"),
-        "criado_em"    : lote.get("criado_em"),
-        "iniciado_em"  : lote.get("iniciado_em"),
-        "concluido_em" : lote.get("concluido_em"),
-        "arquivos"     : lote.get("arquivos", []),
-        "campos"       : lote.get("campos") or "todas",   # [Fase 3] etapas pedidas
-        "etapa"        : lote.get("etapa"),
-        # Quem espera precisa de sinal de vida: um lote silencioso por oito
-        # minutos é indistinguível de um lote travado. O tempo é calculado
-        # aqui, no relógio do serviço — o do navegador pode estar noutro fuso.
-        "decorrido_s"     : _decorrido(
-            lote.get("iniciado_em") or lote.get("criado_em"),
-            lote.get("concluido_em"),
-        ),
-        "lotes_na_frente" : _lotes_na_frente(lote) if status == "na_fila" else None,
-        # O que dá para baixar deste lote, para o consumidor não ter que
-        # tentar cada rota e colecionar 404.
-        # Também em lote com erro: o Agente 1 pode ter concluído e deixado a
-        # planilha pronta antes de o Agente 2 falhar.
-        "downloads"       : sorted(_arquivos_do_lote(lote)) if status in ("concluido", "erro") else [],
-        "resumo"       : lote.get("resumo"),
-        "avisos"       : lote.get("avisos", []),
-        "erro"         : lote.get("erro"),
-        "totais"       : lote.get("totais"),
-        # [Fase 4] Quantos processos deste lote tiveram um valor reaproveitado
-        # do estado anterior DIVERGENTE do que saiu agora para o MESMO PDF
-        # (hash igual). Não é erro de código — é o Agente 1 avisando que algo
-        # mudou de interpretação e pede revisão humana. Fica None quando o
-        # Agente 1 ainda não chegou a gerar o JSON de traspasse.
-        "conflitos_detectados": lote.get("conflitos_detectados"),
-    }
-    if incluir_log:
-        saida["log"] = lote.get("log", [])
-    if incluir_analises:
-        saida["analises"] = lote.get("analises", [])
-    return saida
+_PAT_NUM_CNJ = re.compile(r"\d{7}-\d{2}\.\d{4}\.\d\.\d{2}\.\d{4}")
 
+# [FIX numero_processo v8.1] Rótulo típico de capa/certidão de processo
+# ("Processo:", "Execução Fiscal n.", "Autos n.", "Referência"). Usado para
+# preferir o número que está de fato identificando o processo, em vez do
+# primeiro CNJ-like encontrado no PDF inteiro.
+_PAT_NUM_CNJ_COM_ROTULO = re.compile(
+    r"(?:processo|execu[cç][aã]o\s*fiscal|autos?|refer[eê]ncia)"
+    r"[^\n\d]{0,25}n?[º°oO.]{0,3}\s*[:\s]?\s*"
+    r"(\d{7}-\d{2}\.\d{4}\.\d\.\d{2}\.\d{4})",
+    re.IGNORECASE,
+)
 
-# ════════════════════════════════════════════════════════════════
-# DIAGNÓSTICO DO DESFECHO
-# ════════════════════════════════════════════════════════════════
-#
-# O Agente 1 trata OCR quebrado e PDF ilegível internamente e ainda assim encerra
-# com código 0 — um lote pode "terminar bem" tendo extraído zero processos. Sem
-# isto o consumidor recebe status de sucesso e planilha vazia.
-
-# Casa com a linha final do Agente 1: "  9 de 12 processo(s) extraído(s) com sucesso."
-_RE_RESUMO = re.compile(r"(\d+)\s+de\s+(\d+)\s+processo\(s\)\s+extra[íi]do\(s\)\s+com\s+sucesso")
-
-_SINTOMAS = (
-    (("poppler",),         "Poppler indisponível — o OCR não conseguiu renderizar as páginas escaneadas"),
-    (("tesseract",),       "Tesseract indisponível — o OCR não rodou"),
-    (("extracao falhou",), "Algum PDF não pôde ser lido — veja 'Erro na extração' na planilha do Agente 1"),
-    (("fora de escopo",),  "Algum arquivo não é uma execução fiscal — confira antes de usar o resultado"),
-    (("sem texto extraível", "sin texto extraíble"),
-                           "Algum PDF ficou sem texto extraível — confira a qualidade do digitalizado"),
-    (("memoryerror", "out of memory", "killed"),
-                           "Memória insuficiente durante o OCR — reduza OCR_MAX_WORKERS ou OCR_DPI"),
+# [FIX numero_processo v8.1] Contexto de extrato de parcelamento/PPI (Programa
+# de Parcelamento Incentivado). Esses extratos listam, numa coluna "Inscrição",
+# números de dívida ativa NO MESMO FORMATO CNJ — de OUTROS débitos, não do
+# processo. Um número que apareça perto dessas palavras é descartado.
+_PAT_CONTEXTO_PARCELAMENTO = re.compile(
+    r"inscri[cç][aã]o|\bppi\b|parcelamento incentivado|d[eé]bitos declarados|"
+    r"custas judiciais|despesa de cita[cç][aã]o",
+    re.IGNORECASE,
 )
 
 
-def _diagnosticar(linhas: list) -> tuple:
+def _extrair_numero_processo(text):
     """
-    Lê o log dos agentes e responde duas perguntas que o status sozinho não
-    responde: quanto do lote saiu de fato, e o que deu errado no caminho.
+    Extrae el número CNJ (NNNNNNN-DD.AAAA.J.TT.OOOO) del processo.
+
+    [FIX numero_processo v8.1] Antes: pegava o primeiro match do formato CNJ
+    em qualquer lugar do PDF (sem contexto) — vulnerável a extratos de PPI
+    anexados que trazem números de inscrição no mesmo formato (caso real:
+    8090758-07.2019.8.05.0001 saía como 8069599-71.2020.8.05.0001, número de
+    uma linha de "Inscrição" do extrato PPI que vinha antes da capa do
+    processo no PDF). Agora:
+      A) prioriza o número que aparece perto de um rótulo de capa/certidão de
+         processo, descartando os que caiam em contexto de tabela de PPI;
+      B) se nenhum rótulo for encontrado, cai para a busca livre antiga, mas
+         ainda ignorando números em contexto de PPI/parcelamento.
+    Continua podendo devolver None — nunca inventa valor.
     """
-    texto = "\n".join(linhas)
-    baixo = texto.lower()
+    for m in _PAT_NUM_CNJ_COM_ROTULO.finditer(text):
+        contexto_antes = text[max(0, m.start() - 150):m.start()]
+        contexto_apos  = text[m.start():m.end() + 30]
+        if _PAT_CONTEXTO_PARCELAMENTO.search(contexto_antes) or \
+           _PAT_CONTEXTO_PARCELAMENTO.search(contexto_apos):
+            continue
+        return m.group(1)
 
-    avisos = [msg for gatilhos, msg in _SINTOMAS
-              if any(g.lower() in baixo for g in gatilhos)]
+    for m in _PAT_NUM_CNJ.finditer(text):
+        contexto_antes = text[max(0, m.start() - 80):m.start()]
+        if _PAT_CONTEXTO_PARCELAMENTO.search(contexto_antes):
+            continue
+        return m.group(0)
 
-    resumo = None
-    m = _RE_RESUMO.search(texto)
+    return None
+
+
+def _extrair_vara(text):
+    """Extrae la vara/juízo donde tramita el processo."""
+    _PATRONES = [
+        r"(\d+[aª°]\s*vara\s*da\s*fazenda\s*p[uú]blica[^\n\r]{0,40})",
+        r"([oó]rg[aã]o julgador\s*[:\s]+[^\n\r]{5,60})",
+        r"(vara\s*[^\n\r]{3,40})",
+    ]
+    for pat in _PATRONES:
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            return m.group(1).strip()[:80]
+    return None
+
+
+def _extrair_exercicio(text):
+    """Extrae el año o período fiscal del tributo (prioriza tabla de la CDA)."""
+    text_norm = normalizar(text)
+
+    m_cda = re.search(
+        r"(?:esp[eé]cie|tributo)[^\n]{0,80}exerc[ií]cio\s*[:\s]*(\d{4}(?:[/]\d{4})?)",
+        text_norm
+    )
+    if not m_cda:
+        m_cda = re.search(
+            r"exerc[ií]cio\s*[:\s]*(\d{4}(?:[/]\d{4})?)\s+(?:meses|cotas|valor)",
+            text_norm
+        )
+    if not m_cda:
+        m_b = re.search(
+            r"exerc[ií]cio\s+meses[^\n]*\n\s*(\d{4}(?:[/]\d{4})?)",
+            text_norm
+        )
+        if m_b:
+            bloque_tab = text_norm[m_b.start():]
+            anos_tab = re.findall(r"\b(20[012]\d)\s+\d{1,2}\s+[\d.,]+", bloque_tab)
+            if anos_tab:
+                anos_s = sorted(set(anos_tab))
+                return anos_s[0] if len(anos_s) == 1 else f"{anos_s[0]}/{anos_s[-1]}"
+            return m_b.group(1).strip()
+    if not m_cda:
+        m_cda = re.search(
+            r"exerc[ií]cio\s*:\s*(\d{4})\s*\n\s*(?:meses|cotas)",
+            text_norm
+        )
+    if m_cda:
+        return m_cda.group(1).strip()
+
+    m = re.search(r"exerc[ií]cio\s*[:\s]*(\d{4}(?:[/\-]\d{4})?)", text_norm)
     if m:
-        ok, total = int(m.group(1)), int(m.group(2))
-        resumo = f"{ok} de {total} processo(s) extraído(s) com sucesso"
-        if total == 0:
-            avisos.insert(0, "Nenhum processo foi lido — o resultado sairá vazio")
-        elif ok == 0:
-            avisos.insert(0, "Nenhum processo pôde ser extraído — o resultado sairá vazio")
-        elif ok < total:
-            avisos.insert(0, f"{total - ok} de {total} processo(s) não puderam ser extraídos")
-    else:
-        # O Agente 1 sempre imprime essa linha ao terminar. A ausência dela
-        # significa que ele morreu antes de exportar — não que rodou bem.
-        avisos.insert(0, "O Agente 1 não chegou a exportar o resultado — trate como falha")
+        return m.group(1).strip().replace("-", "/")
 
-    return resumo, avisos
+    m2 = re.search(r"exerc[ií]cios?\s+(?:de\s+)?(\d{4})\s+e\s+(\d{4})", text_norm)
+    if m2:
+        return f"{m2.group(1)}/{m2.group(2)}"
 
+    todos = re.findall(r"exerc[ií]cio\s+(\d{4})", text_norm)
+    if todos:
+        anos = sorted(set(todos))
+        return anos[0] if len(anos) == 1 else f"{anos[0]}/{anos[-1]}"
 
-# ════════════════════════════════════════════════════════════════
-# PIPELINE
-# ════════════════════════════════════════════════════════════════
-
-# Um erro de biblioteca despeja 10-15 linhas de traceback no log do lote, que
-# é devolvido ao consumidor e mostrado no painel. Medido: uma única falha de
-# OCR encheu 100 das 188 linhas do lote, empurrando o resto para fora do teto.
-# O que resta útil é a ÚLTIMA linha — o tipo e a mensagem da exceção.
-_INICIO_TRACEBACK = "Traceback (most recent call last)"
-_CONTINUA_TRACEBACK = (
-    "During handling of the above exception",
-    "The above exception was the direct cause",
-)
-
-
-def _encurtar_caminhos(linha: str) -> str:
-    """
-    Tira os prefixos das pastas do serviço, deixando o caminho relativo.
-
-    Só remove PREFIXO CONHECIDO. A versão anterior encurtava qualquer token
-    com barra, e comia dado do processo: o CNPJ "13.504.675/0001-10" saía
-    como "0001-10" no log do cliente.
-    """
-    for base in _PREFIXOS_INTERNOS:
-        if base in linha:
-            linha = linha.replace(base + "\\", "").replace(base + "/", "").replace(base, "")
-    return linha
-
-
-class _FiltroLog:
-    """
-    Transcreve a saída de um agente para o log do lote, colapsando cada
-    traceback na sua linha de exceção. Tem estado porque um traceback ocupa
-    várias linhas e só se sabe onde termina ao chegar nele.
-    """
-
-    def __init__(self):
-        self.no_traceback = False
-
-    def __call__(self, linha: str):
-        if not linha:
-            return None
-
-        if _INICIO_TRACEBACK in linha or any(m in linha for m in _CONTINUA_TRACEBACK):
-            self.no_traceback = True
-            return None
-
-        if self.no_traceback:
-            # Quadro do traceback (indentado) ou a costura entre dois deles:
-            # segue engolindo.
-            if linha.startswith((" ", "\t")) or any(m in linha for m in _CONTINUA_TRACEBACK):
-                return None
-            # Primeira linha não indentada: é a exceção. Guarda essa e sai
-            # do modo traceback.
-            self.no_traceback = False
-            return _encurtar_caminhos(linha)
-
-        return _encurtar_caminhos(linha)
-
-async def _executar(cmd: list, ambiente: dict, lote: dict, etapa: str) -> int:
-    """
-    Roda um agente e transcreve a saída dele para o log do lote.
-
-    Com teto de tempo: passado TIMEOUT_AGENTE_S o processo é morto e a etapa
-    falha. Sem isso, um agente travado segura a fila serial indefinidamente e
-    todo lote seguinte fica em 'na_fila' sem explicação nenhuma.
-    """
-    lote["etapa"] = etapa
-    lote["log"].append(f"{_agora()}  ── {etapa} ──")
-
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        cwd=str(BASE_DIR),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
-        env={**os.environ, "PYTHONUNBUFFERED": "1",
-             "PYTHONIOENCODING": "utf-8", **ambiente},
+    m_tabla = re.search(
+        r"(20[012]\d)\s+\d{1,2}\s+[\d.,]+",
+        text_norm
     )
+    if m_tabla:
+        todos_tabla = re.findall(r"\b(20[012]\d)\s+\d{1,2}\s+[\d.,]+", text_norm)
+        if todos_tabla:
+            anos = sorted(set(todos_tabla))
+            return anos[0] if len(anos) == 1 else f"{anos[0]}/{anos[-1]}"
 
-    filtrar = _FiltroLog()
-
-    async def _transcrever():
-        async for bruto in proc.stdout:
-            linha = filtrar(bruto.decode("utf-8", errors="replace").rstrip())
-            if linha:
-                lote["log"].append(f"{_agora()}  {linha}")
-                if len(lote["log"]) > MAX_LINHAS_LOG:
-                    del lote["log"][:-MAX_LINHAS_LOG]
-        return await proc.wait()
-
-    try:
-        return await asyncio.wait_for(_transcrever(), timeout=TIMEOUT_AGENTE_S)
-    except asyncio.TimeoutError:
-        minutos = TIMEOUT_AGENTE_S // 60
-        lote["log"].append(
-            f"{_agora()}  TEMPO ESGOTADO: a etapa passou de {minutos} min e foi interrompida"
-        )
-        log.error(f"Lote {lote['id']}: '{etapa}' estourou {TIMEOUT_AGENTE_S}s — matando o processo")
-        try:
-            proc.kill()
-            await proc.wait()
-        except ProcessLookupError:
-            pass
-        raise RuntimeError(
-            f"A etapa '{etapa}' passou de {minutos} minutos e foi interrompida. "
-            "Reenvie o lote com menos processos, ou reduza OCR_MAX_LOTE/OCR_DPI."
-        )
-
-async def _processar_lote(lote: dict):
-    lote_id = lote["id"]
-    d = _dir_lote(lote_id)
-    entrada, saida_json, saida_result = d / "entrada", d / "json", d / "resultados"
-    for p in (saida_json, saida_result):
-        p.mkdir(parents=True, exist_ok=True)
-
-    lote["status"]      = "processando"
-    lote["iniciado_em"] = _agora()
-    _salvar_registro()
-
-    try:
-        # ── Agente 1 — pastas isoladas deste lote ──
-        rc = await _executar(
-            [sys.executable, "agente1.py"],
-            {
-                "PASTA_ENTRADA"   : str(entrada),
-                "PASTA_JSON"      : str(saida_json),
-                "PASTA_RESULTADOS": str(saida_result),
-                # [Fase 3] etapas pedidas para este lote ("" = todas). O merge
-                # (Fase 4) combina extrações parciais com o estado compartilhado.
-                "CAMPOS"          : lote.get("campos") or "",
-            },
-            lote,
-            "Agente 1 — extração e OCR",
-        )
-        if rc != 0:
-            raise RuntimeError(f"Agente 1 encerrou com código {rc}")
-
-        traspasse = saida_json / "saida_agente1_V8.json"
-        if not traspasse.exists():
-            raise RuntimeError("O Agente 1 não gerou o JSON de traspasse")
-
-        # [Fase 3/4] Lê a metadata que o Agente 1 grava no próprio JSON de
-        # traspasse — é a CONFIRMAÇÃO do que de fato rodou (o campo "campos" do
-        # lote é só o que foi PEDIDO) e se o merge (Fase 4) achou conflito. Sem
-        # isto, extração parcial e conflito de reaproveitamento só apareciam
-        # soterrados no log bruto — nenhum campo estruturado avisava o consumidor.
-        try:
-            with open(traspasse, encoding="utf-8") as f:
-                _meta_a1 = json.load(f).get("metadata", {})
-            lote["campos_confirmados"]   = _meta_a1.get("campos_processados")
-            lote["conflitos_detectados"] = _meta_a1.get("conflitos_detectados")
-        except Exception:
-            log.exception(f"Lote {lote_id}: falha ao ler metadata do Agente 1")
-
-        # ── [V7.2] Auditoria — anexa as classificações do lote ao histórico compartilhado ──
-        # O Agente 1 grava um JSONL na sua pasta ISOLADA (saida_json); aqui anexamos
-        # ao arquivo COMPARTILHADO (PASTA_JSON), que acumula TODAS as decisões —
-        # inclusive NÃO APTO — entre lotes. Append-only. Falha aqui não derruba o lote.
-        try:
-            audit_lote = saida_json / "historico_extracoes.jsonl"
-            if audit_lote.exists():
-                PASTA_JSON.mkdir(parents=True, exist_ok=True)
-                destino = PASTA_JSON / "historico_extracoes.jsonl"
-                with open(audit_lote, encoding="utf-8") as _src, \
-                     open(destino, "a", encoding="utf-8") as _dst:
-                    _dst.write(_src.read())
-                lote["log"].append(
-                    f"{_agora()}  Auditoria: classificações anexadas ao histórico compartilhado"
-                )
-            else:
-                lote["log"].append(
-                    f"{_agora()}  AVISO: Agente 1 não gerou historico_extracoes.jsonl"
-                )
-        except Exception as e:
-            lote["log"].append(f"{_agora()}  ERRO ao anexar auditoria: {e}")
-            log.exception(f"Falha ao anexar auditoria do lote {lote_id}")
-            
-        # ── Agente 2 — nome de arquivo por lote, pastas COMPARTILHADAS ──
-        # O nome derivado do lote evita que um lote sobrescreva o resultado do
-        # outro; as pastas compartilhadas mantêm o histórico do procurador
-        # acumulando entre lotes, que é o desenho original do Agente 2.
-        entrada_a2 = PASTA_JSON / f"lote_{lote_id}_agente2.json"
-        shutil.copy2(traspasse, entrada_a2)
-
-        rc = await _executar(
-            [sys.executable, "agente2.py", "--arquivo", str(entrada_a2)],
-            {"PASTA_JSON": str(PASTA_JSON), "PASTA_RESULTADOS": str(PASTA_RESULT)},
-            lote,
-            "Agente 2 — priorização jurídico-fiscal",
-        )
-        if rc != 0:
-            raise RuntimeError(f"Agente 2 encerrou com código {rc}")
-
-        # ── Coleta do resultado ──
-        resultado = PASTA_JSON / f"lote_{lote_id}_agente2_resultado.json"
-        if resultado.exists():
-            with open(resultado, encoding="utf-8") as f:
-                payload = json.load(f)
-            lote["analises"] = payload.get("analises", [])
-            lote["totais"]   = payload.get("metadata", {}).get("prioridades")
-        else:
-            lote["analises"] = []
-            lote["totais"]   = None
-
-        planilha = next(iter(sorted(saida_result.glob("*.xlsx"))), None)
-        lote["planilha"] = planilha.name if planilha else None
-
-        lote["status"] = "concluido"
-        lote["etapa"]  = "concluído"
-        lote["log"].append(f"{_agora()}  ── Lote concluído ──")
-
-    except Exception as e:
-        lote["status"] = "erro"
-        lote["etapa"]  = "erro"
-        lote["erro"]   = str(e)
-        lote["log"].append(f"{_agora()}  ERRO: {e}")
-        log.exception(f"Falha no lote {lote_id}")
-
-        # O que o Agente 1 já produziu continua valendo. Sem registrar a
-        # planilha aqui, uma falha do Agente 2 tornava inalcançável um Excel
-        # que está em disco e é útil — o procurador perdia a extração inteira
-        # por causa da etapa seguinte.
-        try:
-            resgatada = next(iter(sorted(saida_result.glob("*.xlsx"))), None)
-            if resgatada:
-                lote["planilha"] = resgatada.name
-                lote["log"].append(
-                    f"{_agora()}  A planilha do Agente 1 ficou pronta antes da falha "
-                    "e continua disponível para download"
-                )
-        except Exception:
-            log.exception(f"Lote {lote_id}: falha ao resgatar a planilha do Agente 1")
-
-    finally:
-        resumo, avisos = _diagnosticar(lote.get("log", []))
-
-        # [Fase 3/4] Avisos estruturados a partir da metadata confirmada pelo
-        # Agente 1 (ver bloco acima) — não do texto do log, que o consumidor da
-        # API não lê por padrão.
-        # Só avisa com a CONFIRMAÇÃO do Agente 1 (campos_confirmados não-nulo) —
-        # se ele falhou antes de chegar lá, o aviso de erro já conta a história,
-        # e listar aqui os campos pedidos como se fossem "faltantes" confundiria.
-        if lote.get("campos") and lote.get("campos_confirmados") is not None:
-            faltantes = sorted(_ETAPAS_VALIDAS - set(lote["campos_confirmados"]))
-            avisos.append(
-                f"Extração parcial — campos pedidos: {lote['campos']}. Os demais "
-                f"({', '.join(faltantes) or 'nenhum'}) vêm do último valor conhecido "
-                "deste processo, ou ficam vazios se for a primeira vez que ele é "
-                "processado."
-            )
-        if lote.get("conflitos_detectados"):
-            avisos.append(
-                f"{lote['conflitos_detectados']} conflito(s) de reaproveitamento "
-                "detectado(s) — um valor extraído agora ficou diferente do estado "
-                "anterior para o MESMO PDF (hash igual). Confira o JSON do Agente 1 "
-                "antes de usar o resultado."
-            )
-
-        lote["resumo"] = resumo
-        lote["avisos"] = avisos
-        lote["concluido_em"] = _agora()
-        await _salvar_registro_async()
+    return None
 
 
-async def _worker():
-    """Consome a fila em série — o OCR já satura a CPU, paralelizar só piora."""
-    log.info("Worker de lotes iniciado")
-    while True:
-        lote_id = await _fila.get()
-        try:
-            lote = _lotes.get(lote_id)
-            if lote:
-                await _processar_lote(lote)
-        except Exception:
-            log.exception(f"Worker falhou no lote {lote_id}")
-        finally:
-            _fila.task_done()
-            # Depois de cada lote, e não num timer: é aqui que o disco acabou
-            # de crescer, e é o único momento em que a fila está livre.
-            try:
-                await asyncio.to_thread(_limpar_antigos)
-            except Exception:
-                log.exception("Falha na limpeza de lotes antigos")
+def _extrair_data_inscricao(text):
+    """Extrae la fecha de inscripción en la dívida ativa (valida formato)."""
+    _PATRONES = [
+        r"data\s*d[ae]\s*inscri[cç][aã]o\s*[:\s]*([\d/\.\-]+)",
+        r"inscri[cç][aã]o\s+na\s+d[ií]vida\s+ativa\s*[:\s]*([\d/\.\-]+)",
+        r"data\s+de\s+emiss[aã]o\s*[:\s]*([\d/\.\-]+)",
+    ]
+    _PAT_FECHA_VALIDA = re.compile(r"^\d{1,2}[/\.\-]\d{1,2}[/\.\-]\d{2,4}$")
+    for pat in _PATRONES:
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            candidato = m.group(1).strip()
+            if _PAT_FECHA_VALIDA.match(candidato):
+                return candidato
+    return None
 
 
-# ════════════════════════════════════════════════════════════════
-# CONTRATO DA API — modelos de resposta
-# ════════════════════════════════════════════════════════════════
+def extract_entidades_agente2(text):
+    """
+    Punto de entrada de extracción de entidades. Devuelve dict con todos los
+    campos; los no encontrados quedan en None (nunca se inventa información).
+    """
+    campos = [
+        "cpf_cnpj", "nome_executado", "nome_exequente",
+        "valor_original", "valor_atualizado", "tipo_tributo",
+        "numero_cda", "numero_processo", "vara",
+        "exercicio", "data_inscricao",
+    ]
+    if not text:
+        return {k: None for k in campos}
+
+    valor_original, valor_atualizado = _extrair_valor(text)
+
+    return {
+        "cpf_cnpj"        : _extrair_cpf_cnpj(text),
+        "nome_executado"  : _extrair_nome_executado(text),
+        "nome_exequente"  : _extrair_nome_exequente(text),
+        "valor_original"  : valor_original,
+        "valor_atualizado": valor_atualizado,
+        "tipo_tributo"    : _extrair_tipo_tributo(text),
+        "numero_cda"      : _extrair_numero_cda(text),
+        "numero_processo" : _extrair_numero_processo(text),
+        "vara"            : _extrair_vara(text),
+        "exercicio"       : _extrair_exercicio(text),
+        "data_inscricao"  : _extrair_data_inscricao(text),
+    }
+
+
+def extract_parcelamento(text):
+    text_norm = normalizar(text)
+    if not any(normalizar(k) in text_norm for k in KEYWORDS_PARCELAMENTO_ATIVO):
+        return None
+
+    KEYWORDS_ART40_EXCLUSIVOS = [
+        "art. 40 da lef",
+        "art. 40 da lei 6.830",
+        "art. 40 - o juiz suspendera",
+        "enquanto nao for localizado o devedor",
+        "nao for localizado o devedor",
+        "ausencia de localizacao do executado",
+        "suspensao do feito pelo prazo de um ano",
+        "suspensao pelo prazo de 1 (um) ano",
+    ]
+    KEYWORDS_PAD_ESPECIFICOS = [
+        "art. 151",
+        "parcelamento do credito tributario",
+        "parcelamento do debito",
+        "instrumento de confissao",
+        "compromisso de pagamento parcelado",
+        "bloq pad",
+        "pad n",
+        "parcelas mensais e sucessivas",
+        "em 38 parcelas",
+        "em 12 parcelas",
+        "em 24 parcelas",
+        "em 36 parcelas",
+        "em 48 parcelas",
+        "em 60 parcelas",
+        "defiro o pedido de suspensao",
+        "suspendo/mantenho suspenso",
+    ]
+    is_art40_context = any(normalizar(k) in text_norm for k in KEYWORDS_ART40_EXCLUSIVOS)
+    has_pad_markers  = any(normalizar(k) in text_norm for k in KEYWORDS_PAD_ESPECIFICOS)
+    if is_art40_context and not has_pad_markers:
+        return None   # art.40 LEF — não confundir com PAD
+
+    KEYWORDS_PAD_HOMOLOGADO = [
+        "situacao do parcelamento: homologado",
+        "situacao pad: homologado",
+        "situacao: homologado",
+        "bloq pad",
+        "suspendo/mantenho suspenso",
+        "suspendo e mantenho suspenso",
+    ]
+    if any(normalizar(k) in text_norm for k in KEYWORDS_PAD_HOMOLOGADO):
+        return "processo suspenso por parcelamento (PAD)"
+
+    KEYWORDS_PAD_ROMPIDO = [
+        "situacao do parcelamento: rompido",
+        "situacao: rompido",
+        "parcelamento rompido",
+        "parcelamento cancelado em",
+        "cred. ref. ao cancel. do parc",
+        "cred. ref. ao cancel. do pad",
+        "motivo: pagamento em atraso",
+        "data de rompimento:",
+        "requerer a citacao da parte executada no seguinte endereco",
+        "requer a citacao da parte executada no seguinte endereco",
+        "citacao da parte executada no seguinte endereco",
+    ]
+    if any(normalizar(k) in text_norm for k in KEYWORDS_PAD_ROMPIDO):
+        KEYWORDS_PAD_NOVO_ATIVO = [
+            "defiro o pedido de suspensao",
+            "determino a suspensao do feito",
+            "suspendo o feito",
+            "suspendo/mantenho suspenso",
+            "suspendo e mantenho suspenso",
+            "situacao pad: homologado",
+            "bloq pad",
+        ]
+        if any(normalizar(k) in text_norm for k in KEYWORDS_PAD_NOVO_ATIVO):
+            return "processo suspenso por parcelamento (PAD)"
+        return None
+
+    return "processo suspenso por parcelamento (PAD)"
+
+
+# ===========================================================================
+# HELPERS DE SÍNTESE (usados por Excel, JSON e histórico — fonte única)
+# ===========================================================================
+
+def _extrair_sinais_processuais(full_text):
+    """
+    Reúne os sinais processuais detectados (fatos, não veredito). Fonte única
+    usada pela planilha, pelo JSON e pelo histórico para evitar divergência.
+    [Fase 3] Só roda se a etapa 'sinais' foi pedida em CAMPOS; senão devolve
+    tudo None (o campo não foi solicitado — diferente de 'procurado e vazio').
+    """
+    if "sinais" not in CAMPOS:
+        return {"extincao": None, "parcelamento": None, "suspensao_art40": None}
+    return {
+        "extincao"       : extract_extincao(full_text),
+        "parcelamento"   : extract_parcelamento(full_text),
+        "suspensao_art40": extract_suspensao_art40(full_text),
+    }
+
+
+def _extrair_alvara(full_text):
+    """
+    Reúne os fatos de alvará (pedido / levantamento). Mesmo padrão de
+    _extrair_sinais_processuais: fatos, não veredito.
+    [Fase 3] Só roda se a etapa 'alvara' foi pedida em CAMPOS; senão devolve
+    tudo None (campo não foi solicitado — diferente de 'procurado e vazio').
+    """
+    if "alvara" not in CAMPOS:
+        return {"pedido": None, "levantamento": None}
+    return {
+        "pedido"      : extract_pedido_alvara(full_text),
+        "levantamento": extract_levantamento_alvara(full_text),
+    }
+
+
+def _dias_desde(fecha, hoy=None):
+    """Días transcurridos desde `fecha` (dato neutral, no es un veredito)."""
+    if fecha is None:
+        return None
+    hoy = hoy or datetime.now()
+    return (hoy - fecha).days
+
+
+# ===========================================================================
+# LLM / GEMINI — NOTA DE ARQUITETURA
+# ===========================================================================
+# O Agente 1 é DETERMINÍSTICO e OFFLINE: usa apenas regex + OCR local. Não faz
+# nenhuma chamada a modelo de linguagem, não precisa de chave de API nem de
+# acesso à internet em tempo de execução (ver "network_mode: none" no compose).
 #
-# Existem pelo Swagger: sem eles o /api/docs mostra "Successful Response" sem
-# corpo nenhum e quem for integrar precisa adivinhar os campos por tentativa.
+# A etapa de raciocínio jurídico assistido por LLM foi movida para o AGENTE 2.
+# É lá que ficará o bloco isolado e claramente marcado:
 #
-# extra="allow" nos modelos que vêm do Agente 2 é deliberado: o response_model
-# DESCARTA campo não declarado. Quando o Agente 2 ganhar a análise por Gemini,
-# os campos novos passariam a sumir da resposta em silêncio — o modelo
-# documenta o mínimo garantido, não um teto.
-
-class StatusLote(str, Enum):
-    na_fila     = "na_fila"
-    processando = "processando"
-    concluido   = "concluido"
-    erro        = "erro"
-
-
-class TipoArquivo(str, Enum):
-    """O que cada agente deixa para trás — ver DESCRICAO_ARQUIVO."""
-    agente1_planilha = "agente1_planilha"
-    agente1_json     = "agente1_json"
-    agente2_json     = "agente2_json"
-    agente2_planilha = "agente2_planilha"
-
-
-class ArquivoLote(BaseModel):
-    tipo      : TipoArquivo
-    descricao : str
-    formato   : str = Field(description="xlsx ou json")
-    tamanho_kb: float
-    url       : str = Field(description="Rota de download, com o mesmo token Bearer")
-
-
-class ListaArquivos(BaseModel):
-    arquivos: list[ArquivoLote]
-
-
-class Erro(BaseModel):
-    detail: str = Field(description="O que impediu a chamada, em texto legível")
-
-
-class Totais(BaseModel):
-    """Quantos processos caíram em cada prioridade."""
-    ALTA : int
-    MEDIA: int
-    BAIXA: int
-
-
-class Analise(BaseModel):
-    model_config = ConfigDict(extra="allow")
-
-    prioridade: str | None = Field(
-        None,
-        description="Ordena o trabalho do procurador; NÃO é critério de ajuizamento. "
-                    "ALTA: dívida ≥ R$ 5.000, OU risco de prescrição (art. 174 CTN), "
-                    "OU 5 anos sem movimentação. MEDIA: R$ 1.000 a R$ 5.000. "
-                    "BAIXA: abaixo de R$ 1.000. Os limiares são provisórios e "
-                    "ajustáveis por LIMIAR_PRIORIDADE_ALTA / LIMIAR_PRIORIDADE_MEDIA.",
-        examples=["ALTA"],
-    )
-    acao_recomendada : str | None = None
-    justificativa    : str | None = None
-    alerta_prescricao: bool | None = Field(
-        None, description="Risco de prescrição quinquenal — CTN art. 174"
-    )
-    observacoes: list[str] = Field(
-        default_factory=list,
-        description="Pontos de atenção para o procurador: dado faltante, OCR ruim, prescrição",
-    )
-
-
-class ProcessoAnalisado(BaseModel):
-    model_config = ConfigDict(extra="allow")
-
-    id_lote        : str | None = None
-    numero_processo: str | None = None
-    nome_executado : str | None = None
-    analise        : Analise | None = None
-    erro           : str | None = Field(
-        None,
-        description="Preenchido quando ESTE processo falhou na análise. "
-                    "Os demais do lote seguem normalmente.",
-    )
-    processado_em: str | None = None
-
-
-class EntidadesProcesso(BaseModel):
-    """Dados que o Agente 1 extraiu do PDF — todos como texto, como saíram."""
-    model_config = ConfigDict(extra="allow")
-
-    numero_processo : str | None = None
-    cpf_cnpj        : str | None = None
-    nome_executado  : str | None = None
-    nome_exequente  : str | None = None
-    tipo_tributo    : str | None = Field(None, examples=["IPTU"])
-    exercicio       : str | None = None
-    numero_cda      : str | None = None
-    data_inscricao  : str | None = None
-    valor_original  : str | None = Field(None, examples=["R$ 12.480,55"])
-    valor_atualizado: str | None = None
-    vara            : str | None = None
-
-
-class TriagemAgente1(BaseModel):
-    """Extração e classificação do Agente 1 para um processo."""
-    model_config = ConfigDict(extra="allow")
-
-    lote_id  : str | None = Field(None, description="Lote em que este processo foi triado")
-    id_lote  : str | None = Field(
-        None,
-        description="Nome do PDF de origem — o Agente 1 chama o arquivo assim. "
-                    "Não confundir com `lote_id`.",
-    )
-    entidades      : EntidadesProcesso | None = None
-    decisao_agente1: str | None = Field(
-        None,
-        description="APTO ou NÃO APTO. Na prática vem sempre APTO: o processo "
-                    "reprovado na triagem não entra no resultado.",
-        examples=["APTO"],
-    )
-    motivo_agente1     : str | None = None
-    status_citacao     : str | None = None
-    resultado_penhora  : str | None = None
-    ultima_movimentacao: str | None = Field(None, examples=["2019-03-14"])
-    confianca_ocr_media: float | None = Field(
-        None,
-        description="Média da confiança do OCR nas páginas digitalizadas, de 0 a 100. "
-                    "Valor baixo pede conferência no PDF.",
-        examples=[92.4],
-    )
-
-
-class ClassificacaoAuditoria(BaseModel):
-    """
-    Uma classificação registrada na auditoria (historico_extracoes.jsonl).
-    Diferente de agente1/agente2, cobre TODAS as decisões — inclusive NÃO APTO.
-    Registro plano: sem 'entidades' aninhadas.
-    """
-    model_config = ConfigDict(extra="allow")
-
-    classificado_em    : str | None = Field(None, examples=["2026-08-05T09:30:00"])
-    numero_processo    : str | None = None
-    decisao            : str | None = Field(None, examples=["NÃO APTO"])
-    motivo             : str | None = Field(None, examples=["Penhora de imóvel efetivada"])
-    fonte_decisao      : str | None = None
-    ultima_movimentacao: str | None = None
-    status_citacao     : str | None = None
-    resultado_penhora  : str | None = None
-    id_lote            : str | None = Field(None, description="Nome do PDF de origem")
-    nome_executado     : str | None = None
-    cpf_cnpj           : str | None = None
-
-
-class AuditoriaProcesso(BaseModel):
-    """
-    Bloco de auditoria de um processo: a classificação vigente (a mais recente)
-    mais o histórico completo. O histórico é APPEND-ONLY, então um processo pode
-    ter várias linhas (foi reclassificado entre lotes) — daí `total`.
-    """
-    atual    : ClassificacaoAuditoria | None = None
-    historico: list[ClassificacaoAuditoria] = Field(default_factory=list)
-    total    : int = 0
-
-
-class ProcessoConsultado(BaseModel):
-    numero_processo: str = Field(description="Número como está gravado, com a pontuação original")
-    encontrado_em: list[str] = Field(
-        description="Quais fontes têm o processo: 'agente1', 'agente2' e/ou 'auditoria'"
-    )
-    agente1: TriagemAgente1 | None = Field(
-        None, description="Nulo quando só o Agente 2 tem o processo"
-    )
-    agente2: ProcessoAnalisado | None = Field(
-        None, description="Nulo enquanto o Agente 2 não analisou o processo"
-    )
-    # [V7.3] O histórico é APPEND-ONLY: o mesmo processo pode ter sido analisado
-    # mais de uma vez entre lotes (reenviado, reclassificado). `agente2` acima
-    # é sempre a análise vigente; aqui vêm TODAS — inclusive a vigente, na
-    # ordem em que foram lidas — para quem quiser ver a evolução completa,
-    # igual ao que `buscar_processo.py` mostra no CLI. Lista com 1 item só
-    # significa "nunca foi reanalisado".
-    agente2_historico: list[ProcessoAnalisado] = Field(
-        default_factory=list,
-        description="Todas as análises do Agente 2 para este processo, em outros "
-                    "lotes inclusive — 1 item quando nunca foi reanalisado.",
-    )
-    auditoria: AuditoriaProcesso | None = Field(
-        None,
-        description="Classificação de triagem — TODAS as decisões, inclusive NÃO APTO. "
-                    "É aqui que aparece um processo reprovado na triagem, que não entra "
-                    "em `agente1`/`agente2`. Nulo se o lote foi processado antes da auditoria.",
-    )
-
-
-class Lote(BaseModel):
-    model_config = ConfigDict(json_schema_extra={"example": {
-        "lote_id"     : "20260729-143000-a1b2c3",
-        "status"      : "concluido",
-        "origem"      : "siap",
-        "criado_em"   : "2026-07-29 14:30:00",
-        "iniciado_em" : "2026-07-29 14:30:01",
-        "concluido_em": "2026-07-29 14:38:12",
-        "arquivos"    : ["processo1.pdf", "processo2.pdf"],
-        "etapa"       : "concluído",
-        "decorrido_s"    : 491,
-        "lotes_na_frente": None,
-        "resumo"      : "9 de 12 processo(s) classificados como APTO",
-        "avisos"      : [],
-        "erro"        : None,
-        "totais"      : {"ALTA": 4, "MEDIA": 3, "BAIXA": 2},
-    }})
-
-    lote_id: str = Field(description="Identificador do lote — use nas demais rotas")
-    status : StatusLote
-    origem : str | None = Field(
-        None, description="Rótulo do consumidor que enviou o lote, ou 'painel'"
-    )
-    criado_em   : str | None = None
-    iniciado_em : str | None = Field(None, description="Nulo enquanto o lote está na fila")
-    concluido_em: str | None = None
-    arquivos    : list[str] = Field(default_factory=list, description="PDFs recebidos neste lote")
-    campos      : str | None = Field(
-        "todas",
-        description="Etapas extraídas neste lote (Fase 3): citacao, penhora, "
-                    "movimentacao, sinais, entidades, tipo — ou 'todas'. Ao pedir "
-                    "qualquer subconjunto, entidades e tipo são sempre incluídos "
-                    "também, mesmo que não tenham sido pedidos (são a identificação "
-                    "básica do processo, necessária pra saber de qual processo é o "
-                    "resto). Etapas não pedidas são reaproveitadas do estado "
-                    "anterior (merge), ou saem null se for a primeira vez.",
-        examples=["todas"],
-    )
-    etapa       : str | None = Field(None, description="Passo corrente, para exibir a quem espera")
-    decorrido_s : int | None = Field(
-        None,
-        description="Segundos de espera na fila, de processamento em curso, ou o "
-                    "total gasto depois de concluído — conforme o status. Vem do "
-                    "relógio do serviço, não depende do fuso de quem consulta.",
-        examples=[491],
-    )
-    lotes_na_frente: int | None = Field(
-        None,
-        description="Quantos lotes precisam terminar antes deste começar. "
-                    "Só vem preenchido com status 'na_fila'.",
-    )
-    downloads: list[TipoArquivo] = Field(
-        default_factory=list,
-        description="Artefatos disponíveis para este lote. Baixe em "
-                    "`GET /api/v1/lotes/{lote_id}/arquivos/{tipo}`.",
-    )
-    resumo      : str | None = Field(
-        None, examples=["9 de 12 processo(s) classificados como APTO"]
-    )
-    avisos: list[str] = Field(
-        default_factory=list,
-        description="NÃO NULO com status 'concluido' significa que o lote rodou até o "
-                    "fim mas algo deu errado no caminho. Trate como falha.",
-    )
-    erro  : str | None = Field(None, description="Preenchido quando status é 'erro'")
-    totais: Totais | None = Field(None, description="Só depois de concluído")
-    conflitos_detectados: int | None = Field(
-        None,
-        description="Quantos processos deste lote tiveram, para o MESMO PDF (hash "
-                    "igual), um valor novo diferente do estado anterior — o Agente 1 "
-                    "manteve o valor antigo e marcou para revisão humana. Veja também "
-                    "em `avisos`. None até o Agente 1 terminar.",
-        examples=[0],
-    )
-
-
-class LoteComLog(Lote):
-    log: list[str] = Field(
-        default_factory=list,
-        description=f"Saída dos agentes, últimas {MAX_LINHAS_LOG} linhas",
-    )
-
-
-class LoteComAnalises(Lote):
-    analises: list[ProcessoAnalisado] = Field(
-        default_factory=list, description="Um item por processo APTO"
-    )
-
-
-class ListaLotes(BaseModel):
-    lotes: list[Lote]
-
-
-class ListaLotesComLog(BaseModel):
-    lotes: list[LoteComLog]
-
-
-class Saude(BaseModel):
-    status     : str = Field(examples=["ok"])
-    api_ativa  : bool = Field(description="False quando falta API_TOKENS — a API recusa tudo com 503")
-    na_fila    : int
-    processando: int
-
-
-class Relatorio(BaseModel):
-    nome         : str
-    tamanho_kb   : float
-    modificado_em: str
-
-
-class ListaRelatorios(BaseModel):
-    arquivos: list[Relatorio]
-
-
-# Respostas de erro comuns a toda a API v1 — repetidas em cada rota só para o
-# Swagger mostrar o corpo que o consumidor vai receber.
-_ERROS_AUTH = {
-    401: {"model": Erro, "description": "Token ausente ou inválido"},
-    503: {"model": Erro, "description": "Serviço sem API_TOKENS configurado — falha fechada"},
-}
-_ERRO_LOTE = {
-    404: {"model": Erro, "description": "Lote inexistente ou de outro consumidor"},
-}
-
-
-# ════════════════════════════════════════════════════════════════
-# APLICAÇÃO
-# ════════════════════════════════════════════════════════════════
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global _fila
-    _garantir_pastas()
-    _carregar_registro()
-    try:
-        _limpar_antigos()
-    except Exception:
-        log.exception("Falha na limpeza de lotes antigos — seguindo mesmo assim")
-    _fila = asyncio.Queue()
-    tarefa = asyncio.create_task(_worker())
-
-    # Credencial malformada nunca autentica ninguém, mas falha como se o token
-    # estivesse errado. Gritar aqui evita horas de caça a um 401 sem causa.
-    for problema in _erros_config:
-        log.error("=" * 70)
-        log.error(f"CREDENCIAL INVÁLIDA — {problema}")
-        log.error("=" * 70)
-
-    if not TOKENS:
-        log.warning("API_TOKENS não configurado — a API responderá 503 a tudo")
-    else:
-        log.info(f"API habilitada para: {', '.join(sorted(set(TOKENS.values())))}")
-    if _tokens_legado:
-        log.warning(
-            f"Token em TEXTO PURO no ambiente para: {', '.join(sorted(set(_tokens_legado)))}. "
-            "Troque pelo hash — 'python gerar_credencial.py api <rotulo>'."
-        )
-    if not PAINEL_ATIVO:
-        log.warning("Senha do painel não configurada — o painel não abrirá")
-    elif not SENHA_PAINEL_HASH:
-        log.warning(
-            "SENHA_PAINEL está em TEXTO PURO no ambiente. Gere o hash com "
-            "'python gerar_credencial.py painel' e use SENHA_PAINEL_HASH."
-        )
-
-    yield
-    tarefa.cancel()
-
-
-_DESCRICAO = """
-Triagem automatizada de execuções fiscais — **HERA Tecnologia / PGMS**, contrato nº 01/2026.
-
-Envie os PDFs dos processos; o serviço extrai os dados (com OCR quando a página é
-digitalizada), classifica cada processo em APTO / NÃO APTO e devolve a priorização
-jurídico-fiscal: prioridade, ação recomendada e alerta de prescrição.
-
-## Autenticação
-
-Todas as rotas `/api/v1/*` exigem o token do consumidor:
-
-```http
-Authorization: Bearer <token>
-```
-
-Clique em **Authorize**, no alto da página, para testar por aqui — o token passa a valer
-para todas as rotas. Ele é emitido por `python gerar_credencial.py api <rotulo>` e
-aparece uma única vez; perdido, emite-se outro.
-
-Cada consumidor só enxerga os próprios lotes. O lote de outro token responde `404`, nunca
-`403` — a existência do lote alheio também não vaza.
-
-Se **tudo** responder `503`, o serviço está sem `API_TOKENS`. É deliberado: configuração
-incompleta deixa o serviço fechado, nunca aberto.
-
-## O processamento é assíncrono
-
-OCR e GPT levam minutos por lote e nenhum proxy segura a conexão tanto tempo. O envio
-responde `202` na hora com um `lote_id`; acompanhe por polling. Os lotes rodam em fila
-serial — um por vez, porque o OCR já satura a CPU.
-
-1. `POST /api/v1/lotes` → `202` com o `lote_id`
-2. `GET /api/v1/lotes/{lote_id}` a cada ~30 s, até o status sair de `na_fila`/`processando`
-3. `GET /api/v1/lotes/{lote_id}/resultado` quando o status for `concluido`
-
-Ciclo de vida: `na_fila` → `processando` → `concluido` | `erro`
-
-## Um PDF por vez
-
-Quem manda **um único PDF por lote** pode pular o formato agregado do passo 3
-e ir direto ao relatório do processo:
-
-```http
-GET /api/v1/lotes/{lote_id}/processo
-```
-
-É o mesmo relatório de `GET /api/v1/processos` — mas sem precisar saber o
-número CNJ de antemão, já que ele sai do próprio PDF enviado. Só funciona
-quando o lote tem exatamente 1 PDF **e** dele saiu exatamente 1 processo; com
-mais de um PDF, ou um PDF com mais de um processo, a rota responde `422` e
-aponta para `/resultado`.
-
-## Consulta por número de processo
-
-Quando a pergunta parte do processo e não do lote:
-
-```http
-GET /api/v1/processos?numero=0752821-68.2013.8.05.0001
-```
-
-Devolve a triagem do Agente 1 e a priorização do Agente 2 do processo, procurando em
-todos os lotes já enviados por este consumidor. A pontuação do número é indiferente.
-
-## Sempre confira `avisos`
-
-A extração trata OCR quebrado, erro de API e PDF ilegível internamente e **encerra com
-sucesso**. Um lote pode chegar a `concluido` tendo classificado zero processos. Por isso
-toda resposta traz `resumo` e `avisos`:
-
-```json
-{
-  "status": "concluido",
-  "resumo": "0 de 12 processo(s) classificados como APTO",
-  "avisos": ["Nenhum processo foi classificado como APTO — o resultado sairá vazio"]
-}
-```
-
-`status: "concluido"` com `avisos` não vazio significa que o lote rodou até o fim mas algo
-deu errado no caminho. **Trate como falha.**
+#     # [GEMINI PLACEHOLDER]   (migração OpenAI -> Gemini localizada; a
+#                              estrutura de entrada/saída das funções não muda,
+#                              só a fonte da resposta.)
+#
+# Consequência prática p/ LGPD: o container do Agente 1 não embarca SDK de LLM
+# nem chave, reduzindo a superfície de dados que sai do servidor da PGMS.
+# ===========================================================================
+
+
+# 6. Resumo informativo (substitui o antigo prompt de GPT; não é veredito)
+RESUMO_TEMPLATE = """RESUMO DOS SINAIS DETECTADOS (Agente 1 — extração automática)
+Informativo. O Agente 1 NÃO emite juízo APTO/NÃO APTO; apenas reporta o que
+foi extraído do processo para revisão humana / Agente 2.
+
+- Última movimentação detectada: {fecha}
+- Status da citação detectado:    {citacion}
+- Resultado da penhora detectado: {penhora}
 """
 
-URL_OPENAPI = "/api/openapi.json"
-
-app = FastAPI(
-    title="Triagem de Execuções Fiscais — PGMS",
-    version="1.0",
-    description=_DESCRICAO,
-    docs_url=None,          # servido à mão logo abaixo, com o enviador de lotes
-    redoc_url="/api/redoc",
-    openapi_url=URL_OPENAPI,
-    openapi_tags=[
-        {
-            "name": "Lotes",
-            "description": "Envio e acompanhamento dos lotes. É o contrato da integração.",
-        },
-        {
-            "name": "Processos",
-            "description": "Consulta de um processo pelo número CNJ, atravessando os lotes já enviados.",
-        },
-        {
-            "name": "Serviço",
-            "description": "Estado do serviço. Sem autenticação, sem dado sensível.",
-        },
-    ],
-    lifespan=lifespan,
-)
+def create_prompt(fecha_reciente, citacion, penhora):
+    return RESUMO_TEMPLATE.format(
+        fecha    = fecha_reciente.strftime("%d/%m/%Y") if fecha_reciente else "Não especificado",
+        citacion = citacion or "Não especificado",
+        penhora  = penhora or "Não especificado",
+    )
 
 
-def _nome_pdf_seguro(nome: str) -> str:
-    limpo = Path(nome or "").name
-    if not limpo.lower().endswith(".pdf"):
-        raise HTTPException(400, f"Somente arquivos .pdf são aceitos: {limpo!r}")
-    if limpo in (".", "..") or not limpo.strip():
-        raise HTTPException(400, "Nome de arquivo inválido")
-    return limpo
+# 7. Generar registros para todos los archivos PDF
+# ===========================================================================
+# FASE 1 — EVIDÊNCIA (página de origem) PARA CITAÇÃO, PENHORA E ENTIDADES
+# ===========================================================================
+# Diz EM QUAL PÁGINA o Agente 1 achou cada informação, com trecho e se a página
+# veio de OCR. Aditivo: viaja em ocr_metadata e vira bloco 'evidencias' no JSON.
+#  - citação/penhora: página = primeira cuja saída do MESMO extractor == global
+#    (nunca aponta página errada; no máximo None em combinações raras).
+#  - entidades: procura o VALOR extraído nas páginas (dígitos p/ identificadores).
+
+_NEEDLES_PENHORA_TRECHO = [normalizar(x) for x in [
+    "valores bloqueados", "bloqueio", "bacenjud", "sisbajud", "bacen jud", "sis bajud",
+    "penhora", "renajud", "restricao veicular", "indisponibilidade", "cnib",
+    "arresto", "constri", "faturamento", "quotas", "cotas", "imovel", "precatorio",
+]]
+_SEM_EVIDENCIA_CITACAO = {"Citação não encontrado"}
+_SEM_EVIDENCIA_PENHORA = {"Penhora não encontrado"}
+# [v8.1.0] Evidência de página para alvará (pedido/levantamento), mesmo
+# mecanismo de citação/penhora: extract_pedido_alvara()/extract_levantamento_
+# alvara() só devolvem UM valor não-None cada (diferente de citação/penhora,
+# que têm várias categorias) — por isso não precisam de 'sem_evidencia'.
+_NEEDLES_ALVARA_PEDIDO       = [normalizar(k) for k in KEYWORDS_PEDIDO_ALVARA]
+_NEEDLES_ALVARA_LEVANTAMENTO = [normalizar(k) for k in KEYWORDS_LEVANTAMENTO_ALVARA]
+_CAMPOS_ENTIDADE_EVIDENCIA = [
+    "cpf_cnpj", "numero_cda", "numero_processo",
+    "valor_original", "valor_atualizado", "data_inscricao",
+    "exercicio", "nome_executado", "nome_exequente", "tipo_tributo", "vara",
+]
 
 
-_ETAPAS_VALIDAS = {"citacao", "penhora", "movimentacao", "sinais", "alvara", "entidades", "tipo"}
+def _localizar_pagina_por_extrator(pages_text, extrator, resultado_global, sem_evidencia):
+    """Primeira página (1-based) cujo extrator(pagina) == resultado_global, ou None."""
+    if not resultado_global or resultado_global in sem_evidencia:
+        return None
+    for i, txt in enumerate(pages_text, start=1):
+        if txt and extrator(txt) == resultado_global:
+            return i
+    return None
 
 
-def _normalizar_campos(campos: str) -> str:
+def _trecho_na_pagina(texto_pagina, needles_norm, ctx=80):
+    """Primeiro trecho (texto normalizado) da página com alguma needle, ou None."""
+    if not texto_pagina:
+        return None
+    tn = normalizar(texto_pagina)
+    melhor = None
+    for needle in needles_norm:
+        pos = tn.find(needle)
+        if pos != -1 and (melhor is None or pos < melhor[0]):
+            melhor = (pos, needle)
+    if melhor is None:
+        return None
+    pos, needle = melhor
+    ini = max(0, pos - 25); fim = min(len(tn), pos + len(needle) + ctx)
+    return tn[ini:fim].strip()
+
+
+def _trecho_valor(texto_pagina, valor, digitos):
+    """Trecho ao redor do valor na página (best-effort)."""
+    if not texto_pagina:
+        return None
+    tn = normalizar(texto_pagina)
+    alvo = normalizar(str(valor))
+    pos = tn.find(alvo)
+    if pos != -1:
+        ini = max(0, pos - 20); fim = min(len(tn), pos + len(alvo) + 45)
+        return tn[ini:fim].strip()
+    if digitos and len(digitos) >= 5:
+        pat = r"[.\-/\s]?".join(re.escape(d) for d in digitos)
+        m = re.search(pat, texto_pagina)
+        if m:
+            ini = max(0, m.start() - 20); fim = min(len(texto_pagina), m.end() + 45)
+            return " ".join(texto_pagina[ini:fim].split())
+    return None
+
+
+def _localizar_pagina_por_valor(pages_text, valor):
     """
-    Valida/normaliza a seleção de etapas (Fase 3 do Agente 1). Devolve string
-    separada por vírgula com as etapas válidas, ou "" quando é 'todas' (ou
-    vazio), que é como o Agente 1 entende "processar tudo". Etapas inválidas
-    são descartadas; se nada sobrar, processa tudo (mesmo critério permissivo
-    que agente1.py usa em `_parse_campos` pro próprio CAMPOS malformado).
-
-    [MUDANÇA] entidades e tipo agora são FORÇADOS sempre que a seleção não é
-    vazia/"todas" — mesmo que não tenham sido pedidos, e mesmo que o pedido
-    tente excluí-los. São a identificação básica do processo (CPF/CNPJ, nome,
-    CDA, valor) e o filtro de escopo (é execução fiscal?): sem eles não dá pra
-    saber de QUAL processo é o dado de citação/penhora/movimentação/sinais que
-    voltou. Antes dava pra pedir, por ex., só "penhora" e nada mais — quem
-    dependia disso agora também recebe entidades+tipo.
+    Primeira página que contém `valor`. Identificadores longos (>=5 dígitos:
+    CPF/CNPJ, CDA, nº processo, valor, data) comparam SÓ dígitos (robusto a
+    formatação/OCR); o resto compara por texto normalizado. (pagina|None, trecho|None).
     """
-    if not campos:
-        return ""
-    pedidos = {c.strip().lower() for c in campos.split(",") if c.strip()}
-    validos = pedidos & _ETAPAS_VALIDAS
+    if valor is None:
+        return None, None
+    s = str(valor).strip()
+    if not s:
+        return None, None
+    digitos = re.sub(r"\D", "", s)
+    usar_digitos = len(digitos) >= 5
+    for i, txt in enumerate(pages_text, start=1):
+        if not txt:
+            continue
+        if usar_digitos:
+            if digitos in re.sub(r"\D", "", txt):
+                return i, _trecho_valor(txt, s, digitos)
+        else:
+            alvo = normalizar(s)
+            if len(alvo) >= 3 and alvo in normalizar(txt):
+                return i, _trecho_valor(txt, s, digitos)
+    return None, None
+
+
+def construir_evidencias(pages_text, status_citacao, status_penhora, entidades, ocr_metadata,
+                          status_alvara=None):
+    """Monta o bloco 'evidencias' (aditivo). Sem evidência → encontrado_em_pagina=None.
+
+    `status_alvara` ({"pedido":..., "levantamento":...}) é opcional — só vem
+    preenchido quando a etapa 'alvara' foi pedida em CAMPOS (ver generate_
+    prompts). None = etapa não pedida -> evid['alvara'] nem aparece."""
+    paginas_ocr = set((ocr_metadata or {}).get("paginas_ocr", []) or [])
+    conf_ocr    = (ocr_metadata or {}).get("confianza_ocr", {}) or {}
+
+    def _meta(pag, trecho):
+        if pag is None:
+            return {"encontrado_em_pagina": None, "trecho": None, "via_ocr": None, "confianca_ocr": None}
+        via = pag in paginas_ocr
+        return {"encontrado_em_pagina": pag, "trecho": trecho,
+                "via_ocr": via, "confianca_ocr": conf_ocr.get(pag) if via else None}
+
+    def _bloco_extrator(extrator, status, sem_evid, needles):
+        pag = _localizar_pagina_por_extrator(pages_text, extrator, status, sem_evid)
+        texto = pages_text[pag - 1] if (pag and pag <= len(pages_text)) else None
+        return _meta(pag, _trecho_na_pagina(texto, needles) if pag else None)
+
+    needles_cit = [normalizar(k) for k in (KEYWORDS_CITACION_OK
+                   if status_citacao == "HOUVE CITAÇÃO" else KEYWORDS_CITACION_NAO_OK)]
+
+    evid = {
+        "citacao": _bloco_extrator(extract_citacion, status_citacao, _SEM_EVIDENCIA_CITACAO, needles_cit),
+        "penhora": _bloco_extrator(extract_penhora,  status_penhora,  _SEM_EVIDENCIA_PENHORA, _NEEDLES_PENHORA_TRECHO),
+    }
+    if status_alvara is not None:
+        evid["alvara"] = {
+            "pedido": _bloco_extrator(extract_pedido_alvara, status_alvara.get("pedido"),
+                                       set(), _NEEDLES_ALVARA_PEDIDO),
+            "levantamento": _bloco_extrator(extract_levantamento_alvara, status_alvara.get("levantamento"),
+                                             set(), _NEEDLES_ALVARA_LEVANTAMENTO),
+        }
+    ent = entidades or {}
+    ent_evid = {}
+    for campo in _CAMPOS_ENTIDADE_EVIDENCIA:
+        valor = ent.get(campo)
+        if valor is None or str(valor).strip() == "":
+            continue
+        pag, trecho = _localizar_pagina_por_valor(pages_text, valor)
+        ent_evid[campo] = _meta(pag, trecho)
+    if ent_evid:
+        evid["entidades"] = ent_evid
+    return evid
+
+
+def _pag_evid(ocr_metadata, campo):
+    """Número da página da evidência de citacao/penhora para a planilha, ou ''."""
+    ev = (ocr_metadata or {}).get("evidencias") or {}
+    p = (ev.get(campo) or {}).get("encontrado_em_pagina")
+    return p if p is not None else ""
+
+
+# ===========================================================================
+# FILTRO DE ESCOPO — ignorar PDFs que NÃO são execução fiscal
+# ===========================================================================
+# MODO_ESCOPO:
+#   "ignorar_todos" (PADRÃO): não inclui nenhum PDF fora de escopo (alta OU baixa).
+#   "ignorar_alta"          : ignora só os de ALTA confiança; baixa entra p/ revisão.
+#   "incluir_tudo"          : nunca ignora (comportamento antigo).
+# Em qualquer modo, ignorados são logados e listados em 'ignorados_V8.txt'.
+MODO_ESCOPO = os.environ.get("MODO_ESCOPO", "ignorar_todos").strip().lower()
+
+
+# ===========================================================================
+# FASE 3 — SELETOR DE ETAPAS (definir o que o agente deve buscar)
+# ===========================================================================
+# Env CAMPOS: lista separada por vírgula das etapas a executar. Vazio/"todas"
+# = tudo (comportamento padrão, retrocompatível). Etapas não pedidas ficam
+# NULL na saída — o que é DIFERENTE de "procurado e não encontrado".
+# O JSON registra 'campos_processados' (proveniência) para o passo seguinte
+# (Fase 4 — reaproveitamento) poder distinguir "não pedido" de "vazio".
+#
+# ATENÇÃO: uma extração PARCIAL não deve ir direto ao Agente 2 sem antes ser
+# combinada com o estado anterior (Fase 4) — senão o Agente 2 lê os campos não
+# pedidos como ausentes. Por isso emitimos um aviso visível ao rodar parcial.
+_CAMPOS_VALIDOS = {"citacao", "penhora", "movimentacao", "sinais", "alvara", "entidades", "tipo"}
+
+
+def _parse_campos(valor):
+    if not valor or valor.strip().lower() in ("", "todas", "todos", "all", "*"):
+        return set(_CAMPOS_VALIDOS)
+    pedidos = {c.strip().lower() for c in valor.split(",") if c.strip()}
+    invalidos = pedidos - _CAMPOS_VALIDOS
+    if invalidos:
+        logging.warning(f"CAMPOS inválidos ignorados: {sorted(invalidos)}. "
+                        f"Válidos: {sorted(_CAMPOS_VALIDOS)}")
+    validos = pedidos & _CAMPOS_VALIDOS
     if not validos:
-        return ""          # nada reconhecido -> processa tudo, por segurança
-    validos |= {"entidades", "tipo"}
-    if validos == _ETAPAS_VALIDAS:
-        return ""          # a união deu tudo -> mesma convenção de "" = todas
-    return ",".join(sorted(validos))
+        logging.warning("Nenhum CAMPO válido informado — processando TODOS por segurança.")
+        return set(_CAMPOS_VALIDOS)
+    return validos
 
 
-async def _gravar_lote(arquivos: list, origem: str, campos: str = "") -> dict:
-    """Cria o lote em disco e o enfileira."""
-    lote_id = datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + secrets.token_hex(3)
-    entrada = _dir_lote(lote_id) / "entrada"
-    entrada.mkdir(parents=True, exist_ok=True)
-
-    nomes, total_bytes = [], 0
-    for arq in arquivos:
-        nome = _nome_pdf_seguro(arq.filename)
-
-        # Dois PDFs de pastas diferentes podem chegar com o mesmo nome — o
-        # painel deixa juntar arquivos de várias pastas num lote só. Sem
-        # desambiguar, o segundo sobrescreveria o primeiro e o lote
-        # processaria um processo a menos sem avisar ninguém.
-        if nome in nomes:
-            base, seq = nome[:-4], 2
-            while f"{base}-{seq}.pdf" in nomes:
-                seq += 1
-            nome = f"{base}-{seq}.pdf"
-
-        destino = entrada / nome
-        with open(destino, "wb") as f:
-            while chunk := await arq.read(1024 * 1024):
-                total_bytes += len(chunk)
-                if total_bytes > MAX_MB_LOTE * 1024 * 1024:
-                    f.close()
-                    shutil.rmtree(_dir_lote(lote_id), ignore_errors=True)
-                    raise HTTPException(413, f"Lote excede o limite de {MAX_MB_LOTE} MB")
-                f.write(chunk)
-        nomes.append(nome)
-
-    if not nomes:
-        shutil.rmtree(_dir_lote(lote_id), ignore_errors=True)
-        raise HTTPException(400, "Nenhum PDF enviado")
-
-    lote = {
-        "id"          : lote_id,
-        "status"      : "na_fila",
-        "origem"      : origem,
-        "criado_em"   : _agora(),
-        "iniciado_em" : None,
-        "concluido_em": None,
-        "arquivos"    : nomes,
-        "campos"      : _normalizar_campos(campos),   # [Fase 3] etapas pedidas ("" = todas)
-        "etapa"       : "na fila",
-        "log"         : [],
-        "analises"    : [],
-        "avisos"      : [],
-        "resumo"      : None,
-        "erro"        : None,
-        "totais"      : None,
-        "planilha"    : None,
-    }
-
-    async with _lock:
-        _lotes[lote_id] = lote
-        _salvar_registro()
-    await _fila.put(lote_id)
-
-    log.info(f"Lote {lote_id} recebido de '{origem}' — {len(nomes)} PDF(s), "
-             f"{round(total_bytes/1024/1024, 1)} MB")
-    return lote
+CAMPOS = _parse_campos(os.environ.get("CAMPOS"))
 
 
-# ════════════════════════════════════════════════════════════════
-# API v1 — consumo externo (SIAP)
-# ════════════════════════════════════════════════════════════════
+# ===========================================================================
+# FASE 4 — REAPROVEITAMENTO / MERGE (estado atual por processo)
+# ===========================================================================
+# Um arquivo dedicado e COMPARTILHADO guarda o "estado atual" de cada processo,
+# campo a campo, com proveniência (quando, de qual lote, de qual hash de PDF).
+# A cada corrida o merge atualiza esse estado respeitando CAMPOS:
+#   - etapa NÃO pedida  -> mantém o valor anterior (é o reaproveitamento);
+#   - etapa pedida:
+#       * valor igual        -> refresca proveniência;
+#       * valor diferente:
+#            - PDF mudou (hash != )  -> toma o novo (documento evoluiu);
+#            - mesmo PDF (ou hash ?) -> conserva o velho e MARCA CONFLITO p/ revisão.
+# Chave = número do processo; se não houver, nome do arquivo (com reverse-lookup
+# por arquivo para não duplicar um processo já conhecido pelo número).
+# Fica junto ao script (compartilhado, estável entre lotes). Docker: volume.
+ESTADO_PATH = os.environ.get("ESTADO_PATH") or os.path.join(CURRENT_DIR, "estado_atual_processos.json")
+USAR_MERGE  = os.environ.get("USAR_MERGE", "1").strip().lower() not in ("0", "false", "nao", "não", "off")
 
-@app.get("/api/docs", include_in_schema=False)
-async def documentacao():
-    """
-    Swagger com um enviador de lotes por cima.
-
-    O formulário que o Swagger UI gera para um campo do tipo lista aceita um
-    arquivo por linha e não abre seleção múltipla — para mandar uma pasta de
-    processos é inviável. Como a página é servida por nós, um enviador próprio
-    entra antes dela: mesma rota, mesmo token, mas com arrastar-e-soltar,
-    escolha de pasta inteira e acompanhamento do lote até o resultado.
-    """
-    pagina = bytes(get_swagger_ui_html(
-        openapi_url=URL_OPENAPI,
-        title=f"{app.title} — API",
-    ).body).decode()
-    return HTMLResponse(pagina.replace('<div id="swagger-ui">',
-                                       _ENVIO_DOCS + '<div id="swagger-ui">'))
-
-
-@app.get(
-    "/health",
-    tags=["Serviço"],
-    summary="Healthcheck",
-    response_model=Saude,
-)
-async def health():
-    """Healthcheck do Easypanel — sem autenticação, sem dado sensível."""
-    return {
-        "status"     : "ok",
-        "api_ativa"  : bool(TOKENS),
-        "na_fila"    : sum(1 for l in _lotes.values() if l["status"] == "na_fila"),
-        "processando": sum(1 for l in _lotes.values() if l["status"] == "processando"),
-    }
-
-
-@app.post(
-    "/api/v1/lotes",
-    tags=["Lotes"],
-    summary="Enviar processos para triagem",
-    status_code=202,
-    response_model=Lote,
-    responses={
-        202: {"model": Lote, "description": "Lote aceito e enfileirado"},
-        400: {"model": Erro, "description": "Nenhum PDF enviado, ou arquivo que não é .pdf"},
-        413: {"model": Erro, "description": f"Lote acima de {MAX_MB_LOTE} MB"},
-        **_ERROS_AUTH,
-    },
-)
-async def criar_lote(
-    arquivos: list[UploadFile] = File(..., description="Um ou mais PDFs de processos"),
-    campos: str = Form(
-        "",
-        description="Quais análises pedir, entre citacao, penhora, movimentacao, "
-                    "sinais — separadas por vírgula. Vazio = todas. "
-                    "entidades e tipo são SEMPRE extraídos junto, mesmo que não "
-                    "sejam pedidos aqui: sem eles não dá pra saber de QUAL "
-                    "processo é o dado de citação/penhora que voltou. "
-                    "Etapas não pedidas são reaproveitadas do estado anterior "
-                    "daquele processo (ou saem null, se for a primeira vez).",
-        examples=["penhora"],
-    ),
-    consumidor: str = Depends(autenticar_api),
-):
-    """
-    Envio `multipart/form-data`, campo `arquivos` repetido — um por PDF. **Todos os
-    PDFs de uma requisição formam UM lote**, processado de uma vez.
-
-    Responde **202 na hora**: o processamento é assíncrono e leva minutos. Guarde o
-    `lote_id` e acompanhe em `GET /api/v1/lotes/{lote_id}` até o status virar
-    `concluido` ou `erro`. Para pegar só os campos extraídos, recortados ao que
-    foi pedido (sem as demais chaves com `null`), use
-    `GET /api/v1/lotes/{lote_id}/dados`.
-
-    ### Pedindo só uma ou algumas etapas
-
-    Útil para reprocessar, por exemplo, só a penhora depois de uma correção,
-    sem pagar o custo de reler citação/movimentação/sinais que já estavam
-    certos: `-F campos=penhora`. entidades e tipo vêm sempre, por cima do que
-    foi pedido — não precisa (nem dá pra) excluir os dois.
-
-    O Agente 1 reaproveita, para as etapas NÃO pedidas, o último valor
-    conhecido daquele número de processo (Fase 4 — merge), guardado num estado
-    **compartilhado entre todos os lotes e consumidores** desta instância.
-    Para um processo nunca visto antes, as etapas não pedidas saem `null` — não
-    há de onde reaproveitar. Se o Agente 1 encontrar, para o MESMO PDF, um
-    valor diferente do que tinha guardado, isso vira um "conflito": confira
-    `conflitos_detectados` e `avisos` na resposta de `GET /api/v1/lotes/{lote_id}`.
-
-    ### Mandando muitos PDFs de uma vez
-
-    O formulário aqui embaixo é do Swagger UI, que desenha **uma linha por arquivo** e
-    não abre seleção múltipla — é limitação da página, não da API. Com poucos arquivos,
-    clique em *Add string item* e escolha um por linha; todos entram no mesmo lote.
-
-    Para uma pasta inteira, use uma destas:
-
-    ```bash
-    # Linux/Mac — a pasta toda numa requisição
-    curl -X POST https://SEU-DOMINIO/api/v1/lotes \\
-         -H "Authorization: Bearer $TOKEN" \\
-         $(printf -- '-F arquivos=@%s ' *.pdf)
-    ```
-
-    ```powershell
-    # Windows PowerShell — $campos, não $args: $args é variável reservada
-    $campos = Get-ChildItem *.pdf | ForEach-Object { '-F'; "arquivos=@$($_.Name)" }
-    curl.exe -X POST https://SEU-DOMINIO/api/v1/lotes `
-             -H "Authorization: Bearer $TOKEN" @campos
-    ```
-
-    Ou abra o **painel** em `/` e arraste os arquivos — mesma fila, mesmo pipeline.
-    """
-    lote = await _gravar_lote(arquivos, origem=consumidor, campos=campos)
-    return _publico(lote)
-
-
-@app.get(
-    "/api/v1/lotes",
-    tags=["Lotes"],
-    summary="Listar meus lotes",
-    response_model=ListaLotes,
-    responses=_ERROS_AUTH,
-)
-async def listar_lotes(
-    consumidor: str = Depends(autenticar_api),
-    limite: int = Query(50, ge=1, le=500, description="Quantos lotes trazer"),
-):
-    """Lotes enviados por este consumidor, mais recentes primeiro. Sem log nem análises."""
-    meus = [l for l in _lotes.values() if l.get("origem") == consumidor]
-    meus.sort(key=lambda l: l.get("criado_em") or "", reverse=True)
-    return {"lotes": [_publico(l) for l in meus[:limite]]}
-
-
-@app.get(
-    "/api/v1/lotes/{lote_id}",
-    tags=["Lotes"],
-    summary="Consultar o estado de um lote",
-    response_model=LoteComLog,
-    responses={**_ERROS_AUTH, **_ERRO_LOTE},
-)
-async def consultar_lote(lote_id: str, consumidor: str = Depends(autenticar_api)):
-    """
-    Rota do polling. Enquanto o status for `na_fila` ou `processando`, repita —
-    a cada ~30 s basta. Traz o log dos agentes, útil para diagnosticar um lote travado.
-    """
-    return _publico(_lote_do_consumidor(lote_id, consumidor), incluir_log=True)
-
-
-@app.get(
-    "/api/v1/lotes/{lote_id}/resultado",
-    tags=["Lotes"],
-    summary="Baixar a priorização do lote",
-    response_model=LoteComAnalises,
-    responses={
-        409: {"model": Erro, "description": "Lote ainda não concluído — continue o polling"},
-        **_ERROS_AUTH,
-        **_ERRO_LOTE,
-    },
-)
-async def resultado_lote(lote_id: str, consumidor: str = Depends(autenticar_api)):
-    """
-    Priorização completa: um item em `analises` por processo APTO, com prioridade,
-    ação recomendada e alerta de prescrição.
-
-    Só responde com status `concluido`; antes disso devolve `409`. Confira `avisos`
-    antes de consumir — lote concluído com avisos rodou até o fim mas deu errado.
-    """
-    lote = _lote_do_consumidor(lote_id, consumidor)
-    if lote["status"] != "concluido":
-        raise HTTPException(409, f"Lote ainda em '{lote['status']}' — aguarde 'concluido'")
-    return _publico(lote, incluir_analises=True)
-
-
-def _lote_do_consumidor(lote_id: str, consumidor: str) -> dict:
-    lote = _lotes.get(lote_id)
-    if not lote or lote.get("origem") != consumidor:
-        raise HTTPException(404, "Lote não encontrado")
-    return lote
-
-
-# Mantido em sincronia manual com _CAMPOS_POR_ETAPA em agente1.py — mapeia
-# cada etapa de CAMPOS para as chaves do JSON de saída que ela preenche.
-# Usado só para RECORTAR a resposta de GET /api/v1/lotes/{lote_id}/dados; o
-# arquivo bruto (agente1_json) nunca é tocado, e o Agente 2 sempre recebe o
-# JSON completo — o recorte é só uma projeção para quem pediu extração parcial.
-_CHAVES_POR_ETAPA = {
+# Campos do 'pr' (schema do JSON) agrupados por etapa. Dicts aninhados
+# (sinais/alvara/entidades/tipo) são tratados como unidade da sua etapa.
+_CAMPOS_POR_ETAPA = {
+    "movimentacao": ["ultima_movimentacao"],  # dias_desde é recomputado à parte
     "citacao"     : ["status_citacao", "data_ordem_citacao",
-                      "data_tentativa_citacao", "data_citacao_efetiva"],
+                     "data_tentativa_citacao", "data_citacao_efetiva"],
     "penhora"     : ["resultado_penhora"],
-    "movimentacao": ["ultima_movimentacao", "dias_desde_ultima_movimentacao"],
     "sinais"      : ["sinais_processuais"],
     "alvara"      : ["status_alvara"],
-}
-
-# Sempre presentes, pedidas ou não: identificam o processo e dizem se a
-# leitura do PDF deu certo. Sem isto, a resposta recortada não diria nem de
-# QUAL processo nem se o que falta é "não pedido" ou "PDF não pôde ser lido".
-_CHAVES_SEMPRE = ["arquivo", "numero_processo", "extracao_ok", "erro_extracao",
-                  "entidades", "tipo_processo"]
-
-
-def _recortar_processo(pr: dict, campos: str) -> dict:
-    """
-    Mantém só as chaves de _CHAVES_SEMPRE mais as da(s) etapa(s) pedida(s) em
-    `campos` ("" == todas as etapas de citação/penhora/movimentação/sinais,
-    sem recorte nenhum — mesmo conteúdo de sempre).
-    """
-    recortado = {k: pr.get(k) for k in _CHAVES_SEMPRE}
-    etapas = set(campos.split(",")) if campos else set(_CHAVES_POR_ETAPA)
-    for etapa in etapas:
-        for chave in _CHAVES_POR_ETAPA.get(etapa, []):
-            recortado[chave] = pr.get(chave)
-    if pr.get("conflitos"):
-        recortado["conflitos"] = pr["conflitos"]
-    return recortado
-
-
-def _recorte_etapas_relatorio(agente1: dict | None, campos: str | None) -> dict | None:
-    """
-    Irmã de `_recortar_processo`, mas para a tarjeta de UM processo (GET
-    .../processo, usada pelo widget de teste e pelo painel): ali o registro
-    completo do Agente 1 é exibido com TODAS as suas chaves (lote_id, decisão,
-    OCR, evidências de página etc.), não um dict recortado às pressas — por
-    isso aqui só ZERAMOS as chaves das etapas NÃO pedidas nesta corrida
-    (`campos` do lote), em vez de reconstruir o dict do zero.
-
-    Sem isto, um processo já visto antes mostrava, por ex., 'Resultado
-    penhora' reaproveitado de uma corrida anterior mesmo quando esta corrida
-    só pediu 'citacao' — confuso: pareceria que a penhora foi conferida agora.
-
-    `agente2`/`auditoria` (a priorização e a classificação) não são afetados:
-    `campos` só controla o que o Agente 1 extrai, não a análise do Agente 2.
-    """
-    if not agente1 or not campos:
-        return agente1
-    agente1 = dict(agente1)    # cópia — não mexe no dict devolvido pela busca
-    etapas = set(campos.split(","))
-    evidencias = agente1.get("evidencias")
-    if isinstance(evidencias, dict):
-        evidencias = dict(evidencias)
-        agente1["evidencias"] = evidencias
-    for etapa, chaves in _CHAVES_POR_ETAPA.items():
-        if etapa in etapas:
-            continue
-        for chave in chaves:
-            agente1.pop(chave, None)
-        if evidencias is not None:
-            evidencias.pop(etapa, None)
-    return agente1
-
-
-@app.get(
-    "/api/v1/lotes/{lote_id}/dados",
-    tags=["Lotes"],
-    summary="Dados extraídos do lote, recortados ao que foi pedido",
-    responses={
-        200: {"description": "Um item por processo, só com as chaves pedidas"},
-        409: {"model": Erro, "description": "Lote ainda não concluído — continue o polling"},
-        **_ERROS_AUTH,
-        **_ERRO_LOTE,
-    },
-)
-async def dados_lote(lote_id: str, consumidor: str = Depends(autenticar_api)):
-    """
-    Um item por processo, com **só** as chaves que fazem sentido para o que foi
-    pedido neste lote: `arquivo`, `numero_processo`, `extracao_ok`,
-    `erro_extracao`, `entidades` e `tipo_processo` sempre vêm; as demais
-    (`status_citacao` + 3 datas, `resultado_penhora`, `ultima_movimentacao` +
-    `dias_desde_ultima_movimentacao`, `sinais_processuais`) só vêm se a etapa
-    correspondente estava em `campos` quando o lote foi criado em
-    `POST /api/v1/lotes` (ex.: `campos=penhora`). Um lote sem `campos`
-    (extração completa) devolve tudo, sem recorte nenhum.
-
-    Diferente de `GET .../arquivos/agente1_json` (o JSON **bruto**, sempre com
-    TODAS as chaves, usando `null` tanto para "não pedido" quanto para "pedido
-    e não encontrado"): aqui, uma chave ausente é inequivocamente "não foi
-    pedida nesta corrida" — sem a ambiguidade do `null`.
-
-    Só responde com status `concluido`; antes disso devolve `409`.
-    """
-    lote = _lote_do_consumidor(lote_id, consumidor)
-    if lote["status"] != "concluido":
-        raise HTTPException(409, f"Lote ainda em '{lote['status']}' — aguarde 'concluido'")
-
-    caminho = _dir_lote(lote_id) / "json" / "saida_agente1_V8.json"
-    if not caminho.exists():
-        raise HTTPException(
-            404,
-            "Este lote não tem dados do Agente 1 — pode ter falhado antes de "
-            "gerar o JSON de traspasse. Veja 'erro' em GET /api/v1/lotes/{lote_id}.",
-        )
-
-    with open(caminho, encoding="utf-8") as f:
-        bruto = json.load(f)
-
-    campos = lote.get("campos") or ""
-    return {
-        "lote_id"  : lote_id,
-        "campos"   : campos or "todas",
-        "processos": [_recortar_processo(pr, campos) for pr in bruto.get("processos", [])],
-    }
-
-
-def _resposta_arquivo(lote: dict, tipo: str, consumidor: str | None = None) -> FileResponse:
-    """
-    consumidor=None significa painel: o procurador enxerga o acervo inteiro por
-    desenho. Com um consumidor, a planilha acumulada do Agente 2 é recortada aos
-    lotes dele — o arquivo em resultados/ é global e entregá-lo cru vazaria os
-    processos dos demais consumidores.
-    """
-    if tipo == "agente2_planilha" and consumidor is not None:
-        recorte = _planilha_a2_recortada(consumidor)
-        if not recorte:
-            raise HTTPException(
-                404,
-                "Ainda não há processos priorizados nos seus lotes. "
-                "Aguarde o lote concluir e tente de novo.",
-            )
-        return FileResponse(recorte, filename="priorizacao.xlsx", media_type=_XLSX)
-
-    achado = _arquivos_do_lote(lote).get(tipo)
-    if not achado:
-        raise HTTPException(
-            404,
-            f"Este lote não tem '{tipo}'. Veja em 'downloads' o que existe — "
-            "um lote que terminou em erro pode não ter gerado nada.",
-        )
-    caminho, nome, media = achado
-    return FileResponse(caminho, filename=nome, media_type=media)
-
-
-@app.get(
-    "/api/v1/lotes/{lote_id}/arquivos",
-    tags=["Lotes"],
-    summary="Listar o que dá para baixar deste lote",
-    response_model=ListaArquivos,
-    responses={**_ERROS_AUTH, **_ERRO_LOTE},
-)
-async def arquivos_lote(lote_id: str, consumidor: str = Depends(autenticar_api)):
-    """
-    Os artefatos dos dois agentes, com tamanho e rota de download.
-
-    Atenção ao `agente2_planilha`: o Excel de priorização é **acumulativo** — o
-    Agente 2 o regera do histórico inteiro a cada lote, então ele traz também os
-    processos dos lotes anteriores. Para o recorte deste lote use `agente2_json`.
-    """
-    lote = _lote_do_consumidor(lote_id, consumidor)
-    return {
-        "arquivos": [
-            {
-                "tipo"      : tipo,
-                "descricao" : DESCRICAO_ARQUIVO[tipo],
-                "formato"   : caminho.suffix.lstrip("."),
-                "tamanho_kb": round(caminho.stat().st_size / 1024, 1),
-                "url"       : f"/api/v1/lotes/{lote_id}/arquivos/{tipo}",
-            }
-            for tipo, (caminho, _, _) in sorted(_arquivos_do_lote(lote).items())
-        ]
-    }
-
-
-@app.get(
-    "/api/v1/lotes/{lote_id}/arquivos/{tipo}",
-    tags=["Lotes"],
-    summary="Baixar um artefato do lote",
-    response_class=FileResponse,
-    responses={
-        200: {"content": {_XLSX: {}, "application/json": {}}, "description": "O arquivo"},
-        404: {"model": Erro, "description": "Lote ou artefato inexistente"},
-        **_ERROS_AUTH,
-    },
-)
-async def baixar_arquivo_lote(
-    lote_id: str,
-    tipo: TipoArquivo,
-    consumidor: str = Depends(autenticar_api),
-):
-    """Download direto. O mesmo token Bearer das demais rotas."""
-    return _resposta_arquivo(_lote_do_consumidor(lote_id, consumidor), tipo.value, consumidor)
-
-
-_RESPOSTAS_XLSX: dict[int | str, dict[str, Any]] = {
-    200: {"content": {_XLSX: {}}, "description": "Arquivo .xlsx"},
-    404: {"model": Erro, "description": "Lote inexistente, de outro consumidor, ou sem a planilha"},
-    **_ERROS_AUTH,
+    "entidades"   : ["entidades", "numero_processo"],
+    "tipo"        : ["tipo_processo"],
 }
 
 
-@app.get(
-    "/api/v1/lotes/{lote_id}/planilha/agente1",
-    tags=["Lotes"],
-    summary="Baixar a planilha do Agente 1",
-    response_class=FileResponse,
-    responses=_RESPOSTAS_XLSX,
-)
-async def planilha_agente1(lote_id: str, consumidor: str = Depends(autenticar_api)):
-    """
-    Excel de revisão da extração: um processo por linha, com a classificação
-    APTO / NÃO APTO e o motivo.
-
-    **Só deste lote.** Sai da pasta isolada do lote.
-    """
-    return _resposta_arquivo(_lote_do_consumidor(lote_id, consumidor), "agente1_planilha", consumidor)
-
-
-@app.get(
-    "/api/v1/lotes/{lote_id}/planilha/agente2",
-    tags=["Lotes"],
-    summary="Baixar a planilha do Agente 2",
-    response_class=FileResponse,
-    responses=_RESPOSTAS_XLSX,
-)
-async def planilha_agente2(lote_id: str, consumidor: str = Depends(autenticar_api)):
-    """
-    Excel de priorização jurídico-fiscal: prioridade, ação recomendada e alerta
-    de prescrição.
-
-    **Atenção — este arquivo é ACUMULADO.** O Agente 2 o regera a partir do
-    histórico inteiro a cada lote, então ele traz também os processos dos lotes
-    anteriores, não só os deste. É o desenho do relatório do procurador, que
-    existe para dar a visão do acervo.
-
-    Para o recorte exato deste lote, use `GET /api/v1/lotes/{lote_id}/resultado`
-    (mesma priorização, em JSON) ou `/arquivos/agente2_json`.
-    """
-    return _resposta_arquivo(_lote_do_consumidor(lote_id, consumidor), "agente2_planilha", consumidor)
-
-
-# ════════════════════════════════════════════════════════════════
-# CONSULTA POR NÚMERO DE PROCESSO
-# ════════════════════════════════════════════════════════════════
-#
-# A pasta JSON/ é compartilhada: mistura os lotes de todos os consumidores e os
-# que o procurador subiu pelo painel. A consulta por número roda sobre uma cópia
-# recortada aos lotes de quem chamou, para ficar com o MESMO isolamento das
-# rotas por lote_id — o número CNJ é público e, sem o recorte, bastava informá-lo
-# para ler nome, CPF/CNPJ e valor da dívida de processo alheio.
-
-_RE_ARQUIVO_LOTE = re.compile(r"^lote_(.+)_agente2\.json$")
-
-# Número CNJ, com ou sem a pontuação. Serve de guarda contra o valor
-# começando com '-', que o argparse do buscar_processo.py leria como flag.
-_RE_NUMERO_CNJ = re.compile(r"[0-9][0-9.\-/]{0,40}")
-
-
-def _lote_da_origem(nome_arquivo: str) -> dict | None:
-    """
-    Lote que originou um arquivo da pasta JSON/ — chamam-se 'lote_<id>_agente2.json'.
-
-    Nulo para nome fora desse padrão: são as rodadas manuais por linha de
-    comando, que não pertencem a consumidor nenhum.
-    """
-    achado = _RE_ARQUIVO_LOTE.match(Path(nome_arquivo or "").name)
-    return _lotes.get(achado.group(1)) if achado else None
-
-
-def _filtro_do_consumidor(consumidor: str):
-    """Predicado que a busca aplica a cada arquivo: só os lotes deste consumidor."""
-    def do_consumidor(nome_arquivo: str) -> bool:
-        lote = _lote_da_origem(nome_arquivo)
-        return bool(lote) and lote.get("origem") == consumidor
-    return do_consumidor
-
-
-def _sem_internos(rec: dict | None) -> dict | None:
-    """Tira as chaves internas '_...' que a busca anexa (ex.: _origem_arquivo,
-    _total_classificacoes). Usado no bloco de auditoria, que é um registro plano
-    e não passa por _com_lote_id."""
-    if not rec:
-        return None
-    return {k: v for k, v in rec.items() if not k.startswith("_")}
-
-
-def _com_lote_id(achado: dict | None) -> dict | None:
-    """Troca a procedência interna pelo lote_id — o consumidor não vê nome de arquivo."""
-    if not achado:
-        return None
-    origem = achado.get("origem_lote") or achado.get("_origem_arquivo") or ""
-    lote   = _lote_da_origem(origem)
-    limpo  = {
-        k: v for k, v in achado.items()
-        if not k.startswith("_") and k != "origem_lote"
-    }
-    limpo["lote_id"] = lote["id"] if lote else None
-    return limpo
-
-
-def _pasta_recortada(destino: Path, consumidor: str) -> None:
-    """
-    Preenche `destino` com os artefatos que o buscar_processo.py lê, contendo
-    apenas o que pertence a este consumidor:
-
-      • lote_<id>_agente2.json   → só os lotes com origem == consumidor
-      • historial_agente2.jsonl  → só as linhas cujo 'origem_lote' é de um deles
-      • historico_extracoes.jsonl→ só as linhas dos PDFs desses lotes
-
-    A pasta JSON/ real é compartilhada entre todos os consumidores e com o
-    painel. Apontar o script direto para ela entregava processo alheio a
-    qualquer token válido.
-    """
-    origens = _origens_do_consumidor(consumidor)
-    if not origens:
-        return
-
-    for nome in origens:
-        fonte = PASTA_JSON / nome
-        if fonte.exists():
-            shutil.copy2(fonte, destino / nome)
-
-    # Arquivos dos PDFs deste consumidor — chave do recorte da auditoria, que
-    # é um registro plano, sem campo de origem.
-    arquivos_meus = {
-        arq
-        for lote in _lotes.values()
-        if lote.get("origem") == consumidor
-        for arq in lote.get("arquivos", [])
-    }
-
-    for nome, chave in ((_JSONL_AGENTE2, "origem_lote"), ("historico_extracoes.jsonl", "arquivo")):
-        fonte = PASTA_JSON / nome
-        if not fonte.exists():
-            continue
-        permitido = origens if chave == "origem_lote" else arquivos_meus
-        with open(fonte, encoding="utf-8") as entrada, \
-             open(destino / nome, "w", encoding="utf-8") as saida:
-            for linha in entrada:
-                linha = linha.strip()
-                if not linha:
-                    continue
-                try:
-                    rec = json.loads(linha)
-                except json.JSONDecodeError:
-                    continue          # linha corrompida: não é deste nem de ninguém
-                if rec.get(chave) in permitido:
-                    saida.write(linha + "\n")
-
-
-def _numeros_do_lote(lote_id: str) -> set[str]:
-    """
-    Números de processo que o Agente 1 extraiu deste lote — lidos do JSON
-    ISOLADO do lote (dados/lotes/<id>/json/saida_agente1_V8.json), não do
-    histórico compartilhado.
-
-    Existe para a rota de atalho '/lotes/{lote_id}/processo' logo abaixo: ela
-    recebe o lote_id mas não o número CNJ até ler aqui.
-    """
-    traspasse = _dir_lote(lote_id) / "json" / "saida_agente1_V8.json"
-    if not traspasse.exists():
-        return set()
+def _ler_estado(caminho):
+    import json
+    if not os.path.exists(caminho):
+        return {}
     try:
-        with open(traspasse, encoding="utf-8") as f:
-            payload = json.load(f)
-    except (json.JSONDecodeError, OSError):
-        return set()
-    return {
-        numero
-        for proc in payload.get("processos", [])
-        if (numero := (proc.get("entidades") or {}).get("numero_processo"))
-    }
-
-
-async def _relatorio_processo_do_lote(lote: dict, pasta_busca) -> dict:
-    """
-    Núcleo comum às duas rotas de atalho 'processo do lote' (API com token e
-    painel com sessão): valida que o lote tem exatamente 1 PDF e exatamente 1
-    número extraído, busca os dados em `pasta_busca` e monta o payload no
-    formato de `ProcessoConsultado`.
-
-    `pasta_busca` já deve vir pronta para `buscar_processo.buscar_dados`: uma
-    cópia recortada ao consumidor (rota da API) ou a PASTA_JSON cheia (painel,
-    que enxerga o acervo inteiro por desenho — ver `_resposta_arquivo`).
-    """
-    lote_id = lote["id"]
-    if lote["status"] != "concluido":
-        raise HTTPException(409, f"Lote ainda em '{lote['status']}' — aguarde 'concluido'")
-
-    if len(lote.get("arquivos", [])) != 1:
-        raise HTTPException(
-            422,
-            f"Este lote tem {len(lote.get('arquivos', []))} PDF(s). Esta rota só "
-            "atende lotes de um único PDF — use o resultado agregado para vários.",
-        )
-
-    numeros = _numeros_do_lote(lote_id)
-    if not numeros:
-        raise HTTPException(
-            404,
-            "Não foi possível extrair um número de processo deste PDF. Veja "
-            f"'avisos' e 'log' do lote {lote_id}.",
-        )
-    if len(numeros) > 1:
-        raise HTTPException(
-            422,
-            f"Este PDF contém {len(numeros)} processos ({', '.join(sorted(numeros))}). "
-            "Consulte cada um individualmente, ou use o resultado agregado.",
-        )
-    numero = next(iter(numeros))
-
-    dados = await asyncio.to_thread(buscar_processo.buscar_dados, numero, str(pasta_busca))
-
-    if not dados.get("agente1") and not dados.get("agente2") and not dados.get("auditoria"):
-        # Não deveria acontecer — o número saiu do JSON deste próprio lote —,
-        # mas sem esta guarda uma falha ao montar a busca devolveria um
-        # ProcessoConsultado com tudo nulo em vez de avisar o que deu errado.
-        log.error(f"Lote {lote_id}: número {numero} extraído do PDF mas ausente na busca")
-        raise HTTPException(404, f"Nenhum processo com o número {numero}.")
-
-    return {
-        "numero_processo": numero,
-        "encontrado_em": [
-            fonte for fonte in ("agente1", "agente2", "auditoria") if dados.get(fonte)
-        ],
-        "agente1": _recorte_etapas_relatorio(_sem_internos(dados.get("agente1")), lote.get("campos")),
-        "agente2": _sem_internos(dados.get("agente2")),
-        "agente2_historico": [_sem_internos(r) for r in dados.get("agente2_historico", [])],
-        "auditoria": {
-            "atual": _sem_internos(dados.get("auditoria")),
-            "historico": [_sem_internos(r) for r in dados.get("auditoria_historico", [])],
-            "total": len(dados.get("auditoria_historico", [])),
-        } if dados.get("auditoria") else None,
-    }
-
-
-@app.get(
-    "/api/v1/lotes/{lote_id}/processo",
-    tags=["Lotes"],
-    summary="Consultar o processo deste lote (lotes de 1 PDF)",
-    response_model=ProcessoConsultado,
-    responses={
-        404: {
-            "model": Erro,
-            "description": "Lote de outro consumidor, inexistente, ou nenhum "
-                            "número de processo pôde ser extraído do PDF",
-        },
-        409: {"model": Erro, "description": "Lote ainda não concluído — continue o polling"},
-        422: {
-            "model": Erro,
-            "description": "O lote não tem exatamente 1 PDF, ou dele saiu mais de 1 processo",
-        },
-        **_ERROS_AUTH,
-    },
-)
-async def processo_do_lote(lote_id: str, consumidor: str = Depends(autenticar_api)):
-    """
-    Atalho para quem manda **um PDF por vez** (um processo por lote): em vez do
-    formato agregado de `/resultado`, devolve o mesmo relatório estruturado de
-    `GET /api/v1/processos` — já com o número CNJ que saiu deste PDF, sem o
-    consumidor precisar lê-lo do payload de `/resultado` para então perguntar
-    de novo por `/api/v1/processos`.
-
-    Só funciona quando o lote tem **exatamente 1 PDF** e dele saiu
-    **exatamente 1 número de processo**. Lotes com mais de um PDF — ou um PDF
-    que contenha mais de um processo — respondem `422`; use `/resultado` (ou
-    consulte cada número em `/api/v1/processos`) nesses casos.
-    """
-    lote = _lote_do_consumidor(lote_id, consumidor)
-    # Mesmo isolamento de /api/v1/processos: a busca roda sobre uma cópia
-    # recortada aos lotes deste consumidor, nunca sobre a pasta JSON/ real.
-    with tempfile.TemporaryDirectory(prefix="consulta-") as tmp:
-        recorte = Path(tmp)
-        await asyncio.to_thread(_pasta_recortada, recorte, consumidor)
-        return await _relatorio_processo_do_lote(lote, recorte)
-
-
-@app.get(
-    "/api/v1/processos",
-    tags=["Processos"],
-    summary="Consultar um processo pelo número",
-    response_class=PlainTextResponse,
-    responses={
-        400: {"model": Erro, "description": "Número fora do formato CNJ"},
-        404: {"model": Erro, "description": "Nenhum processo com esse número nos lotes deste consumidor"},
-        **_ERROS_AUTH,
-    },
-)
-async def consultar_processo(
-    numero: str = Query(
-        ...,
-        min_length=1,
-        description="Número CNJ do processo. A pontuação é indiferente — "
-                    "'0752821-68.2013.8.05.0001' e '07528216820138050001' acham o mesmo.",
-        examples=["0752821-68.2013.8.05.0001"],
-    ),
-    consumidor: str = Depends(autenticar_api),
-):
-    """
-    Executa o `buscar_processo.py` como script (não apenas a função `buscar_dados`)
-    e devolve a saída formatada COMPLETA do `main()` em texto puro — a mesma visão
-    do CLI: Agente 1 (dados extraídos), Agente 2 (priorização) e auditoria.
-
-    A busca cobre os lotes **deste consumidor** — o mesmo isolamento das rotas
-    por `lote_id`. Um processo enviado por outro consumidor responde `404`.
-
-    Responde `404` quando o número não aparece em fonte nenhuma, e `500` se o
-    próprio `buscar_processo.py` falhar ao executar.
-    """
-    # O número vai como argv para o subprocess. Sem esta guarda, um valor
-    # começando com '-' é lido pelo argparse como FLAG, não como número:
-    # '-h' devolvia o help com HTTP 200, '--pasta=/x' redirecionava a busca
-    # para outra pasta do disco. Só dígitos e a pontuação do CNJ passam.
-    numero = numero.strip()
-    if not _RE_NUMERO_CNJ.fullmatch(numero):
-        raise HTTPException(
-            400,
-            "Número de processo inválido. Use o número CNJ — só dígitos, "
-            "pontos, hífens e barras. Ex.: 0752821-68.2013.8.05.0001",
-        )
-
-    script = BASE_DIR / "buscar_processo.py"
-
-    # Subprocess isolado, mesmo padrão dos agentes:
-    #  - caminho ABSOLUTO (BASE_DIR/…): evita o "código 2" de arquivo não achado.
-    #  - stdin=DEVNULL: se cair no modo interativo (número vazio), não trava no input().
-    #  - stdout piped → sys.stdout.isatty() é False lá dentro, então _cor() devolve
-    #    texto SEM códigos ANSI. A saída chega limpa.
-    # A pasta JSON/ é compartilhada por todos os consumidores e pelo painel.
-    # O script é apontado para uma cópia recortada aos lotes de quem pediu —
-    # sem isso, qualquer token lia processo alheio informando o número CNJ,
-    # que é público.
-    try:
-        with tempfile.TemporaryDirectory(prefix="consulta-") as tmp:
-            recorte = Path(tmp)
-            await asyncio.to_thread(_pasta_recortada, recorte, consumidor)
-
-            proc = await asyncio.create_subprocess_exec(
-                sys.executable, str(script),
-                "--pasta", str(recorte),
-                "--",              # encerra as opções: o que vem depois é posicional
-                numero,
-                cwd=str(BASE_DIR),
-                stdin=asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                # O relatório usa acento e caractere de caixa. Sem isto, uma
-                # locale não-UTF-8 derruba o script no print e a consulta
-                # devolve 500 tendo encontrado o processo.
-                env={**os.environ, "PYTHONIOENCODING": "utf-8"},
-            )
-            bruto_out, bruto_err = await proc.communicate()
+        with open(caminho, encoding="utf-8") as f:
+            return json.load(f)
     except Exception as e:
-        log.exception("Falha ao lançar buscar_processo.py")
-        raise HTTPException(500, "Não foi possível consultar o processo agora. Tente de novo.")
+        logging.error(f"Estado atual corrompido em {caminho} — começando vazio: {e}", exc_info=True)
+        return {}
 
-    saida = bruto_out.decode("utf-8", errors="replace")
-    erro  = bruto_err.decode("utf-8", errors="replace")
 
-    # [v2] Contrato de saída do buscar_processo.py (ver EXIT_NAO_ENCONTRADO lá):
-    #   0 = encontrado   3 = não encontrado   qualquer outro = falha real → 500
-    #
-    # ANTES a decisão vinha de farejar o stdout ('não encontrado' in saida). Isso
-    # colidia com valores de dado do próprio processo — "Citação não encontrado",
-    # "Penhora não encontrado" — e devolvia o relatório de SUCESSO com HTTP 404.
-    # O código de saída é inequívoco e não olha o conteúdo (nem o dado sensível).
-    EXIT_NAO_ENCONTRADO = 3
+def _gravar_estado(caminho, estado):
+    import json
+    try:
+        os.makedirs(os.path.dirname(caminho) or ".", exist_ok=True)
+        tmp = caminho + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(estado, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, caminho)  # escrita atômica
+    except Exception as e:
+        logging.error(f"Falha ao gravar estado atual em {caminho}: {e}", exc_info=True)
 
-    if proc.returncode == EXIT_NAO_ENCONTRADO:
-        log.info("Processo não encontrado — numero=%s consumidor=%s", numero, consumidor)
-        raise HTTPException(404, saida.strip() or f"Nenhum processo com o número {numero}.")
 
-    if proc.returncode != 0:
-        # Ex.: 2 = Python não achou buscar_processo.py; outros = exceção no script.
-        log.error(
-            "buscar_processo.py saiu com código %s\nSTDERR:\n%s\nSTDOUT:\n%s",
-            proc.returncode, erro, saida,
+def _resolver_chave(estado, numero_processo, arquivo):
+    """Número do processo se houver; senão tenta achar entrada existente pelo
+    arquivo (para não duplicar um processo já conhecido pelo número); senão arquivo."""
+    if numero_processo:
+        return numero_processo, "numero_processo"
+    for chave, ent in estado.items():
+        if ent.get("arquivo") == arquivo:
+            return chave, ent.get("tipo_chave", "arquivo")
+    return arquivo, "arquivo"
+
+
+def _merge_estado(pr, estado, chave, tipo_chave, hash_novo, campos_run, origem_lote):
+    """
+    Combina o 'pr' desta corrida com o estado guardado, campo a campo, e devolve
+    o pr MERGED (estado completo). Atualiza `estado[chave]` in-place.
+    """
+    agora = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    entry = estado.get(chave) or {
+        "chave": chave, "tipo_chave": tipo_chave, "arquivo": pr.get("arquivo"),
+        "numero_processo": pr.get("numero_processo"),
+        "dados": {}, "prov": {}, "conflitos": [], "atualizado_em": agora,
+    }
+    dados = entry.setdefault("dados", {})
+    prov  = entry.setdefault("prov", {})
+    entry.setdefault("conflitos", [])
+
+    _AUSENTE = object()
+    for etapa, campos in _CAMPOS_POR_ETAPA.items():
+        for campo in campos:
+            if etapa not in campos_run:
+                # não pedido nesta corrida -> mantém o guardado (reaproveitamento)
+                if campo in dados:
+                    pr[campo] = dados[campo]
+                continue
+            novo = pr.get(campo)
+            antigo = dados.get(campo, _AUSENTE)
+            hash_antigo = prov.get(campo, {}).get("origem_hash")
+
+            def _set(valor, extra=None):
+                dados[campo] = valor
+                p = {"extraido_em": agora, "origem_lote": origem_lote, "origem_hash": hash_novo}
+                if extra:
+                    p.update(extra)
+                prov[campo] = p
+                entry["conflitos"] = [c for c in entry["conflitos"] if c["campo"] != campo]
+
+            if antigo is _AUSENTE or antigo == novo:
+                _set(novo)
+            elif hash_antigo and hash_novo and hash_antigo != hash_novo:
+                _set(novo, {"substituiu": antigo, "motivo": "pdf_alterado"})  # documento evoluiu
+            else:
+                # mesmo PDF (ou hash desconhecido) -> conserva o velho e marca conflito
+                pr[campo] = antigo
+                conf = {"campo": campo, "valor_anterior": antigo, "valor_novo": novo,
+                        "visto_em": agora, "origem_lote": origem_lote, "revisar": True,
+                        "motivo": "mesmo_pdf" if (hash_antigo and hash_novo) else "hash_desconhecido"}
+                entry["conflitos"] = [c for c in entry["conflitos"] if c["campo"] != campo] + [conf]
+
+    # 'dias_desde' é derivado -> recomputa a partir do ultima_movimentacao merged
+    um = pr.get("ultima_movimentacao")
+    pr["dias_desde_ultima_movimentacao"] = _dias_desde_str(um)
+
+    # Evidências: mantém as das etapas não pedidas; atualiza as pedidas.
+    old_ev = dados.get("evidencias") or {}
+    new_ev = pr.get("evidencias") or {}
+    merged_ev = dict(old_ev)
+    for sub, et in (("citacao", "citacao"), ("penhora", "penhora"),
+                    ("entidades", "entidades"), ("alvara", "alvara")):
+        if et in campos_run:
+            merged_ev[sub] = new_ev.get(sub)
+    dados["evidencias"] = merged_ev
+    pr["evidencias"] = merged_ev
+
+    entry["arquivo"] = pr.get("arquivo") or entry.get("arquivo")
+    entry["numero_processo"] = pr.get("numero_processo") or entry.get("numero_processo")
+    entry["tipo_chave"] = tipo_chave
+    entry["atualizado_em"] = agora
+    estado[chave] = entry
+
+    if entry["conflitos"]:
+        pr["conflitos"] = entry["conflitos"]
+    return pr
+
+
+def _dias_desde_str(fecha_str):
+    """dias desde uma data 'YYYY-MM-DD' (string), ou None."""
+    if not fecha_str:
+        return None
+    try:
+        return (datetime.now() - datetime.strptime(fecha_str, "%Y-%m-%d")).days
+    except Exception:
+        return None
+
+
+def _deve_ignorar(tipo_processo):
+    if tipo_processo is None:
+        return False
+    if tipo_processo.get("es_execucao_fiscal"):
+        return False
+    if MODO_ESCOPO == "incluir_tudo":
+        return False
+    if MODO_ESCOPO == "ignorar_alta":
+        return tipo_processo.get("confianza") == "alta"
+    return True  # ignorar_todos
+
+
+def _registrar_ignorados(ignorados, output_file):
+    """Grava a lista de PDFs ignorados (fora de escopo) — nada some em silêncio."""
+    from datetime import datetime as _dt
+    n = len(ignorados)
+    logging.info(f"Modo de escopo: '{MODO_ESCOPO}' — {n} arquivo(s) ignorado(s) (fora de escopo)")
+    try:
+        with open(output_file, "w", encoding="utf-8") as f:
+            f.write(f"# Arquivos IGNORADOS (fora de escopo) — modo={MODO_ESCOPO}\n")
+            f.write(f"# Gerado em {_dt.now().strftime('%Y-%m-%d %H:%M:%S')} — total: {n}\n")
+            f.write("# Estes PDFs NAO entraram na planilha nem no JSON. Se algum for\n")
+            f.write("# execucao fiscal de verdade, rode com MODO_ESCOPO=incluir_tudo e revise.\n\n")
+            for ig in ignorados:
+                f.write(f"- {ig['arquivo']}  [confianca: {ig.get('confianca')}]  {ig.get('motivo')}\n")
+    except Exception as e:
+        logging.error(f"Falha ao gravar lista de ignorados em {output_file}: {e}", exc_info=True)
+    print(f"Arquivos ignorados (fora de escopo): {n} — lista em {output_file}")
+    return n
+
+
+# ===========================================================================
+# FASE 2 — CACHE DO TEXTO/OCR POR HASH DO CONTEÚDO DO PDF
+# ===========================================================================
+# Guarda o resultado do passo CARO (pdfplumber + OCR) indexado pelo hash do
+# conteúdo do PDF. Cache-hit pula OCR inteiro no reprocessamento. Se o PDF mudar,
+# o hash muda e reextrai sozinho. Falha SEMPRE de forma segura: qualquer erro de
+# cache cai para a extração normal (nunca derruba o lote).
+
+def _hash_arquivo(pdf_path, _bloco=1 << 20):
+    """SHA-256 do conteúdo do arquivo (streaming — barato perto do OCR)."""
+    import hashlib
+    h = hashlib.sha256()
+    with open(pdf_path, "rb") as f:
+        for chunk in iter(lambda: f.read(_bloco), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _caminho_cache(hash_hex):
+    return os.path.join(PASTA_CACHE, f"{hash_hex}.json")
+
+
+def _ler_cache(hash_hex):
+    """Devolve (pages_text, metadata) do cache, ou None se não existe/corrompido."""
+    import json
+    caminho = _caminho_cache(hash_hex)
+    if not os.path.exists(caminho):
+        return None
+    try:
+        with open(caminho, encoding="utf-8") as f:
+            dados = json.load(f)
+        pages_text = dados["pages_text"]
+        meta = dados.get("metadata", {}) or {}
+        # JSON serializa chaves de dict como string; confianza_ocr usa página (int).
+        conf = meta.get("confianza_ocr", {}) or {}
+        meta["confianza_ocr"] = {int(k): v for k, v in conf.items()}
+        meta["paginas_ocr"] = list(meta.get("paginas_ocr", []) or [])
+        return pages_text, meta
+    except Exception as e:
+        logging.error(f"Cache corrompido em {caminho} — ignorando e reextraindo: {e}", exc_info=True)
+        return None
+
+
+def _gravar_cache(hash_hex, pdf_path, pages_text, metadata):
+    """Grava o cache de forma ATÔMICA (.tmp + replace) para não deixar cache meio-escrito."""
+    import json
+    from datetime import datetime as _dt
+    try:
+        os.makedirs(PASTA_CACHE, exist_ok=True)
+        caminho = _caminho_cache(hash_hex)
+        payload = {
+            "hash"          : hash_hex,
+            "arquivo_origem": os.path.basename(pdf_path),
+            "gerado_em"     : _dt.now().strftime("%Y-%m-%dT%H:%M:%S"),
+            "total_paginas" : len(pages_text),
+            "pages_text"    : pages_text,
+            "metadata": {
+                "paginas_ocr"  : list((metadata or {}).get("paginas_ocr", []) or []),
+                "confianza_ocr": (metadata or {}).get("confianza_ocr", {}) or {},
+            },
+        }
+        tmp = caminho + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+        os.replace(tmp, caminho)
+    except Exception as e:
+        logging.error(f"Falha ao gravar cache de {os.path.basename(pdf_path)}: {e}", exc_info=True)
+
+
+def extract_text_by_page_cached(pdf_path):
+    """
+    [Fase 2] Wrapper de extract_text_by_page() com cache por hash do conteúdo.
+    Cache-hit pula pdfplumber + OCR. Se o PDF mudar, reextrai. Qualquer erro de
+    cache cai para a extração normal (segurança).
+    [Fase 4] Sempre anexa meta['hash_pdf'] (usado pelo merge hash-aware), mesmo
+    com o cache desligado.
+    """
+    hash_hex = None
+    try:
+        hash_hex = _hash_arquivo(pdf_path)
+    except Exception as e:
+        logging.error(f"Falha ao calcular hash de {pdf_path}: {e}", exc_info=True)
+
+    if USAR_CACHE and hash_hex and not CACHE_REFRESH:
+        cache = _ler_cache(hash_hex)
+        if cache is not None:
+            pages_text, meta = cache
+            meta["hash_pdf"] = hash_hex
+            n_ocr = len(meta.get("paginas_ocr", []))
+            logging.info(f"  {os.path.basename(pdf_path)}: CACHE HIT (hash {hash_hex[:12]}…, "
+                         f"{len(pages_text)} pág, {n_ocr} via OCR) — OCR pulado")
+            print(f"CACHE HIT: {os.path.basename(pdf_path)} — texto reaproveitado (sem OCR)")
+            return pages_text, meta
+
+    pages_text, meta = extract_text_by_page(pdf_path)
+    meta["hash_pdf"] = hash_hex
+    if USAR_CACHE and hash_hex:
+        _gravar_cache(hash_hex, pdf_path, pages_text, meta)
+    return pages_text, meta
+
+
+def generate_prompts(input_dir):
+    # [Fase 2] extração com cache é feita via extract_text_by_page_cached() dentro do loop.
+    pdf_files = [f for f in os.listdir(input_dir) if f.lower().endswith('.pdf')]
+    prompts = []
+    ignorados = []   # PDFs fora de escopo que não entram no resultado (auditados à parte)
+
+    # [Fase 3] Aviso visível quando a extração é PARCIAL (nem todos os campos).
+    if CAMPOS != _CAMPOS_VALIDOS:
+        faltantes = sorted(_CAMPOS_VALIDOS - CAMPOS)
+        logging.warning(f"EXTRAÇÃO PARCIAL — campos pedidos: {sorted(CAMPOS)}. "
+                        f"Não processados (ficam null): {faltantes}.")
+        print(f"[Fase 3] EXTRAÇÃO PARCIAL — processando só: {sorted(CAMPOS)}")
+        print(f"         Campos não pedidos ficam NULL. NÃO envie ao Agente 2 sem "
+              f"combinar com o estado anterior (merge — Fase 4).")
+
+    for pdf_file in pdf_files:
+        pdf_path = os.path.join(input_dir, pdf_file)
+
+        full_text      = ""
+        fecha_reciente = None
+        citacion       = None
+        penhora        = None
+        fecha_orden    = None
+        fecha_intento  = None
+        fecha_efectiva = None
+        prompt         = "Error"
+        respuesta_gpt  = None
+        ocr_metadata   = {"paginas_ocr": [], "confianza_ocr": {}}
+        tipo_processo  = None
+        entidades      = None
+
+        try:
+            pages_text, ocr_metadata = extract_text_by_page_cached(pdf_path)
+            full_text  = " ".join(p for p in pages_text if p)
+
+            if ocr_metadata["paginas_ocr"]:
+                n = len(ocr_metadata["paginas_ocr"])
+                conf_prom = sum(ocr_metadata["confianza_ocr"].values()) / n
+                logging.info(f"  {pdf_file}: {n} página(s) por OCR, confiança média {conf_prom:.1f}%")
+
+            if not full_text.strip():
+                logging.warning(f"PDF sin texto extraíble: {pdf_file}")
+                print(f"EXTRACAO FALHOU: {pdf_file} — PDF sem texto extraível")
+                prompts.append((pdf_file, None, None, None, None, None, None,
+                                "Erro - PDF sem texto",
+                                "PDF sem texto extraível — digitalização ilegível ou arquivo vazio",
+                                "", ocr_metadata, tipo_processo, None))
+                continue
+
+            # [Fase 3] 'tipo' também é a base do filtro de escopo. Se não for
+            # pedido, não classificamos e não filtramos por escopo (processa tudo).
+            if "tipo" in CAMPOS:
+                tipo_processo = detectar_tipo_processo(full_text)
+                if _deve_ignorar(tipo_processo):
+                    logging.warning(f"  {pdf_file}: IGNORADO (fora de escopo) — {tipo_processo['motivo']}")
+                    print(f"IGNORADO (fora de escopo): {pdf_file} — {tipo_processo['motivo']}")
+                    ignorados.append({
+                        "arquivo"       : pdf_file,
+                        "confianca"     : tipo_processo.get("confianza"),
+                        "motivo"        : tipo_processo.get("motivo"),
+                        "classe_assunto": tipo_processo.get("classe_assunto"),
+                    })
+                    continue
+
+            if "movimentacao" in CAMPOS:
+                fecha_reciente = fecha_ultima_movimentacao(full_text)
+
+            if "citacao" in CAMPOS:
+                citacion = extract_citacion(full_text)
+                fecha_orden, fecha_intento, fecha_efectiva = extraer_fechas_citacion(full_text)
+                # Regla: fecha_citacion_efectiva None si status_citacion != "HOUVE CITAÇÃO"
+                if not citacion or normalizar(citacion) != normalizar("HOUVE CITAÇÃO"):
+                    fecha_efectiva = None
+
+            if "penhora" in CAMPOS:
+                penhora = extract_penhora(full_text)
+
+            if "entidades" in CAMPOS:
+                entidades = extract_entidades_agente2(full_text)
+
+            # [v8.1.0] Só para montar a evidência de página abaixo — o valor
+            # "oficial" de status_alvara (o que vai pro Excel/JSON) é lido de
+            # novo por _extrair_alvara(full_text) em process_prompts_to_excel/
+            # exportar_json_agente2, igual já acontecia com sinais_processuais.
+            # Recomputar aqui é barato (só regex sobre texto já extraído) e evita
+            # mexer no formato da tupla 'prompts', compartilhado por 3 funções.
+            status_alvara = _extrair_alvara(full_text) if "alvara" in CAMPOS else None
+
+            prompt = create_prompt(fecha_reciente, citacion, penhora)
+
+            # [Fase 1] Evidência: em qual página apareceu citação/penhora/entidades/alvará.
+            # Só localiza os campos que foram pedidos (os None são ignorados).
+            # Aditivo — viaja dentro de ocr_metadata, sem alterar a tupla.
+            ocr_metadata["evidencias"] = construir_evidencias(
+                pages_text, citacion, penhora, entidades, ocr_metadata, status_alvara
+            )
+
+            _ent = entidades or {}
+            print(f"\n{'='*60}")
+            print(f"ARQUIVO : {pdf_file}")
+            print(f"  Última data    : {fecha_reciente.strftime('%Y-%m-%d') if fecha_reciente else 'NÃO ENCONTRADA'}")
+            print(f"  Citação        : {citacion}")
+            print(f"  Penhora        : {penhora}")
+            print(f"  CPF/CNPJ       : {_ent.get('cpf_cnpj') or '—'}")
+            print(f"  Executado      : {_ent.get('nome_executado') or '—'}")
+            print(f"  Valor orig.    : {_ent.get('valor_original') or '—'}")
+            print(f"{'='*60}")
+
+            prompts.append((
+                pdf_file, fecha_reciente, citacion,
+                fecha_orden, fecha_intento, fecha_efectiva,
+                penhora, prompt, respuesta_gpt, full_text, ocr_metadata, tipo_processo, entidades
+            ))
+
+        except Exception as e:
+            logging.error(f"Erro ao processar {pdf_file}: {e}", exc_info=True)
+            print(f"EXTRACAO FALHOU: {pdf_file} — {type(e).__name__}: {e}")
+            prompts.append((
+                pdf_file, None, None, None, None, None, None, "Erro",
+                f"Falha ao ler o PDF ({type(e).__name__}): {e}",
+                full_text, ocr_metadata, tipo_processo, None
+            ))
+
+    return prompts, ignorados
+
+
+# 8. Guardar resumo de sinais en un archivo de texto (auditoría legible)
+def save_prompts_to_file(prompts, output_file):
+    with open(output_file, 'w', encoding='utf-8') as file:
+        for (pdf_file, _, _, _, _, _, _, prompt, _, _, ocr_metadata, tipo_processo, _) in prompts:
+            paginas_ocr = ocr_metadata.get("paginas_ocr", []) if ocr_metadata else []
+            ocr_info = f"Páginas via OCR: {paginas_ocr}\n" if paginas_ocr else ""
+            tipo_info = f"Tipo de processo: {tipo_processo['motivo']}\n" if tipo_processo else ""
+            file.write(f"Arquivo: {pdf_file}\n{tipo_info}{ocr_info}{prompt}\n{'-'*50}\n")
+    print(f"Resumo de sinais salvo em {output_file}")
+
+
+# 9. Procesar registros y generar Excel (extração, SEM veredito APTO/NÃO APTO)
+def process_prompts_to_excel(prompts, output_excel):
+    import pandas as pd
+    resultados = []
+    hoy = datetime.now()
+
+    for (pdf_file, fecha_reciente, citacion, fecha_orden, fecha_intento,
+         fecha_efectiva, penhora, prompt, respuesta_gpt, full_text,
+         ocr_metadata, tipo_processo, entidades) in prompts:
+
+        sinais = _extrair_sinais_processuais(full_text)
+        alvara = _extrair_alvara(full_text)
+        dias = _dias_desde(fecha_reciente, hoy)
+
+        paginas_ocr = ocr_metadata.get("paginas_ocr", []) if ocr_metadata else []
+        confianza_ocr_dict = ocr_metadata.get("confianza_ocr", {}) if ocr_metadata else {}
+        confianza_ocr_media = (
+            round(sum(confianza_ocr_dict.values()) / len(confianza_ocr_dict), 1)
+            if confianza_ocr_dict else None
         )
-        # O stderr traz caminho interno e traceback. Vai para o log do serviço,
-        # que é de quem opera; ao consumidor vai só o que ele pode agir.
-        raise HTTPException(
-            500,
-            "A consulta falhou no servidor. Avise o suporte informando o "
-            f"número {numero} e o horário.",
-        )
+        ent = entidades or {}
+        tp  = tipo_processo or {}
 
-    return PlainTextResponse(saida)
+        resultados.append({
+            # ── Identificação / tipo ──────────────────────────────────────
+            "CASO"                          : pdf_file,
+            "Número do processo"            : ent.get("numero_processo") or "",
+            # Vazio quando a extração correu bem. Preenchido, avisa o procurador
+            # de que a linha NÃO foi lida do PDF — antes ela saía vazia e era
+            # indistinguível de um processo lido sem dados.
+            "Erro na extração"              : respuesta_gpt or "",
+            "É execução fiscal?"            : ("Sim" if tp.get("es_execucao_fiscal") else "Não") if tp else "",
+            "Confiança tipo processo"       : tp.get("confianza", "") if tp else "",
+            "Classe-Assunto (PJe)"          : (tp.get("classe_assunto") or "(não detectado)") if tp else "",
+            # ── Fatos processuais (extraídos, sem veredito) ───────────────
+            "Última data de interação"      : fecha_reciente.strftime("%Y-%m-%d") if fecha_reciente else "Não especificado",
+            "Dias desde última movimentação": dias if dias is not None else "",
+            "Status da citação"             : citacion or "Não especificado",
+            "Data ordem citação"            : fecha_orden.strftime("%Y-%m-%d")   if fecha_orden    else "Não especificado",
+            "Data tentativa citação"        : fecha_intento.strftime("%Y-%m-%d") if fecha_intento  else "Não especificado",
+            "Data citação efetiva"          : fecha_efectiva.strftime("%Y-%m-%d") if fecha_efectiva else "Não especificado",
+            "Resultado da penhora"          : penhora or "Não especificado",
+            "Página citação"                : _pag_evid(ocr_metadata, "citacao"),
+            "Página penhora"                : _pag_evid(ocr_metadata, "penhora"),
+            "Extinção detectada"            : sinais["extincao"] or "",
+            "Parcelamento detectado"        : sinais["parcelamento"] or "",
+            "Suspensão art.40 LEF"          : sinais["suspensao_art40"] or "",
+            "Pedido de alvará"              : alvara["pedido"] or "",
+            "Levantamento alvará (extrato)" : alvara["levantamento"] or "",
+            # ── OCR ────────────────────────────────────────────────────────
+            "Páginas via OCR"               : ", ".join(map(str, paginas_ocr)) if paginas_ocr else "",
+            "Confiança OCR (%)"             : confianza_ocr_media if confianza_ocr_media is not None else "",
+            # ── Entidades ──────────────────────────────────────────────────
+            "CPF/CNPJ"                      : ent.get("cpf_cnpj") or "",
+            "Nome executado"                : ent.get("nome_executado") or "",
+            "Nome exequente"                : ent.get("nome_exequente") or "",
+            "Tipo de tributo"               : ent.get("tipo_tributo") or "",
+            "Exercício"                     : ent.get("exercicio") or "",
+            "Número CDA"                    : ent.get("numero_cda") or "",
+            "Data inscrição dívida ativa"   : ent.get("data_inscricao") or "",
+            "Valor original"                : ent.get("valor_original") or "",
+            "Valor atualizado"              : ent.get("valor_atualizado") or "",
+            "Vara"                          : ent.get("vara") or "",
+        })
+
+    df = pd.DataFrame(resultados)
+
+    cols_texto = ["Número CDA", "CPF/CNPJ", "Número do processo"]
+    for col in cols_texto:
+        if col in df.columns:
+            df[col] = df[col].astype(str).replace({"nan": "", "None": ""})
+
+    with pd.ExcelWriter(output_excel, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Extração Agente 1")
+        ws = writer.sheets["Extração Agente 1"]
+        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+        from openpyxl.utils import get_column_letter
+
+        font_header  = Font(name="Arial", bold=True, color="FFFFFF", size=11)
+        fill_header  = PatternFill("solid", fgColor="1F4E79")
+        align_header = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        borde        = Border(*[Side(style="thin", color="D0D0D0")] * 4)
+        fill_fora    = PatternFill("solid", fgColor="D9D9D9")  # cinza: fora de escopo
+
+        for col_idx in range(1, len(df.columns) + 1):
+            c = ws.cell(row=1, column=col_idx)
+            c.font = font_header; c.fill = fill_header
+            c.alignment = align_header; c.border = borde
+
+        col_fiscal = (list(df.columns).index("É execução fiscal?") + 1) if "É execução fiscal?" in df.columns else None
+        font_dato  = Font(name="Arial", size=10)
+        align_dato = Alignment(vertical="top", wrap_text=True)
+        for row_idx in range(2, len(df) + 2):
+            fora = bool(col_fiscal) and ws.cell(row=row_idx, column=col_fiscal).value == "Não"
+            for col_idx in range(1, len(df.columns) + 1):
+                c = ws.cell(row=row_idx, column=col_idx)
+                c.font = font_dato; c.border = borde; c.alignment = align_dato
+                if fora:
+                    c.fill = fill_fora
+
+        for col_name in cols_texto:
+            if col_name in df.columns:
+                col_letter = get_column_letter(df.columns.get_loc(col_name) + 1)
+                for cell in ws[col_letter][1:]:
+                    if cell.value:
+                        cell.value = str(cell.value)
+                        cell.data_type = "s"
+                        cell.number_format = "@"
+
+        anchos = {
+            "CASO": 34, "Número do processo": 22, "É execução fiscal?": 12,
+            "Confiança tipo processo": 12, "Classe-Assunto (PJe)": 30,
+            "Última data de interação": 16, "Dias desde última movimentação": 14,
+            "Status da citação": 30, "Data ordem citação": 14,
+            "Data tentativa citação": 14, "Data citação efetiva": 14,
+            "Resultado da penhora": 30, "Página citação": 12, "Página penhora": 12,
+            "Extinção detectada": 22,
+            "Parcelamento detectado": 28, "Suspensão art.40 LEF": 22,
+            "Pedido de alvará": 20, "Levantamento alvará (extrato)": 26,
+            "Páginas via OCR": 14, "Confiança OCR (%)": 12,
+            "CPF/CNPJ": 20, "Nome executado": 30, "Nome exequente": 30,
+            "Tipo de tributo": 20, "Exercício": 12, "Número CDA": 22,
+            "Data inscrição dívida ativa": 16, "Valor original": 16,
+            "Valor atualizado": 16, "Vara": 28,
+        }
+        for col_idx, col_name in enumerate(df.columns, start=1):
+            ws.column_dimensions[get_column_letter(col_idx)].width = anchos.get(col_name, 18)
+
+        ws.freeze_panes = "A2"
+        if len(df.columns):
+            ws.auto_filter.ref = f"A1:{get_column_letter(len(df.columns))}{len(df)+1}"
+
+    print(f"Planilha Excel gerada: {output_excel}")
 
 
-# ════════════════════════════════════════════════════════════════
-# PAINEL — uso manual do procurador
-# ════════════════════════════════════════════════════════════════
+# ===========================================================================
+# 9.1 — JSON ESTRUTURADO (interface Agente 1 -> Agente 2)
+# ===========================================================================
 
-@app.post("/painel/login", include_in_schema=False, summary="Abrir sessão no painel")
-async def login(request: Request, senha: str = Form(...)):
-    if not PAINEL_ATIVO:
-        raise HTTPException(503, "Painel sem senha configurada")
-
-    ip = request.client.host if request.client else "desconhecido"
-    corte = datetime.now() - timedelta(minutes=JANELA_FALHAS_MIN)
-
-    # Só as falhas DESTE IP contam. Quem erra a senha em outro lugar não tranca
-    # o painel do procurador.
-    recentes = _falhas_login.setdefault(ip, deque(maxlen=MAX_FALHAS_LOGIN * 2))
-    while recentes and recentes[0] < corte:
-        recentes.popleft()
-
-    if len(recentes) >= MAX_FALHAS_LOGIN:
-        raise HTTPException(429, "Tentativas demais. Aguarde alguns minutos.")
-
-    if not _senha_confere(senha):
-        recentes.append(datetime.now())
-        log.warning(f"Senha incorreta no painel (origem {ip})")
-        await asyncio.sleep(1)
-        raise HTTPException(401, "Senha incorreta")
-
-    # Acertou: zera o contador deste IP e limpa quem já saiu da janela, para o
-    # dicionário não crescer sem limite.
-    _falhas_login.pop(ip, None)
-    for outro in [k for k, v in _falhas_login.items() if not v or v[-1] < corte]:
-        _falhas_login.pop(outro, None)
-
-    token = secrets.token_urlsafe(32)
-    _sessoes[token] = datetime.now() + timedelta(hours=HORAS_SESSAO)
-    resp = JSONResponse({"ok": True})
-    resp.set_cookie(
-        "sessao", token,
-        httponly=True, samesite="lax", secure=COOKIE_SEGURO,
-        max_age=HORAS_SESSAO * 3600,
-    )
-    log.info("Login no painel")
-    return resp
-
-
-@app.post("/painel/logout", include_in_schema=False, summary="Encerrar a sessão")
-async def logout(sessao: str = Cookie(None)):
-    _sessoes.pop(sessao or "", None)
-    resp = JSONResponse({"ok": True})
-    resp.delete_cookie("sessao")
-    return resp
-
-
-@app.post("/painel/lotes", include_in_schema=False, summary="Enviar lote pelo painel", response_model=Lote)
-async def painel_criar(
-    arquivos: list[UploadFile] = File(...),
-    campos: str = Form(""),
-    _=Depends(exigir_painel),
-):
-    lote = await _gravar_lote(arquivos, origem="painel", campos=campos)
-    return _publico(lote)
-
-
-@app.get(
-    "/painel/lotes",
-    include_in_schema=False,
-    summary="Listar todos os lotes",
-    response_model=ListaLotesComLog,
-)
-async def painel_listar(
-    _=Depends(exigir_painel),
-    limite: int = Query(30, ge=1, le=500),
-):
-    """Ao contrário da API, o painel enxerga os lotes de todas as origens."""
-    todos = sorted(_lotes.values(), key=lambda l: l.get("criado_em") or "", reverse=True)
-    return {"lotes": [_publico(l, incluir_log=True) for l in todos[:limite]]}
-
-
-@app.get(
-    "/painel/lotes/{lote_id}/arquivos/{tipo}",
-    include_in_schema=False,
-    summary="Baixar um artefato do lote pelo painel",
-    response_class=FileResponse,
-    responses={404: {"model": Erro, "description": "Lote ou artefato inexistente"}},
-)
-async def painel_baixar_arquivo(lote_id: str, tipo: TipoArquivo, _=Depends(exigir_painel)):
+class _LockEstado:
     """
-    Mesmos arquivos da API, com a sessão do painel em vez do token — o
-    procurador não tem token, e sem isto a planilha do Agente 1, que fica na
-    pasta isolada do lote, ficava inalcançável para ele.
-
-    O painel enxerga lotes de qualquer origem, inclusive os do SIAP.
+    [Fase 5] Lock exclusivo de arquivo (POSIX flock) para serializar o
+    read-modify-write do estado compartilhado quando há processos concorrentes
+    (ex.: a web e um `docker compose run agente1` ao mesmo tempo). Best-effort:
+    se o flock não existir (ex.: Windows no dev), segue sem lock, só com aviso.
+    O lock é liberado no release() e, como garantia, na saída do processo.
     """
-    lote = _lotes.get(lote_id)
-    if not lote:
-        raise HTTPException(404, "Lote não encontrado")
-    return _resposta_arquivo(lote, tipo.value)
+    def __init__(self, base_path):
+        self.lockpath = (base_path or "estado_atual_processos.json") + ".lock"
+        self.f = None
+
+    def acquire(self):
+        try:
+            import fcntl
+            os.makedirs(os.path.dirname(self.lockpath) or ".", exist_ok=True)
+            self.f = open(self.lockpath, "w")
+            fcntl.flock(self.f, fcntl.LOCK_EX)   # bloqueia até conseguir (serializa)
+        except Exception as e:
+            logging.warning(f"Lock de estado indisponível ({e}) — seguindo sem lock.")
+            self.f = None
+        return self
+
+    def release(self):
+        if self.f:
+            try:
+                import fcntl
+                fcntl.flock(self.f, fcntl.LOCK_UN)
+                self.f.close()
+            except Exception:
+                pass
+            self.f = None
 
 
-@app.get(
-    "/painel/lotes/{lote_id}/processo",
-    include_in_schema=False,
-    summary="Consultar o processo deste lote pelo painel",
-    response_model=ProcessoConsultado,
-    responses={404: {"model": Erro, "description": "Lote inexistente"}},
-)
-async def painel_processo(lote_id: str, _=Depends(exigir_painel)):
+def exportar_json_agente2(prompts, output_json, total_ignorados=None):
     """
-    Equivalente a `GET /api/v1/lotes/{lote_id}/processo`, com a sessão do
-    painel em vez do token. Usado pela interface quando o lote tem 1 único
-    PDF: em vez dos botões de download, mostra a tarjeta com o relatório do
-    processo — não faz sentido baixar um Excel para um processo só.
+    Gera o JSON de interface Agente 1 -> Agente 2.
 
-    O painel enxerga o acervo inteiro (não filtra por consumidor), então a
-    busca roda direto sobre a PASTA_JSON, sem o recorte que a rota da API
-    precisa para isolar consumidores entre si.
+    [feedback 1] Inclui TODOS os campos que aparecem na planilha.
+    [feedback 4] Inclui TODOS os processos (sem filtro por decisão) — o
+    Agente 1 não emite mais APTO/NÃO APTO.
+
+    Campos vazios são gravados como null — nunca omitidos.
     """
-    lote = _lotes.get(lote_id)
-    if not lote:
-        raise HTTPException(404, "Lote não encontrado")
-    return await _relatorio_processo_do_lote(lote, PASTA_JSON)
+    import json
+    from datetime import datetime as _dt
 
+    VERSION_AGENTE1 = "8.1.1"
 
-@app.get(
-    "/painel/relatorios",
-    include_in_schema=False,
-    summary="Listar os relatórios acumulados",
-    response_model=ListaRelatorios,
-)
-async def painel_relatorios(_=Depends(exigir_painel)):
-    _garantir_pastas()
-    arqs = [p for p in PASTA_RESULT.iterdir() if p.is_file() and not p.name.startswith(".")]
-    arqs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    return {
-        "arquivos": [
-            {
-                "nome": p.name,
-                "tamanho_kb": round(p.stat().st_size / 1024, 1),
-                "modificado_em": datetime.fromtimestamp(p.stat().st_mtime).strftime("%d/%m/%Y %H:%M"),
-            }
-            for p in arqs
-        ]
+    def _nulo(val):
+        if val is None:
+            return None
+        v = str(val).strip()
+        return None if v in ("", "nan", "None", "Não especificado") else v
+
+    hoy = _dt.now()
+    processos = []
+    _lock_estado = _LockEstado(ESTADO_PATH) if USAR_MERGE else None
+    if _lock_estado:
+        _lock_estado.acquire()          # serializa o merge entre processos concorrentes
+    estado = _ler_estado(ESTADO_PATH) if USAR_MERGE else {}
+    n_merged = 0
+    n_conflitos = 0
+
+    for tupla in prompts:
+        (pdf_file, fecha_reciente, citacion, fecha_orden, fecha_intento,
+         fecha_efectiva, penhora, prompt, respuesta_gpt, full_text,
+         ocr_metadata, tipo_processo, entidades) = tupla
+
+        ent = entidades or {}
+        tp  = tipo_processo or {}
+        sinais = _extrair_sinais_processuais(full_text)
+        alvara = _extrair_alvara(full_text)
+
+        ocr_meta  = ocr_metadata or {}
+        conf_dict = ocr_meta.get("confianza_ocr", {})
+        conf_media = round(sum(conf_dict.values()) / len(conf_dict), 1) if conf_dict else None
+
+        # 'respuesta_gpt' passou a carregar o motivo quando a extração não deu certo
+        # (PDF ilegível, sem texto ou fora de escopo). Sem este campo, um processo
+        # que nunca foi lido saía no JSON igual a um processo lido sem dados — e o
+        # Agente 2 ainda lhe atribuía prioridade.
+        erro_extracao = _nulo(respuesta_gpt)
+
+        pr = {
+            "arquivo"                       : pdf_file,
+            "numero_processo"               : _nulo(ent.get("numero_processo")),
+            "extracao_ok"                   : erro_extracao is None,
+            "erro_extracao"                 : erro_extracao,
+            "tipo_processo": {
+                "e_execucao_fiscal"         : tp.get("es_execucao_fiscal"),
+                "confianca"                 : tp.get("confianza"),
+                "classe_assunto"            : _nulo(tp.get("classe_assunto")),
+            },
+            "ultima_movimentacao"           : fecha_reciente.strftime("%Y-%m-%d") if fecha_reciente else None,
+            "dias_desde_ultima_movimentacao": _dias_desde(fecha_reciente, hoy),
+            "status_citacao"                : _nulo(citacion),
+            "data_ordem_citacao"            : fecha_orden.strftime("%Y-%m-%d")   if fecha_orden    else None,
+            "data_tentativa_citacao"        : fecha_intento.strftime("%Y-%m-%d") if fecha_intento  else None,
+            "data_citacao_efetiva"          : fecha_efectiva.strftime("%Y-%m-%d") if fecha_efectiva else None,
+            "resultado_penhora"             : _nulo(penhora),
+            "sinais_processuais": {
+                "extincao"                  : _nulo(sinais["extincao"]),
+                "parcelamento"              : _nulo(sinais["parcelamento"]),
+                "suspensao_art40_lef"       : _nulo(sinais["suspensao_art40"]),
+            },
+            "status_alvara": {
+                "pedido"                    : _nulo(alvara["pedido"]),
+                "levantamento"              : _nulo(alvara["levantamento"]),
+            },
+            "ocr": {
+                "paginas"                   : ocr_meta.get("paginas_ocr", []),
+                "confianca_media"           : conf_media,
+            },
+            # [Fase 1] Página onde citação/penhora/entidades foram encontradas (aditivo).
+            "evidencias"                    : ocr_meta.get("evidencias"),
+            "entidades": {
+                # numero_processo também dentro de 'entidades' (além do nível
+                # superior) — é onde buscar_processo.py e o Agente 2 procuram.
+                "numero_processo"           : _nulo(ent.get("numero_processo")),
+                "cpf_cnpj"                  : _nulo(ent.get("cpf_cnpj")),
+                "nome_executado"            : _nulo(ent.get("nome_executado")),
+                "nome_exequente"            : _nulo(ent.get("nome_exequente")),
+                "tipo_tributo"              : _nulo(ent.get("tipo_tributo")),
+                "exercicio"                 : _nulo(ent.get("exercicio")),
+                "numero_cda"                : _nulo(ent.get("numero_cda")),
+                "data_inscricao"            : _nulo(ent.get("data_inscricao")),
+                "valor_original"            : _nulo(ent.get("valor_original")),
+                "valor_atualizado"          : _nulo(ent.get("valor_atualizado")),
+                "vara"                      : _nulo(ent.get("vara")),
+            },
+        }
+
+        # [Fase 4] merge com o estado atual (só processos lidos com sucesso).
+        if USAR_MERGE and pr["extracao_ok"]:
+            hash_novo = ocr_meta.get("hash_pdf")
+            chave, tipo_chave = _resolver_chave(estado, pr["numero_processo"], pdf_file)
+            pr = _merge_estado(pr, estado, chave, tipo_chave, hash_novo, CAMPOS, pdf_file)
+            n_merged += 1
+            if pr.get("conflitos"):
+                n_conflitos += len(pr["conflitos"])
+
+        processos.append(pr)
+
+    if USAR_MERGE:
+        _gravar_estado(ESTADO_PATH, estado)
+        if _lock_estado:
+            _lock_estado.release()      # libera após o write (read-modify-write atômico)
+
+    payload = {
+        "metadata": {
+            "gerado_em"        : hoy.strftime("%Y-%m-%dT%H:%M:%S"),
+            "total_processados": len(prompts),
+            "total_ignorados"  : total_ignorados,
+            "campos_processados": sorted(CAMPOS),
+            "extracao_parcial" : CAMPOS != _CAMPOS_VALIDOS,
+            "total_com_erro"   : sum(1 for pr in processos if not pr["extracao_ok"]),
+            "merge_ativo"      : USAR_MERGE,
+            "processos_merged" : n_merged,
+            "conflitos_detectados": n_conflitos,
+            "estado_atual"     : ESTADO_PATH if USAR_MERGE else None,
+            "versao_agente1"   : VERSION_AGENTE1,
+            "observacao"       : "Agente 1 faz apenas extração determinística; não emite juízo APTO/NÃO APTO.",
+        },
+        "processos": processos,
     }
 
-
-@app.get(
-    "/painel/relatorios/{nome}",
-    include_in_schema=False,
-    summary="Baixar um relatório",
-    response_class=FileResponse,
-    responses={
-        200: {"content": {"application/octet-stream": {}}, "description": "O arquivo"},
-        404: {"model": Erro, "description": "Arquivo não encontrado"},
-    },
-)
-async def painel_baixar(nome: str, _=Depends(exigir_painel)):
-    limpo = Path(nome).name
-    alvo = (PASTA_RESULT / limpo).resolve()
-    if alvo.parent != PASTA_RESULT.resolve() or not alvo.exists():
-        raise HTTPException(404, "Arquivo não encontrado")
-    return FileResponse(alvo, filename=alvo.name, media_type="application/octet-stream")
-
-
-@app.get("/", response_class=HTMLResponse, include_in_schema=False)
-async def index(sessao: str = Cookie(None)):
-    if not PAINEL_ATIVO:
-        return HTMLResponse(
-            "<h1>Painel indisponível</h1><p>Gere o hash com "
-            "<code>python gerar_credencial.py painel</code> e defina "
-            "<code>SENHA_PAINEL_HASH</code> no ambiente do serviço.</p>",
-            status_code=503,
-        )
-    return HTMLResponse(PAINEL if _sessao_valida(sessao) else LOGIN)
-
-
-# ════════════════════════════════════════════════════════════════
-# PÁGINAS
-# ════════════════════════════════════════════════════════════════
-
-# [V7.3] Tarjeta do relatório de processo — compartilhada pelo painel e pela
-# página de teste do Swagger (/api/docs). Usada quando o lote tem 1 único PDF:
-# substitui os botões de download, que não fazem sentido para um processo só.
-_ESTILO_PROCESSO = """
-  .pc-card { border:1px solid #eef1f4; border-radius:8px; padding:.85rem 1rem;
-    margin-top:.65rem; background:#fbfcfd; }
-  .pc-cab { display:flex; align-items:center; gap:.6rem; flex-wrap:wrap;
-    font-size:.95rem; margin-bottom:.3rem; }
-  .pc-badge { display:inline-block; padding:.15rem .55rem; border-radius:20px;
-    font-size:.76rem; font-weight:700; }
-  .pc-secao { margin-top:.7rem; padding-top:.6rem; border-top:1px solid #eef1f4; }
-  .pc-secao h4 { margin:0 0 .4rem; font-size:.78rem; text-transform:uppercase;
-    letter-spacing:.04em; color:#5c6b7a; font-weight:600; }
-  .pc-linha { display:flex; gap:.5rem; font-size:.87rem; padding:.15rem 0; }
-  .pc-linha .pc-label { color:#5c6b7a; min-width:150px; flex:none; }
-  .pc-vazio { color:#8b98a5; font-size:.85rem; margin-top:.5rem; }
-  .pc-hist { margin:.5rem 0 0; padding-left:1rem; border-left:2px solid #eef1f4; }
-  .pc-hist-item { font-size:.83rem; padding:.25rem 0; }
-  .pc-hist-item .pc-hist-quando { color:#8b98a5; margin-right:.4rem; }
-"""
-
-_ESTILO = """
-  * { box-sizing: border-box; }
-  body { margin:0; padding:2rem 1rem;
-    font:15px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
-    background:#f4f6f8; color:#1a2027; }
-  .wrap { max-width:960px; margin:0 auto; }
-  h1 { margin:0 0 .25rem; font-size:1.5rem; color:#1F4E79; }
-  section { background:#fff; border:1px solid #e2e8ee; border-radius:10px;
-    padding:1.25rem 1.4rem; margin-bottom:1.15rem; }
-  h2 { margin:0 0 .9rem; font-size:1.02rem; color:#1F4E79;
-    display:flex; align-items:center; gap:.5rem; }
-  .num { background:#1F4E79; color:#fff; width:1.5rem; height:1.5rem;
-    border-radius:50%; display:inline-flex; align-items:center;
-    justify-content:center; font-size:.8rem; flex:none; }
-  button { font:inherit; font-weight:600; cursor:pointer; border:0;
-    border-radius:7px; padding:.6rem 1.15rem; background:#1F4E79; color:#fff; }
-  button:hover:not(:disabled) { background:#163a5b; }
-  button:disabled { background:#b6c2cf; cursor:not-allowed; }
-  button.ghost { background:#eef2f6; color:#1F4E79; }
-  input[type=password], input[type=file] { font:inherit; }
-  input[type=password] { padding:.6rem .8rem; border:1px solid #ccd6e0;
-    border-radius:7px; width:100%; }
-  table { width:100%; border-collapse:collapse; font-size:.9rem; }
-  th,td { text-align:left; padding:.5rem .6rem; border-bottom:1px solid #eef1f4; }
-  th { color:#5c6b7a; font-weight:600; font-size:.78rem;
-    text-transform:uppercase; letter-spacing:.04em; }
-  .vazio { color:#8b98a5; font-size:.9rem; padding:.4rem 0; }
-  .linha { display:flex; gap:.7rem; align-items:center; flex-wrap:wrap; }
-  .badge { display:inline-block; padding:.2rem .6rem; border-radius:20px;
-    font-size:.78rem; font-weight:600; }
-  .b-fila { background:#eef2f6; color:#5c6b7a; }
-  .b-proc { background:#fff4d6; color:#8a6100; }
-  .b-ok { background:#dff3e4; color:#1d6b34; }
-  .b-alerta { background:#ffeccc; color:#8a4b00; }
-  .b-erro { background:#fde5e3; color:#9b2c22; }
-  .av-item { font-size:.85rem; padding:.45rem .7rem; border-radius:6px;
-    background:#fff5e6; border:1px solid #f2dcb3; color:#7a4b00; margin-top:.3rem; }
-
-  /* Sinal de vida: um lote silencioso por oito minutos é indistinguível de um
-     lote travado. O ponto pisca, a barra corre e a última linha do log muda —
-     três evidências independentes de que ainda está andando. */
-  .pulso { display:inline-block; width:.45rem; height:.45rem; border-radius:50%;
-    background:currentColor; margin-right:.4rem; vertical-align:middle;
-    animation:pisca 1.3s ease-in-out infinite; }
-  @keyframes pisca { 0%,100% { opacity:1 } 50% { opacity:.2 } }
-  .barra { height:4px; border-radius:3px; background:#eef2f6;
-    overflow:hidden; margin-top:.6rem; }
-  .barra i { display:block; height:100%; width:32%; border-radius:3px;
-    background:#1F4E79; animation:corre 1.7s ease-in-out infinite; }
-  @keyframes corre { 0% { margin-left:-32% } 100% { margin-left:100% } }
-  .solta { border:2px dashed #ccd6e0; border-radius:9px; padding:1.3rem 1rem;
-    text-align:center; background:#fbfcfd; transition:.15s; }
-  .solta.sobre { border-color:#1F4E79; background:#eef4fa; }
-  .solta strong { display:block; margin-bottom:.55rem; color:#3d4a57; font-size:.95rem; }
-  .arq { display:flex; align-items:center; gap:.6rem; padding:.4rem .1rem;
-    border-bottom:1px solid #f1f4f7; font-size:.88rem; }
-  .arq:last-child { border-bottom:0; }
-  .arq .nome { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .arq .kb { color:#8b98a5; font-size:.8rem; flex:none; }
-  .arq .tira { border:0; background:none; color:#9b2c22; cursor:pointer;
-    font-size:1.05rem; line-height:1; padding:.1rem .35rem; border-radius:5px; flex:none; }
-  .arq .tira:hover { background:#fde5e3; }
-  .excedeu { color:#9b2c22; font-weight:600; }
-  .baixe { display:flex; flex-wrap:wrap; gap:.5rem; margin-top:.65rem; }
-  .baixe a { font-size:.83rem; padding:.32rem .7rem; border-radius:6px;
-    background:#eef2f6; text-decoration:none; }
-  .baixe a:hover { background:#e2eaf2; text-decoration:none; }
-  .andando { margin-top:.55rem; font-size:.88rem; color:#3d4a57; }
-  .andando b { font-weight:600; }
-  .ao-vivo { margin-top:.3rem; font:12px/1.5 ui-monospace,Consolas,monospace;
-    color:#7b8794; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  @media (prefers-reduced-motion:reduce) {
-    .pulso, .barra i { animation:none }
-  }
-  a.dl { color:#1F4E79; font-weight:600; text-decoration:none; }
-  a.dl:hover { text-decoration:underline; }
-  pre.log { background:#10161c; color:#c8d6e2; border-radius:7px; padding:.8rem;
-    font:12px/1.5 ui-monospace,Consolas,monospace; max-height:240px;
-    overflow:auto; white-space:pre-wrap; margin:.5rem 0 0; }
-  details summary { cursor:pointer; color:#1F4E79; font-size:.85rem; font-weight:600; }
-  .erro-msg { color:#9b2c22; font-size:.9rem; margin-top:.5rem; }
-""" + _ESTILO_PROCESSO
-
-_JS_ARQUIVOS = """
-// ── Coletor de PDFs ──────────────────────────────────────────────
-//
-// Usado pelo painel e pela página do Swagger. Um <input type=file> descarta a
-// escolha anterior a cada nova, e o formulário do Swagger só aceita um arquivo
-// por linha. Aqui os arquivos SE SOMAM, venham de escolhas sucessivas, de uma
-// pasta inteira ou de arrastar e soltar — inclusive arrastando a pasta, que o
-// dataTransfer.files sozinho ignora.
-
-const Arquivos = {
-  itens: [],
-  aviso: '',
-
-  chave(f) { return f.name + '::' + f.size + '::' + f.lastModified; },
-  total()  { return Arquivos.itens.reduce((s, f) => s + f.size, 0); },
-  excedeu(){ return Arquivos.total() > MAX_MB * 1048576; },
-  limpar() { Arquivos.itens = []; Arquivos.aviso = ''; },
-  remover(i) { Arquivos.itens.splice(i, 1); },
-
-  add(lista) {
-    const naoPdf = [];
-    let repetidos = 0;
-    for (const f of lista) {
-      if (!/\\.pdf$/i.test(f.name)) { naoPdf.push(f.name); continue; }
-      if (Arquivos.itens.some(e => Arquivos.chave(e) === Arquivos.chave(f))) { repetidos++; continue; }
-      Arquivos.itens.push(f);
-    }
-    const partes = [];
-    if (naoPdf.length) partes.push(
-      naoPdf.length > 3
-        ? `${naoPdf.length} arquivo(s) ignorado(s) por não serem PDF`
-        : `Ignorado(s) por não ser PDF: ${naoPdf.join(', ')}`);
-    if (repetidos) partes.push(`${repetidos} já estavam na lista`);
-    Arquivos.aviso = partes.join('. ');
-    return Arquivos.itens.length;
-  },
-
-  // Arrastar uma PASTA entrega um diretório, não arquivos — é preciso percorrer.
-  async doDrop(dt) {
-    const entradas = dt.items
-      ? [...dt.items].map(i => i.webkitGetAsEntry && i.webkitGetAsEntry()).filter(Boolean)
-      : [];
-    if (!entradas.length) return Arquivos.add(dt.files);
-
-    const achados = [];
-    for (const e of entradas) await Arquivos._percorrer(e, achados);
-    return Arquivos.add(achados);
-  },
-
-  async _percorrer(entrada, acc) {
-    if (entrada.isFile) {
-      acc.push(await new Promise((ok, erro) => entrada.file(ok, erro)));
-      return;
-    }
-    if (!entrada.isDirectory) return;
-    const leitor = entrada.createReader();
-    // readEntries devolve no máximo 100 por chamada — repetir até vir vazio.
-    let bloco;
-    do {
-      bloco = await new Promise((ok, erro) => leitor.readEntries(ok, erro));
-      for (const e of bloco) await Arquivos._percorrer(e, acc);
-    } while (bloco.length);
-  },
-};
-
-const tamanho = b => b >= 1048576
-  ? (b / 1048576).toFixed(1) + ' MB'
-  : Math.max(1, Math.round(b / 1024)) + ' KB';
-
-const escapar = s => String(s).replace(/[&<>"]/g,
-  c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-
-// ── Envio do lote ────────────────────────────────────────────────
-//
-// XMLHttpRequest em vez de fetch por um motivo só: fetch não informa o
-// progresso do UPLOAD. Num lote de 100 MB a tela ficava muda por minutos e
-// quem estava esperando não distinguia "enviando" de "travou".
-//
-// Devolve sempre {ok, status, dados, erro} — nunca lança. Todo caminho de
-// falha tem mensagem que diz o que fazer.
-function enviarLote(url, arquivos, cabecalhos, aoProgresso, campos) {
-  return new Promise(resolve => {
-    const fd = new FormData();
-    for (const f of arquivos) fd.append('arquivos', f);
-    if (campos) fd.append('campos', campos);   // [Fase 3] etapas selecionadas
-
-    const req = new XMLHttpRequest();
-    req.open('POST', url);
-    for (const [k, v] of Object.entries(cabecalhos || {})) req.setRequestHeader(k, v);
-
-    if (aoProgresso) {
-      req.upload.onprogress = e => {
-        if (e.lengthComputable) aoProgresso(e.loaded, e.total);
-      };
-    }
-
-    req.onload = () => {
-      let dados = null;
-      try { dados = JSON.parse(req.responseText); } catch (_) { /* não é JSON */ }
-
-      if (req.status >= 200 && req.status < 300) {
-        return resolve(dados
-          ? {ok: true, status: req.status, dados}
-          : {ok: false, status: req.status,
-             erro: 'O servidor respondeu num formato inesperado.'});
-      }
-
-      // O 413 quase sempre vem do proxy à frente do serviço, não daqui: ele
-      // corta o corpo antes de a requisição chegar. Dizer isso poupa horas.
-      if (req.status === 413) {
-        return resolve({ok: false, status: 413, erro:
-          'O envio foi recusado por ser grande demais. Se o limite mostrado ' +
-          'acima não foi atingido, quem recusou foi o servidor de entrada ' +
-          '(proxy) — peça a quem administra para aumentar o tamanho máximo ' +
-          'de requisição, ou envie os PDFs em lotes menores.'});
-      }
-      if (req.status === 401 || req.status === 403) {
-        return resolve({ok: false, status: req.status, erro:
-          'Sessão expirada ou token inválido. Entre de novo e repita o envio.'});
-      }
-      if (req.status === 502 || req.status === 503 || req.status === 504) {
-        return resolve({ok: false, status: req.status, erro:
-          'O serviço não respondeu. Aguarde um instante e tente de novo.'});
-      }
-      resolve({ok: false, status: req.status,
-               erro: (dados && dados.detail) || ('Falha no envio (HTTP ' + req.status + ').')});
-    };
-
-    req.onerror   = () => resolve({ok: false, status: 0, erro:
-      'Não foi possível falar com o servidor. Verifique a conexão e tente de novo.'});
-    req.ontimeout = () => resolve({ok: false, status: 0, erro:
-      'O envio demorou demais e foi interrompido. Tente com menos arquivos.'});
-    req.onabort   = () => resolve({ok: false, status: 0, erro: 'Envio cancelado.'});
-
-    req.send(fd);
-  });
-}
-
-// "42 MB de 100 MB (42%)" — o que quem espera precisa ver.
-function textoProgresso(enviado, total) {
-  const pct = total ? Math.round(enviado / total * 100) : 0;
-  return `Enviando… ${tamanho(enviado)} de ${tamanho(total)} (${pct}%)`;
-}
-
-// Rótulos dos artefatos. O Excel do Agente 2 é acumulativo — dizer isso no
-// botão evita que alguém o mande para o cartório achando que é só deste lote.
-const ROTULO_ARQUIVO = {
-  agente1_planilha: 'Planilha do Agente 1',
-  agente1_json    : 'JSON do Agente 1',
-  agente2_json    : 'JSON do Agente 2',
-  agente2_planilha: 'Planilha do Agente 2 (acumulada)',
-};
-
-// ── Relatório do processo (lote de 1 único PDF) ────────────────────
-//
-// Quando o lote tem 1 PDF só, a interface troca os botões de download pelo
-// relatório do processo — baixar um Excel não faz sentido para um processo
-// só. Compartilhado entre o painel (/painel/lotes/{id}/processo, cookie) e a
-// página de teste do Swagger (/api/v1/lotes/{id}/processo, token Bearer).
-//
-// Cache por URL: o lote concluído não muda mais, então uma vez buscado não
-// há por que repetir a chamada a cada rodada do polling (a cada 3 s).
-const _processoCache = new Map();
-
-async function obterProcesso(url, cabecalhos) {
-  if (_processoCache.has(url)) return _processoCache.get(url);
-  let resultado = null;
-  try {
-    const r = await fetch(url, {headers: cabecalhos || {}});
-    if (r.ok) resultado = await r.json();
-  } catch (_) { /* rede instável — cai no formato de downloads */ }
-  _processoCache.set(url, resultado);
-  return resultado;
-}
-
-const CORES_PRIORIDADE = {
-  ALTA:  {cor: '#9b2c22', fundo: '#fde5e3'},
-  MEDIA: {cor: '#8a6100', fundo: '#fff4d6'},
-  BAIXA: {cor: '#1d6b34', fundo: '#dff3e4'},
-};
-
-// Monta a tarjeta HTML a partir do JSON de GET .../processo (ProcessoConsultado).
-function renderizarProcesso(d) {
-  const ag1 = d.agente1 || {};
-  const ent = ag1.entidades || {};
-  const an  = (d.agente2 && d.agente2.analise) || {};
-  const aud = d.auditoria && d.auditoria.atual;
-
-  // [Fase 1 do Agente 1] Cada entidade extraída carrega a página do PDF onde
-  // foi encontrada — o mesmo dado que o CLI (buscar_processo.py) mostra como
-  // "(pág. N)". Sem isto o procurador não sabe onde conferir no PDF original.
-  const evid    = ag1.evidencias || {};
-  const evidEnt = evid.entidades || {};
-  const comPagina = (valor, campo) => {
-    if (valor === null || valor === undefined || valor === '') return valor;
-    const b = evidEnt[campo];
-    const pag = b && b.encontrado_em_pagina;
-    return pag == null ? valor : `${valor}  (pág. ${pag}${b.via_ocr ? ' OCR' : ''})`;
-  };
-  const paginaDe = (bloco) => {
-    const pag = bloco && bloco.encontrado_em_pagina;
-    return pag == null ? null : `pág. ${pag}${bloco.via_ocr ? ' (OCR)' : ''}`;
-  };
-
-  const linha = (label, valor) => (valor === null || valor === undefined || valor === '')
-    ? ''
-    : `<div class="pc-linha"><span class="pc-label">${escapar(label)}</span><span>${escapar(valor)}</span></div>`;
-
-  let html = '<div class="pc-card">';
-  html += `<div class="pc-cab"><b>${escapar(d.numero_processo)}</b>`;
-  if (an.prioridade) {
-    const cp = CORES_PRIORIDADE[an.prioridade] || {cor: '#5c6b7a', fundo: '#eef2f6'};
-    html += ` <span class="pc-badge" style="background:${cp.fundo};color:${cp.cor}">${escapar(an.prioridade)}</span>`;
-  }
-  html += '</div>';
-
-  if (Object.keys(ent).length || ag1.status_citacao || ag1.resultado_penhora) {
-    html += '<div class="pc-secao"><h4>Dados extraídos — Agente 1</h4>';
-    html += linha('Executado', comPagina(ent.nome_executado, 'nome_executado'));
-    html += linha('CPF/CNPJ', comPagina(ent.cpf_cnpj, 'cpf_cnpj'));
-    html += linha('Exequente', comPagina(ent.nome_exequente, 'nome_exequente'));
-    html += linha('Tipo de tributo', comPagina(ent.tipo_tributo, 'tipo_tributo'));
-    html += linha('Valor original', comPagina(ent.valor_original, 'valor_original'));
-    html += linha('Valor atualizado', comPagina(ent.valor_atualizado, 'valor_atualizado'));
-    html += linha('Vara', comPagina(ent.vara, 'vara'));
-    html += linha('Status citação', ag1.status_citacao);
-    html += linha('　↳ citação na', paginaDe(evid.citacao));
-    html += linha('Resultado penhora', ag1.resultado_penhora);
-    html += linha('　↳ penhora na', paginaDe(evid.penhora));
-    // [v8.1.0] Alvará (pedido/levantamento) — raro, por isso linha() já esconde
-    // sozinha quando não há nada (mesmo critério dos sinais processuais).
-    const alvara = ag1.status_alvara || {};
-    const evidAlvara = evid.alvara || {};
-    html += linha('Pedido de alvará', alvara.pedido);
-    html += linha('　↳ pedido na', paginaDe(evidAlvara.pedido));
-    html += linha('Levantamento alvará', alvara.levantamento);
-    html += linha('　↳ levantamento na', paginaDe(evidAlvara.levantamento));
-    html += linha('Última movimentação', ag1.ultima_movimentacao);
-    html += '</div>';
-  }
-
-  if (d.agente2) {
-    html += '<div class="pc-secao"><h4>Priorização — Agente 2</h4>';
-    if (d.agente2.erro) {
-      html += `<div class="pc-linha"><span class="pc-label">Status</span><span>FALHA NA ANÁLISE: ${escapar(d.agente2.erro)}</span></div>`;
-    } else {
-      html += linha('Ação recomendada', an.acao_recomendada);
-      html += linha('Justificativa', an.justificativa);
-      html += linha('Alerta de prescrição', an.alerta_prescricao ? 'SIM' : 'não');
-      if ((an.observacoes || []).length)
-        html += linha('Observações', an.observacoes.join('; '));
-    }
-    // [V7.3] Histórico completo (append-only): o processo pode ter sido
-    // analisado mais de uma vez, em lotes diferentes — 1 registro só não
-    // mostra evolução nenhuma, por isso só aparece com 2+.
-    const histA2 = d.agente2_historico || [];
-    if (histA2.length > 1) {
-      html += `<div class="pc-hist"><b style="font-size:.8rem;color:#5c6b7a">Histórico de análises (${histA2.length}):</b>`;
-      histA2.forEach(r => {
-        const a = r.analise || {};
-        const cp = CORES_PRIORIDADE[a.prioridade] || {cor: '#5c6b7a', fundo: '#eef2f6'};
-        const rotulo = r.erro
-          ? `<span style="color:#9b2c22">FALHA NA ANÁLISE</span>`
-          : (a.prioridade
-              ? `<span class="pc-badge" style="background:${cp.fundo};color:${cp.cor}">${escapar(a.prioridade)}</span>`
-              : '');
-        html += `<div class="pc-hist-item"><span class="pc-hist-quando">${escapar(r.processado_em || '—')}</span>`
-              + `${rotulo} ${escapar(a.acao_recomendada || r.erro || '')} `
-              + `${escapar(r.origem_lote ? `(lote ${escapar(r.origem_lote)})` : '')}</div>`;
-      });
-      html += '</div>';
-    }
-    html += '</div>';
-  }
-
-  if (aud) {
-    html += '<div class="pc-secao"><h4>Auditoria</h4>';
-    if (aud.decisao) html += linha('Decisão', aud.decisao);
-    html += linha('Motivo', aud.motivo);
-    html += linha('Registrado em', aud.classificado_em || aud.extraido_em);
-    // [V7.3] Idem: evolução das classificações de triagem entre lotes.
-    const histAud = (d.auditoria && d.auditoria.historico) || [];
-    if (histAud.length > 1) {
-      html += `<div class="pc-hist"><b style="font-size:.8rem;color:#5c6b7a">Histórico de classificações (${histAud.length}):</b>`;
-      histAud.forEach(r => {
-        html += `<div class="pc-hist-item"><span class="pc-hist-quando">${escapar(r.classificado_em || r.extraido_em || '—')}</span>`
-              + `${escapar(r.decisao || '')} ${escapar(r.motivo || '')}</div>`;
-      });
-      html += '</div>';
-    }
-    html += '</div>';
-  }
-
-  if (!d.agente2 && !aud)
-    html += '<p class="pc-vazio">Ainda sem priorização do Agente 2 — só a extração do Agente 1.</p>';
-
-  html += '</div>';
-  return html;
-}
-"""
-
-
-_ENVIO_DOCS = ("""
-<style>
-  .hera { max-width:1400px; margin:1.4rem auto 0; padding:0 20px;
-    font:15px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; color:#1a2027; }
-  .hera .cx { background:#fff; border:1px solid #d6e0ea; border-left:4px solid #1F4E79;
-    border-radius:9px; padding:1.1rem 1.3rem; }
-  .hera h2 { margin:0 0 .3rem; font-size:1.08rem; color:#1F4E79; }
-  .hera p { margin:.25rem 0 0; font-size:.88rem; color:#5c6b7a; }
-  .hera label { display:block; font-size:.8rem; color:#5c6b7a; margin:.9rem 0 .3rem; }
-  .hera input[type=password] { font:inherit; padding:.5rem .7rem; border:1px solid #ccd6e0;
-    border-radius:7px; width:100%; max-width:520px; }
-  .hera .zona { margin-top:.9rem; border:2px dashed #ccd6e0; border-radius:9px;
-    padding:1.1rem; text-align:center; background:#fbfcfd; transition:.15s; }
-  .hera .zona.sobre { border-color:#1F4E79; background:#eef4fa; }
-  .hera button { font:inherit; font-weight:600; cursor:pointer; border:0; border-radius:7px;
-    padding:.55rem 1.05rem; background:#1F4E79; color:#fff; }
-  .hera button.g { background:#eef2f6; color:#1F4E79; }
-  .hera button:disabled { background:#b6c2cf; cursor:not-allowed; }
-  .hera .fila { max-height:190px; overflow:auto; margin-top:.7rem; }
-  .hera .it { display:flex; gap:.6rem; align-items:center; font-size:.86rem;
-    padding:.32rem .1rem; border-bottom:1px solid #f1f4f7; }
-  .hera .it span:first-child { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .hera .it small { color:#8b98a5; }
-  .hera .it button { background:none; color:#9b2c22; padding:.1rem .3rem; }
-  .hera .barra { height:4px; border-radius:3px; background:#eef2f6; overflow:hidden; margin-top:.7rem; }
-  .hera .barra i { display:block; height:100%; width:32%; border-radius:3px; background:#1F4E79;
-    animation:heracorre 1.7s ease-in-out infinite; }
-  @keyframes heracorre { 0% { margin-left:-32% } 100% { margin-left:100% } }
-  .hera .estado { margin-top:.8rem; font-size:.9rem; }
-  .hera .ruim { color:#9b2c22; font-weight:600; }
-  .hera .av { font-size:.85rem; padding:.4rem .6rem; border-radius:6px; background:#fff5e6;
-    border:1px solid #f2dcb3; color:#7a4b00; margin-top:.3rem; }
-  @media (prefers-reduced-motion:reduce) { .hera .barra i { animation:none } }
-</style>
-<style>""" + _ESTILO_PROCESSO + """</style>
-
-<div class="hera"><div class="cx">
-  <h2>Enviar um lote de teste</h2>
-  <p>O formulário do Swagger, mais abaixo, aceita <b>um arquivo por linha</b> — é limitação
-     daquela página. Aqui você solta a pasta inteira de uma vez. Mesma rota
-     <code>POST /api/v1/lotes</code>, mesmo token.</p>
-
-  <label for="hera-tk">Token do consumidor</label>
-  <input type="password" id="hera-tk" placeholder="pgms_live_..." autocomplete="off">
-
-  <input type="file" id="hera-arq" multiple accept="application/pdf,.pdf" hidden>
-  <input type="file" id="hera-pasta" webkitdirectory directory multiple hidden>
-
-  <div class="zona" id="hera-zona">
-    <strong>Arraste os PDFs — ou a pasta inteira — aqui</strong>
-    <div style="margin-top:.6rem;display:flex;gap:.6rem;justify-content:center;flex-wrap:wrap">
-      <button type="button" class="g" id="hera-b-arq">Escolher arquivos</button>
-      <button type="button" class="g" id="hera-b-pasta">Escolher uma pasta</button>
-    </div>
-    <p>Só os PDFs entram. Todos formam <b>um único lote</b>. Até __MAX_MB__ MB.</p>
-  </div>
-
-  <div class="fila" id="hera-fila"></div>
-
-  <details style="margin-top:.9rem">
-    <summary style="cursor:pointer;font-size:.9rem;color:#5c6b7a">
-      Etapas a extrair (avançado) — por padrão, todas</summary>
-    <div id="hera-campos-box" style="display:flex;flex-wrap:wrap;gap:.8rem;margin-top:.6rem;font-size:.9rem">
-      <label><input type="checkbox" class="hera-campo" value="citacao" checked> Citação</label>
-      <label><input type="checkbox" class="hera-campo" value="penhora" checked> Penhora</label>
-      <label><input type="checkbox" class="hera-campo" value="movimentacao" checked> Movimentação</label>
-      <label><input type="checkbox" class="hera-campo" value="sinais" checked> Sinais (extinção/parcelamento/art.40)</label>
-      <label><input type="checkbox" class="hera-campo" value="alvara" checked> Alvará (pedido/levantamento)</label>
-    </div>
-    <p style="font-size:.85rem;color:#8b98a5;margin-top:.4rem">Entidades (CPF/CNPJ, CDA, valor…) e
-      Tipo (é execução fiscal?) vêm sempre junto, mesmo desmarcando tudo aqui — são a
-      identificação básica do processo. As etapas não marcadas são <b>reaproveitadas</b> do
-      que já foi extraído antes (ou saem vazias, se for a primeira vez). Útil para
-      reprocessar só uma etapa (ex.: só penhora) sem refazer o resto.</p>
-  </details>
-
-  <div style="display:flex;gap:.6rem;align-items:center;flex-wrap:wrap;margin-top:.9rem">
-    <button id="hera-enviar" disabled>Enviar e processar</button>
-    <button class="g" id="hera-limpar" hidden>Limpar</button>
-    <span style="font-size:.85rem;color:#8b98a5" id="hera-total"></span>
-  </div>
-
-  <div class="estado" id="hera-estado"></div>
-</div></div>
-
-<script>
-const MAX_MB = __MAX_MB__;
-</script>
-<script>""" + _JS_ARQUIVOS + """</script>
-<script>
-(function () {
-  const q = s => document.querySelector(s);
-  const estado = q('#hera-estado');
-  let acompanhando = null;
-
-  function autorizacao() {
-    const t = q('#hera-tk').value.trim();
-    return t ? {'Authorization': 'Bearer ' + t} : null;
-  }
-
-  function desenhar() {
-    const itens = Arquivos.itens, excedeu = Arquivos.excedeu();
-    q('#hera-fila').innerHTML = itens.map((f, i) => `
-      <div class="it"><span>${escapar(f.webkitRelativePath || f.name)}</span>
-        <small>${tamanho(f.size)}</small>
-        <button data-i="${i}" title="Tirar da lista">&times;</button></div>`).join('');
-    q('#hera-enviar').disabled = !itens.length || excedeu;
-    q('#hera-enviar').textContent = itens.length
-      ? `Enviar ${itens.length} PDF(s) e processar` : 'Enviar e processar';
-    q('#hera-limpar').hidden = !itens.length;
-    q('#hera-total').innerHTML = itens.length
-      ? (excedeu
-          ? `<span class="ruim">${tamanho(Arquivos.total())} — acima do limite de ${MAX_MB} MB</span>`
-          : `${tamanho(Arquivos.total())} no total`)
-      : '';
-    if (Arquivos.aviso) { estado.textContent = Arquivos.aviso; Arquivos.aviso = ''; }
-  }
-
-  q('#hera-fila').onclick = e => {
-    const i = e.target.dataset && e.target.dataset.i;
-    if (i === undefined) return;
-    Arquivos.remover(Number(i)); desenhar();
-  };
-  q('#hera-b-arq').onclick   = () => q('#hera-arq').click();
-  q('#hera-b-pasta').onclick = () => q('#hera-pasta').click();
-  q('#hera-limpar').onclick  = () => { Arquivos.limpar(); desenhar(); };
-  for (const id of ['#hera-arq', '#hera-pasta']) {
-    q(id).onchange = e => { Arquivos.add(e.target.files); e.target.value = ''; desenhar(); };
-  }
-
-  const zona = q('#hera-zona');
-  ['dragenter','dragover'].forEach(ev => zona.addEventListener(ev, e => {
-    e.preventDefault(); zona.classList.add('sobre');
-  }));
-  ['dragleave','drop'].forEach(ev => zona.addEventListener(ev, e => {
-    e.preventDefault(); zona.classList.remove('sobre');
-  }));
-  zona.addEventListener('drop', async e => {
-    estado.textContent = 'Lendo os arquivos...';
-    await Arquivos.doDrop(e.dataTransfer);
-    desenhar();
-  });
-
-  // Baixar exige o cabeçalho de autenticação, então não dá para usar <a href>.
-  async function baixar(url, nome) {
-    const r = await fetch(url, {headers: autorizacao()});
-    if (!r.ok) { estado.innerHTML += `<div class="ruim">Falha ao baixar (${r.status})</div>`; return; }
-    const blob = await r.blob();
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob); a.download = nome;
-    a.click(); URL.revokeObjectURL(a.href);
-  }
-
-  async function pintar(l) {
-    const dur = s => s == null ? '' : (s < 60 ? s + ' s' : Math.floor(s/60) + ' min');
-    let html = `<b>${escapar(l.lote_id)}</b> — ${escapar(l.status)}`;
-    if (l.status === 'na_fila')
-      html += ` · ${l.lotes_na_frente || 0} lote(s) na frente · esperando há ${dur(l.decorrido_s)}`
-            + '<div class="barra"><i></i></div>';
-    if (l.status === 'processando')
-      html += ` · ${escapar(l.etapa || '')} · há ${dur(l.decorrido_s)}`
-            + '<div class="barra"><i></i></div>';
-    if (l.status === 'concluido') html += ` · processado em ${dur(l.decorrido_s)}`;
-    if (l.resumo) html += `<div style="margin-top:.4rem">${escapar(l.resumo)}</div>`;
-    if (l.erro)   html += `<div class="ruim">${escapar(l.erro)}</div>`;
-    (l.avisos || []).forEach(a => html += `<div class="av">&#9888; ${escapar(a)}</div>`);
-
-    // [V7.3] Lote de 1 único PDF: mostra o relatório do processo em vez dos
-    // botões de download — baixar um Excel não faz sentido para 1 processo.
-    let processo = null;
-    if (l.status === 'concluido' && (l.arquivos || []).length === 1) {
-      processo = await obterProcesso(`/api/v1/lotes/${l.lote_id}/processo`, autorizacao());
-    }
-
-    if (processo) {
-      html += renderizarProcesso(processo);
-      estado.innerHTML = html;
-      return;
-    }
-
-    const baixaveis = l.downloads || [];
-    if (baixaveis.length)
-      html += '<div style="margin-top:.7rem;display:flex;gap:.6rem;flex-wrap:wrap">'
-            + baixaveis.map(t => `<button class="g" data-baixar="${t}">&#8681; `
-                + `${escapar(ROTULO_ARQUIVO[t] || t)}</button>`).join('')
-            + '</div>';
-    estado.innerHTML = html;
-
-    estado.querySelectorAll('[data-baixar]').forEach(b => {
-      const t = b.dataset.baixar;
-      const ext = t.endsWith('planilha') ? 'xlsx' : 'json';
-      b.onclick = () => baixar(`/api/v1/lotes/${l.lote_id}/arquivos/${t}`,
-                               `${t}_${l.lote_id}.${ext}`);
-    });
-  }
-
-  async function acompanhar(id) {
-    clearInterval(acompanhando);
-    const passo = async () => {
-      const r = await fetch('/api/v1/lotes/' + id, {headers: autorizacao()});
-      if (!r.ok) { clearInterval(acompanhando); return; }
-      const l = await r.json();
-      await pintar(l);
-      if (l.status === 'concluido' || l.status === 'erro') clearInterval(acompanhando);
-    };
-    await passo();
-    acompanhando = setInterval(passo, 3000);
-  }
-
-  let enviando = false;
-
-  q('#hera-enviar').onclick = async () => {
-    if (enviando) return;                  // trava contra o duplo clique
-    const cab = autorizacao();
-    if (!cab) { estado.innerHTML = '<span class="ruim">Informe o token do consumidor.</span>'; return; }
-
-    const quantos = Arquivos.itens.length;
-    enviando = true;
-    q('#hera-enviar').disabled = true;
-    estado.textContent = `Enviando ${quantos} PDF(s)…`;
-
-    try {
-      // [Fase 3] etapas marcadas; se todas (ou nenhuma) -> "" = todas.
-      const marcados = Array.from(document.querySelectorAll('.hera-campo:checked')).map(c => c.value);
-      const todas = document.querySelectorAll('.hera-campo').length;
-      const campos = (marcados.length === 0 || marcados.length === todas) ? '' : marcados.join(',');
-      const r = await enviarLote('/api/v1/lotes', Arquivos.itens, cab,
-                                 (env, tot) => { estado.textContent = textoProgresso(env, tot); },
-                                 campos);
-      if (!r.ok) {
-        // Antes, um 413 do proxy (que responde HTML) fazia o r.json() estourar
-        // e a tela mostrava "Falha de rede: Unexpected token '<'".
-        estado.innerHTML = `<span class="ruim">${escapar(r.erro)}</span>`;
-        return;
-      }
-      Arquivos.limpar(); desenhar();
-      acompanhar(r.dados.lote_id);
-    } finally {
-      enviando = false;
-      q('#hera-enviar').disabled = !Arquivos.itens.length;
-    }
-  };
-
-  desenhar();
-})();
-</script>
-""").replace("__MAX_MB__", str(MAX_MB_LOTE))
-
-
-LOGIN = """<!doctype html>
-<html lang="pt-BR"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Entrar — Triagem de Execuções Fiscais</title>
-<style>""" + _ESTILO + """
-  .wrap { max-width:380px; margin-top:12vh; }
-</style></head><body><div class="wrap">
-  <section>
-    <h1>Triagem de Execuções Fiscais</h1>
-    <p class="vazio">HERA Tecnologia / PGMS</p>
-    <form id="f" style="margin-top:1.2rem">
-      <label for="senha" style="font-size:.85rem;color:#5c6b7a">Senha de acesso</label>
-      <input type="password" id="senha" name="senha" autofocus required style="margin:.35rem 0 .9rem">
-      <button type="submit" style="width:100%">Entrar</button>
-    </form>
-    <p class="erro-msg" id="erro"></p>
-  </section>
-</div>
-<script>
-document.getElementById('f').onsubmit = async e => {
-  e.preventDefault();
-  const fd = new FormData();
-  fd.append('senha', document.getElementById('senha').value);
-  const r = await fetch('/painel/login', {method:'POST', body:fd});
-  if (r.ok) { location.reload(); }
-  else {
-    const j = await r.json().catch(() => ({detail:'Falha no login'}));
-    document.getElementById('erro').textContent = j.detail;
-  }
-};
-</script></body></html>
-"""
-
-PAINEL = ("""<!doctype html>
-<html lang="pt-BR"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Triagem de Execuções Fiscais — PGMS</title>
-<style>""" + _ESTILO + """</style></head><body><div class="wrap">
-
-  <div class="linha" style="justify-content:space-between;margin-bottom:1.5rem">
-    <div>
-      <h1>Triagem de Execuções Fiscais</h1>
-      <p class="vazio" style="padding:0">HERA Tecnologia / PGMS</p>
-    </div>
-    <button class="ghost" id="sair">Sair</button>
-  </div>
-
-  <section>
-    <h2><span class="num">1</span> Enviar processos</h2>
-
-    <input type="file" id="files" multiple accept="application/pdf,.pdf" hidden>
-    <input type="file" id="pasta" webkitdirectory directory multiple hidden>
-    <div id="solta" class="solta">
-      <strong>Arraste os PDFs — ou a pasta inteira — aqui</strong>
-      <div class="linha" style="justify-content:center">
-        <button type="button" class="ghost" id="btn-escolher">Escolher arquivos</button>
-        <button type="button" class="ghost" id="btn-pasta">Escolher uma pasta</button>
-      </div>
-      <p class="vazio" style="padding:.6rem 0 0">Pode escolher várias vezes, de pastas
-        diferentes — os arquivos se somam. Só os PDFs entram. Até __MAX_MB__ MB por lote.</p>
-    </div>
-
-    <div id="lista"></div>
-
-    <details style="margin-top:.9rem">
-      <summary style="cursor:pointer;font-size:.9rem;color:#5c6b7a">
-        Etapas a extrair (avançado) — por padrão, todas</summary>
-      <div class="linha" id="campos-box" style="flex-wrap:wrap;gap:.8rem;margin-top:.6rem;font-size:.9rem">
-        <label><input type="checkbox" class="campo" value="citacao" checked> Citação</label>
-        <label><input type="checkbox" class="campo" value="penhora" checked> Penhora</label>
-        <label><input type="checkbox" class="campo" value="movimentacao" checked> Movimentação</label>
-        <label><input type="checkbox" class="campo" value="sinais" checked> Sinais (extinção/parcelamento/art.40)</label>
-        <label><input type="checkbox" class="campo" value="alvara" checked> Alvará (pedido/levantamento)</label>
-        <label><input type="checkbox" class="campo" value="entidades" checked> Entidades (CPF, CDA, valor…)</label>
-        <label><input type="checkbox" class="campo" value="tipo" checked> Tipo (execução fiscal?)</label>
-      </div>
-      <p class="vazio" style="padding:.4rem 0 0">As etapas não marcadas são
-        <b>reaproveitadas</b> do que já foi extraído antes (não se perdem). Útil para
-        reprocessar só uma etapa (ex.: só penhora) sem refazer o resto.</p>
-    </details>
-
-    <div class="linha" style="margin-top:.9rem">
-      <button id="btn-up" disabled>Enviar e processar</button>
-      <button class="ghost" id="btn-limpar" hidden>Limpar seleção</button>
-      <span class="vazio" id="total" style="padding:0"></span>
-    </div>
-
-    <p class="vazio" id="up-msg">Cada envio vira um lote independente, processado em
-      fila — um por vez. A leitura dos PDFs e a análise levam alguns minutos por
-      processo; pode fechar a página e voltar depois.</p>
-  </section>
-
-  <section>
-    <h2><span class="num">2</span> Lotes <span id="contador" class="vazio"
-        style="padding:0;font-weight:400"></span></h2>
-    <div id="lotes"><p class="vazio">Carregando...</p></div>
-  </section>
-
-  <section>
-    <h2><span class="num">3</span> Relatórios acumulados</h2>
-    <table>
-      <thead><tr><th>Arquivo</th><th style="width:110px">Tamanho</th><th style="width:150px">Gerado em</th></tr></thead>
-      <tbody id="relatorios"></tbody>
-    </table>
-  </section>
-
-</div>
-<script>
-const MAX_MB = __MAX_MB__;
-</script>
-<script>""" + _JS_ARQUIVOS + """</script>
-<script>
-const $ = s => document.querySelector(s);
-const esc = escapar;
-
-const CLASSE = {na_fila:'b-fila', processando:'b-proc', concluido:'b-ok', erro:'b-erro'};
-
-// A lista é redesenhada a cada 3 s. Sem isto, o log que o procurador abre para
-// acompanhar o lote fecha sozinho na próxima rodada — justamente enquanto ele
-// está olhando. 'toggle' não borbulha, daí a captura.
-const abertos = new Set();
-document.addEventListener('toggle', e => {
-  const id = e.target.dataset && e.target.dataset.lote;
-  if (!id) return;
-  e.target.open ? abertos.add(id) : abertos.delete(id);
-}, true);
-
-$('#sair').onclick = async () => { await fetch('/painel/logout',{method:'POST'}); location.reload(); };
-
-// ── Seleção de arquivos ──────────────────────────────────────────
-// A lógica de acumular vive em Arquivos (coletor compartilhado); aqui fica só
-// o desenho da tela do painel.
-
-function desenharSelecao() {
-  const itens = Arquivos.itens, excedeu = Arquivos.excedeu();
-
-  $('#lista').innerHTML = itens.map((f, i) => `
-    <div class="arq">
-      <span class="nome">${esc(f.webkitRelativePath || f.name)}</span>
-      <span class="kb">${tamanho(f.size)}</span>
-      <button class="tira" data-i="${i}" title="Tirar da lista">&times;</button>
-    </div>`).join('');
-
-  $('#btn-up').disabled = !itens.length || excedeu;
-  $('#btn-up').textContent = itens.length
-    ? `Enviar ${itens.length} PDF(s) e processar`
-    : 'Enviar e processar';
-  $('#btn-limpar').hidden = !itens.length;
-  $('#total').innerHTML = itens.length
-    ? (excedeu
-        ? `<span class="excedeu">${tamanho(Arquivos.total())} — acima do limite de ${MAX_MB} MB. Tire alguns arquivos.</span>`
-        : `${tamanho(Arquivos.total())} no total`)
-    : '';
-  if (Arquivos.aviso) { $('#up-msg').textContent = Arquivos.aviso; Arquivos.aviso = ''; }
-}
-
-$('#lista').onclick = e => {
-  const i = e.target.dataset && e.target.dataset.i;
-  if (i === undefined) return;
-  Arquivos.remover(Number(i));
-  desenharSelecao();
-};
-
-$('#btn-escolher').onclick = () => $('#files').click();
-$('#btn-pasta').onclick    = () => $('#pasta').click();
-$('#btn-limpar').onclick   = () => { Arquivos.limpar(); desenharSelecao(); };
-
-for (const id of ['#files', '#pasta']) {
-  $(id).onchange = e => {
-    Arquivos.add(e.target.files);
-    e.target.value = '';   // libera reescolher o MESMO arquivo depois de removê-lo
-    desenharSelecao();
-  };
-}
-
-const solta = $('#solta');
-['dragenter','dragover'].forEach(ev => solta.addEventListener(ev, e => {
-  e.preventDefault(); solta.classList.add('sobre');
-}));
-['dragleave','drop'].forEach(ev => solta.addEventListener(ev, e => {
-  e.preventDefault(); solta.classList.remove('sobre');
-}));
-solta.addEventListener('drop', async e => {
-  $('#up-msg').textContent = 'Lendo os arquivos...';
-  await Arquivos.doDrop(e.dataTransfer);
-  desenharSelecao();
-});
-
-let enviando = false;
-
-$('#btn-up').onclick = async () => {
-  if (enviando) return;                    // trava contra o duplo clique
-  if (!Arquivos.itens.length) { $('#up-msg').textContent = 'Selecione ao menos um PDF.'; return; }
-
-  const quantos = Arquivos.itens.length;
-  enviando = true;
-  $('#btn-up').disabled = true;
-  $('#up-msg').textContent = `Enviando ${quantos} PDF(s)…`;
-
-  // enviarLote nunca lança: o try/finally aqui é só para o estado do botão.
-  // Antes não havia catch nenhum, e uma falha de rede deixava a tela parada
-  // em "Enviando…" com o botão reabilitado — dois cliques, dois lotes iguais.
-  try {
-    // [Fase 3] etapas marcadas; se todas (ou nenhuma) -> "" = todas.
-    const marcados = Array.from(document.querySelectorAll('.campo:checked')).map(c => c.value);
-    const todas = document.querySelectorAll('.campo').length;
-    const campos = (marcados.length === 0 || marcados.length === todas) ? '' : marcados.join(',');
-    const r = await enviarLote('/painel/lotes', Arquivos.itens, null,
-                               (env, tot) => { $('#up-msg').textContent = textoProgresso(env, tot); },
-                               campos);
-    if (r.ok) {
-      $('#up-msg').textContent =
-        `Lote ${r.dados.lote_id} criado com ${r.dados.arquivos.length} PDF(s) — acompanhe abaixo.`;
-      Arquivos.limpar();
-    } else {
-      $('#up-msg').textContent = r.erro;
-      if (r.status === 401) setTimeout(() => location.reload(), 1500);
-    }
-    desenharSelecao();
-    carregar();
-  } finally {
-    enviando = false;
-    $('#btn-up').disabled = !Arquivos.itens.length;
-  }
-};
-
-// "há 3 min" diz mais do que "iniciado 14:31:02" para quem está esperando.
-function duracao(s) {
-  if (s == null) return '';
-  if (s < 60) return `${s} s`;
-  const min = Math.floor(s / 60), h = Math.floor(min / 60);
-  return h ? `${h} h ${String(min % 60).padStart(2, '0')} min` : `${min} min`;
-}
-
-// Última linha do log, sem o timestamp que o servidor prefixa.
-function ultimaLinha(l) {
-  if (!l.log || !l.log.length) return '';
-  const bruta = l.log[l.log.length - 1]
-    .replace(/^\\d{4}-\\d\\d-\\d\\d \\d\\d:\\d\\d:\\d\\d\\s+/, '')
-    .replace(/^──\\s*|\\s*──$/g, '');
-  return bruta.length > 120 ? bruta.slice(0, 120) + '…' : bruta;
-}
-
-function andamento(l) {
-  if (l.status === 'na_fila') {
-    const frente = l.lotes_na_frente
-      ? `${l.lotes_na_frente} lote(s) na frente`
-      : 'é o próximo a entrar';
-    return `<div class="andando"><b>Na fila</b> — ${frente}.
-              Aguardando há ${duracao(l.decorrido_s)}.</div>
-            <div class="barra"><i></i></div>`;
-  }
-  if (l.status === 'processando') {
-    const viva = ultimaLinha(l);
-    return `<div class="andando"><b>${esc(l.etapa || 'Processando')}</b>
-              — há ${duracao(l.decorrido_s)}. Leva alguns minutos por processo.</div>
-            <div class="barra"><i></i></div>
-            ${viva ? `<div class="ao-vivo">${esc(viva)}</div>` : ''}`;
-  }
-  if (l.status === 'concluido' && l.decorrido_s != null) {
-    return `<div class="andando" style="color:#5c6b7a">Processado em ${duracao(l.decorrido_s)}.</div>`;
-  }
-  return '';
-}
-
-async function cartaoLote(l) {
-  const comAviso = l.status === 'concluido' && l.avisos.length;
-  const emCurso = l.status === 'na_fila' || l.status === 'processando';
-  const cls = comAviso ? 'b-alerta' : (CLASSE[l.status] || 'b-fila');
-  const rotulo = comAviso ? 'concluído com avisos' : l.status;
-
-  // [V7.3] Lote de 1 único PDF: mostra o relatório do processo em vez dos
-  // botões de download — baixar um Excel não faz sentido para 1 processo.
-  let processo = null;
-  if (l.status === 'concluido' && (l.arquivos || []).length === 1) {
-    processo = await obterProcesso(`/painel/lotes/${encodeURIComponent(l.lote_id)}/processo`);
-  }
-  const corpoDownloads = processo
-    ? renderizarProcesso(processo)
-    : ((l.downloads || []).length ? `<div class="baixe">${l.downloads.map(t =>
-        `<a class="dl" href="/painel/lotes/${encodeURIComponent(l.lote_id)}/arquivos/${t}"
-            download>&#8681; ${esc(ROTULO_ARQUIVO[t] || t)}</a>`).join('')}</div>` : '');
-
-  return `
-  <div style="border:1px solid #eef1f4;border-radius:8px;padding:.85rem 1rem;margin-bottom:.7rem">
-    <div class="linha" style="justify-content:space-between">
-      <div>
-        <strong style="font-size:.9rem">${esc(l.lote_id)}</strong>
-        <span class="vazio" style="padding:0;margin-left:.5rem">
-          ${l.arquivos.length} PDF(s) &middot; ${esc(l.origem||'')} &middot; ${esc(l.criado_em||'')}
-        </span>
-      </div>
-      <span class="badge ${cls}">${emCurso ? '<span class="pulso"></span>' : ''}${esc(rotulo)}</span>
-    </div>
-    ${andamento(l)}
-    ${corpoDownloads}
-    ${l.resumo ? `<div style="margin-top:.5rem;font-size:.9rem">${esc(l.resumo)}</div>` : ''}
-    ${l.erro ? `<div class="erro-msg">${esc(l.erro)}</div>` : ''}
-    ${l.avisos.map(a => `<div class="av-item">&#9888; ${esc(a)}</div>`).join('')}
-    ${l.log && l.log.length ? `<details style="margin-top:.6rem" data-lote="${esc(l.lote_id)}"
-      ${abertos.has(l.lote_id) ? 'open' : ''}>
-      <summary>Ver log</summary><pre class="log">${esc(l.log.join('\\n'))}</pre></details>` : ''}
-  </div>`;
-}
-
-async function carregar() {
-  try {
-    const r = await fetch('/painel/lotes');
-    if (r.status === 401) { location.reload(); return; }
-    const j = await r.json();
-    const cartoes = await Promise.all(j.lotes.map(cartaoLote));
-    $('#lotes').innerHTML = j.lotes.length
-      ? cartoes.join('')
-      : '<p class="vazio">Nenhum lote enviado ainda.</p>';
-
-    // O procurador pode estar com a seção 3 na tela e não ver o cartão do lote.
-    const ativos = j.lotes.filter(l => l.status === 'na_fila' || l.status === 'processando').length;
-    $('#contador').textContent = ativos ? `— ${ativos} em andamento` : '';
-    document.title = ativos
-      ? `(${ativos}) Triagem de Execuções Fiscais — PGMS`
-      : 'Triagem de Execuções Fiscais — PGMS';
-
-    const rel = await (await fetch('/painel/relatorios')).json();
-    $('#relatorios').innerHTML = rel.arquivos.length
-      ? rel.arquivos.map(a => `<tr>
-          <td><a class="dl" href="/painel/relatorios/${encodeURIComponent(a.nome)}">${esc(a.nome)}</a></td>
-          <td>${a.tamanho_kb} KB</td><td>${esc(a.modificado_em)}</td></tr>`).join('')
-      : '<tr><td colspan="3" class="vazio">Nenhum relatório gerado ainda.</td></tr>';
-  } catch (e) { /* rede instável — proxima rodada tenta de novo */ }
-}
-
-desenharSelecao();
-carregar();
-setInterval(carregar, 3000);
-</script></body></html>
-""").replace("__MAX_MB__", str(MAX_MB_LOTE))
+    with open(output_json, 'w', encoding='utf-8') as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+    print(f"JSON do Agente 1 gerado: {output_json}")
+    com_erro = sum(1 for pr in processos if not pr["extracao_ok"])
+    print(f"  {len(processos) - com_erro} de {len(processos)} processo(s) extraído(s) com sucesso.")
+    if com_erro:
+        print(f"  {com_erro} processo(s) NÃO puderam ser extraídos — ver 'erro_extracao' no JSON.")
+    return payload
+
+
+# ===========================================================================
+# 9.2 — HISTÓRICO DE EXTRAÇÕES (auditoria acumulativa — append-only)
+# ===========================================================================
+
+def exportar_historico_extracoes(prompts, output_jsonl):
+    """
+    Registra TODOS os processos do lote num JSONL — uma linha por processo.
+    APPEND-ONLY: nunca sobrescreve o rastro anterior. Cada processo vai em
+    try/except: um registro com erro é logado e pulado, sem derrubar o lote.
+    """
+    import json
+    from datetime import datetime as _dt
+
+    def _nulo(val):
+        if val is None:
+            return None
+        v = str(val).strip()
+        return None if v in ("", "nan", "None", "Não especificado") else v
+
+    hoy = _dt.now()
+    gravados, erros = 0, 0
+
+    with open(output_jsonl, "a", encoding="utf-8") as f:
+        for tupla in prompts:
+            try:
+                (pdf_file, fecha_reciente, citacion, fecha_orden, fecha_intento,
+                 fecha_efectiva, penhora, prompt, respuesta_gpt, full_text,
+                 ocr_metadata, tipo_processo, entidades) = tupla
+
+                ent    = entidades or {}
+                tp     = tipo_processo or {}
+                sinais = _extrair_sinais_processuais(full_text)
+
+                registro = {
+                    "extraido_em"        : hoy.strftime("%Y-%m-%dT%H:%M:%S"),
+                    "arquivo"            : pdf_file,
+                    "numero_processo"    : _nulo(ent.get("numero_processo")),
+                    "e_execucao_fiscal"  : tp.get("es_execucao_fiscal"),
+                    "erro_extracao"      : _nulo(respuesta_gpt),
+                    "ultima_movimentacao": fecha_reciente.strftime("%Y-%m-%d") if fecha_reciente else None,
+                    "status_citacao"     : _nulo(citacion),
+                    "resultado_penhora"  : _nulo(penhora),
+                    "extincao"           : _nulo(sinais["extincao"]),
+                    "parcelamento"       : _nulo(sinais["parcelamento"]),
+                    "suspensao_art40_lef": _nulo(sinais["suspensao_art40"]),
+                    "nome_executado"     : _nulo(ent.get("nome_executado")),
+                    "cpf_cnpj"           : _nulo(ent.get("cpf_cnpj")),
+                }
+                f.write(json.dumps(registro, ensure_ascii=False) + "\n")
+                gravados += 1
+            except Exception as e:
+                erros += 1
+                _id = tupla[0] if isinstance(tupla, (list, tuple)) and tupla else "desconhecido"
+                print(f"[HISTORICO] ERRO ao registrar '{_id}': {e}")
+
+    print(f"Histórico de extrações (append-only): {output_jsonl}")
+    print(f"  {gravados} registro(s) gravado(s), {erros} com erro")
+    return gravados, erros
+
+
+# 10. Ejecutar el flujo
+if __name__ == "__main__":
+    os.makedirs(PASTA_JSON, exist_ok=True)
+    os.makedirs(PASTA_RESULTADOS, exist_ok=True)
+
+    _timestamp = datetime.now().strftime("%Y-%m-%d_%Hh%M")
+    output_file_resumo    = os.path.join(PASTA_JSON, f"resumo_sinais_V8.txt")
+    output_file_excel     = os.path.join(PASTA_RESULTADOS, f"resultados_V8.xlsx")
+    output_file_json      = os.path.join(PASTA_JSON, f"saida_agente1_V8.json")
+    output_file_historico = os.path.join(PASTA_JSON, "historico_extracoes.jsonl")
+    output_file_ignorados = os.path.join(PASTA_JSON, "ignorados_V8.txt")
+
+    prompts, ignorados = generate_prompts(input_directory)
+    _registrar_ignorados(ignorados, output_file_ignorados)   # auditoria — nunca em silêncio
+    save_prompts_to_file(prompts, output_file_resumo)
+    process_prompts_to_excel(prompts, output_file_excel)
+    exportar_json_agente2(prompts, output_file_json, total_ignorados=len(ignorados))
+    exportar_historico_extracoes(prompts, output_file_historico)
