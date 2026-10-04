@@ -1,6 +1,6 @@
 # ===========================================================================
 # AGENTE 1 — Extração determinística de execuções fiscais (PGMS / HERA)
-# Versão 8.0.3
+# Versão 8.1.0
 #
 # MUDANÇAS EM RELAÇÃO A promptV7_1.py:
 #   1. [feedback 4] Removida a camada de juízo APTO / NÃO APTO. O Agente 1
@@ -82,6 +82,27 @@
 #      para bloqueio de veículos, mas não apareceu em nenhum dos 9 PDFs
 #      recebidos, então não mexi sem evidência real. Vale testar se aparecer
 #      um caso de RENAJUD no feedback.
+#
+# MUDANÇAS EM RELAÇÃO A v8.0.3 (Versão 8.1.0):
+#   8. [NOVO] Nova etapa selecionável 'alvara' (CAMPOS=alvara): detecta se há
+#      PEDIDO de expedição de alvará de levantamento e se há LEVANTAMENTO
+#      confirmado (extrato/comprovante) — ver extract_pedido_alvara() e
+#      extract_levantamento_alvara(). Saída em "status_alvara": {"pedido":
+#      ..., "levantamento": ...}, mesmo padrão de sinais_processuais — mas
+#      COM rastreamento de página (evidências), no mesmo nível de citação/
+#      penhora: evid['alvara']['pedido'/'levantamento'] traz
+#      encontrado_em_pagina/trecho/via_ocr, e isso também entra no merge/
+#      reaproveitamento (Fase 4) como as demais evidências.
+#      [SUPOSIÇÃO NÃO VALIDADA — PRECISA DE CONFIRMAÇÃO] As keywords foram
+#      inferidas do PADRÃO de linguagem já usado em citação/penhora/sinais
+#      (termos como "requer a expedição de alvará", "alvará de levantamento
+#      expedido"), mas NÃO foram testadas contra processos reais de alvará da
+#      PGMS — diferente dos fixes acima, que vieram do quadro comparativo do
+#      NTI/PGMS com PDFs de verdade. Preciso de exemplos reais (mascarados,
+#      sem dados pessoais) de processos com pedido/levantamento de alvará
+#      para validar e ajustar antes de considerar isto pronto.
+#      Regra do Agente 2 (como isso afeta prioridade/ação recomendada) ainda
+#      NÃO foi definida — fica para quando a extração estiver validada.
 # ===========================================================================
 
 import os
@@ -1137,6 +1158,60 @@ def extract_extincao(text):
     return None
 
 
+# --- Detección de alvará (pedido / levantamento) ---------------------------
+# [SUPOSIÇÃO NÃO VALIDADA] Keywords inferidas do padrão de linguagem já usado
+# em citação/penhora/sinais — ainda não conferidas contra processos reais de
+# alvará da PGMS. Ajustar assim que houver exemplos reais (mascarados).
+KEYWORDS_PEDIDO_ALVARA = [
+    "requer a expedicao de alvara",
+    "requeiro a expedicao de alvara",
+    "requer expedicao de alvara",
+    "requer-se a expedicao de alvara",
+    "pedido de alvara de levantamento",
+    "requerimento de alvara",
+    "solicita alvara de levantamento",
+    "requer o levantamento dos valores",
+    "requeiro o levantamento dos valores",
+    "requer alvara judicial",
+    "expedicao de alvara de levantamento",
+]
+
+KEYWORDS_LEVANTAMENTO_ALVARA = [
+    "alvara de levantamento expedido",
+    "expeca-se alvara de levantamento",
+    "defiro a expedicao de alvara",
+    "defiro o levantamento",
+    "extrato de levantamento",
+    "comprovante de levantamento",
+    "alvara eletronico de levantamento",
+    "valores levantados",
+    # [FIX — achado em teste próprio, não em feedback real] "levantamento dos
+    # valores depositados" (sem verbo de confirmação) foi removido daqui: é
+    # texto genérico que também aparece no PEDIDO ("requer... levantamento
+    # dos valores depositados"), então marcava falso positivo de levantamento
+    # CONFIRMADO na mesma página de um mero pedido. Mantidas só frases com
+    # sinal de confirmação explícito (expedido, defiro, extrato, comprovante,
+    # levantados, transferência).
+    "transferencia dos valores para a conta",
+    "alvara expedido e levantado",
+    "alvara cumprido",
+]
+
+
+def extract_pedido_alvara(text):
+    text_norm = normalizar(text)
+    if any(normalizar(k) in text_norm for k in KEYWORDS_PEDIDO_ALVARA):
+        return "PEDIDO DE ALVARÁ"
+    return None
+
+
+def extract_levantamento_alvara(text):
+    text_norm = normalizar(text)
+    if any(normalizar(k) in text_norm for k in KEYWORDS_LEVANTAMENTO_ALVARA):
+        return "LEVANTAMENTO CONFIRMADO (EXTRATO)"
+    return None
+
+
 # ===========================================================================
 # EXTRACCIÓN DE ENTIDADES (datos estructurados del processo)
 # ===========================================================================
@@ -1792,6 +1867,21 @@ def _extrair_sinais_processuais(full_text):
     }
 
 
+def _extrair_alvara(full_text):
+    """
+    Reúne os fatos de alvará (pedido / levantamento). Mesmo padrão de
+    _extrair_sinais_processuais: fatos, não veredito.
+    [Fase 3] Só roda se a etapa 'alvara' foi pedida em CAMPOS; senão devolve
+    tudo None (campo não foi solicitado — diferente de 'procurado e vazio').
+    """
+    if "alvara" not in CAMPOS:
+        return {"pedido": None, "levantamento": None}
+    return {
+        "pedido"      : extract_pedido_alvara(full_text),
+        "levantamento": extract_levantamento_alvara(full_text),
+    }
+
+
 def _dias_desde(fecha, hoy=None):
     """Días transcurridos desde `fecha` (dato neutral, no es un veredito)."""
     if fecha is None:
@@ -1854,6 +1944,12 @@ _NEEDLES_PENHORA_TRECHO = [normalizar(x) for x in [
 ]]
 _SEM_EVIDENCIA_CITACAO = {"Citação não encontrado"}
 _SEM_EVIDENCIA_PENHORA = {"Penhora não encontrado"}
+# [v8.1.0] Evidência de página para alvará (pedido/levantamento), mesmo
+# mecanismo de citação/penhora: extract_pedido_alvara()/extract_levantamento_
+# alvara() só devolvem UM valor não-None cada (diferente de citação/penhora,
+# que têm várias categorias) — por isso não precisam de 'sem_evidencia'.
+_NEEDLES_ALVARA_PEDIDO       = [normalizar(k) for k in KEYWORDS_PEDIDO_ALVARA]
+_NEEDLES_ALVARA_LEVANTAMENTO = [normalizar(k) for k in KEYWORDS_LEVANTAMENTO_ALVARA]
 _CAMPOS_ENTIDADE_EVIDENCIA = [
     "cpf_cnpj", "numero_cda", "numero_processo",
     "valor_original", "valor_atualizado", "data_inscricao",
@@ -1933,8 +2029,13 @@ def _localizar_pagina_por_valor(pages_text, valor):
     return None, None
 
 
-def construir_evidencias(pages_text, status_citacao, status_penhora, entidades, ocr_metadata):
-    """Monta o bloco 'evidencias' (aditivo). Sem evidência → encontrado_em_pagina=None."""
+def construir_evidencias(pages_text, status_citacao, status_penhora, entidades, ocr_metadata,
+                          status_alvara=None):
+    """Monta o bloco 'evidencias' (aditivo). Sem evidência → encontrado_em_pagina=None.
+
+    `status_alvara` ({"pedido":..., "levantamento":...}) é opcional — só vem
+    preenchido quando a etapa 'alvara' foi pedida em CAMPOS (ver generate_
+    prompts). None = etapa não pedida -> evid['alvara'] nem aparece."""
     paginas_ocr = set((ocr_metadata or {}).get("paginas_ocr", []) or [])
     conf_ocr    = (ocr_metadata or {}).get("confianza_ocr", {}) or {}
 
@@ -1957,6 +2058,13 @@ def construir_evidencias(pages_text, status_citacao, status_penhora, entidades, 
         "citacao": _bloco_extrator(extract_citacion, status_citacao, _SEM_EVIDENCIA_CITACAO, needles_cit),
         "penhora": _bloco_extrator(extract_penhora,  status_penhora,  _SEM_EVIDENCIA_PENHORA, _NEEDLES_PENHORA_TRECHO),
     }
+    if status_alvara is not None:
+        evid["alvara"] = {
+            "pedido": _bloco_extrator(extract_pedido_alvara, status_alvara.get("pedido"),
+                                       set(), _NEEDLES_ALVARA_PEDIDO),
+            "levantamento": _bloco_extrator(extract_levantamento_alvara, status_alvara.get("levantamento"),
+                                             set(), _NEEDLES_ALVARA_LEVANTAMENTO),
+        }
     ent = entidades or {}
     ent_evid = {}
     for campo in _CAMPOS_ENTIDADE_EVIDENCIA:
@@ -2000,7 +2108,7 @@ MODO_ESCOPO = os.environ.get("MODO_ESCOPO", "ignorar_todos").strip().lower()
 # ATENÇÃO: uma extração PARCIAL não deve ir direto ao Agente 2 sem antes ser
 # combinada com o estado anterior (Fase 4) — senão o Agente 2 lê os campos não
 # pedidos como ausentes. Por isso emitimos um aviso visível ao rodar parcial.
-_CAMPOS_VALIDOS = {"citacao", "penhora", "movimentacao", "sinais", "entidades", "tipo"}
+_CAMPOS_VALIDOS = {"citacao", "penhora", "movimentacao", "sinais", "alvara", "entidades", "tipo"}
 
 
 def _parse_campos(valor):
@@ -2040,13 +2148,14 @@ ESTADO_PATH = os.environ.get("ESTADO_PATH") or os.path.join(CURRENT_DIR, "estado
 USAR_MERGE  = os.environ.get("USAR_MERGE", "1").strip().lower() not in ("0", "false", "nao", "não", "off")
 
 # Campos do 'pr' (schema do JSON) agrupados por etapa. Dicts aninhados
-# (sinais/entidades/tipo) são tratados como unidade da sua etapa.
+# (sinais/alvara/entidades/tipo) são tratados como unidade da sua etapa.
 _CAMPOS_POR_ETAPA = {
     "movimentacao": ["ultima_movimentacao"],  # dias_desde é recomputado à parte
     "citacao"     : ["status_citacao", "data_ordem_citacao",
                      "data_tentativa_citacao", "data_citacao_efetiva"],
     "penhora"     : ["resultado_penhora"],
     "sinais"      : ["sinais_processuais"],
+    "alvara"      : ["status_alvara"],
     "entidades"   : ["entidades", "numero_processo"],
     "tipo"        : ["tipo_processo"],
 }
@@ -2142,7 +2251,8 @@ def _merge_estado(pr, estado, chave, tipo_chave, hash_novo, campos_run, origem_l
     old_ev = dados.get("evidencias") or {}
     new_ev = pr.get("evidencias") or {}
     merged_ev = dict(old_ev)
-    for sub, et in (("citacao", "citacao"), ("penhora", "penhora"), ("entidades", "entidades")):
+    for sub, et in (("citacao", "citacao"), ("penhora", "penhora"),
+                    ("entidades", "entidades"), ("alvara", "alvara")):
         if et in campos_run:
             merged_ev[sub] = new_ev.get(sub)
     dados["evidencias"] = merged_ev
@@ -2381,13 +2491,21 @@ def generate_prompts(input_dir):
             if "entidades" in CAMPOS:
                 entidades = extract_entidades_agente2(full_text)
 
+            # [v8.1.0] Só para montar a evidência de página abaixo — o valor
+            # "oficial" de status_alvara (o que vai pro Excel/JSON) é lido de
+            # novo por _extrair_alvara(full_text) em process_prompts_to_excel/
+            # exportar_json_agente2, igual já acontecia com sinais_processuais.
+            # Recomputar aqui é barato (só regex sobre texto já extraído) e evita
+            # mexer no formato da tupla 'prompts', compartilhado por 3 funções.
+            status_alvara = _extrair_alvara(full_text) if "alvara" in CAMPOS else None
+
             prompt = create_prompt(fecha_reciente, citacion, penhora)
 
-            # [Fase 1] Evidência: em qual página apareceu citação/penhora/entidades.
+            # [Fase 1] Evidência: em qual página apareceu citação/penhora/entidades/alvará.
             # Só localiza os campos que foram pedidos (os None são ignorados).
             # Aditivo — viaja dentro de ocr_metadata, sem alterar a tupla.
             ocr_metadata["evidencias"] = construir_evidencias(
-                pages_text, citacion, penhora, entidades, ocr_metadata
+                pages_text, citacion, penhora, entidades, ocr_metadata, status_alvara
             )
 
             _ent = entidades or {}
@@ -2441,6 +2559,7 @@ def process_prompts_to_excel(prompts, output_excel):
          ocr_metadata, tipo_processo, entidades) in prompts:
 
         sinais = _extrair_sinais_processuais(full_text)
+        alvara = _extrair_alvara(full_text)
         dias = _dias_desde(fecha_reciente, hoy)
 
         paginas_ocr = ocr_metadata.get("paginas_ocr", []) if ocr_metadata else []
@@ -2476,6 +2595,8 @@ def process_prompts_to_excel(prompts, output_excel):
             "Extinção detectada"            : sinais["extincao"] or "",
             "Parcelamento detectado"        : sinais["parcelamento"] or "",
             "Suspensão art.40 LEF"          : sinais["suspensao_art40"] or "",
+            "Pedido de alvará"              : alvara["pedido"] or "",
+            "Levantamento alvará (extrato)" : alvara["levantamento"] or "",
             # ── OCR ────────────────────────────────────────────────────────
             "Páginas via OCR"               : ", ".join(map(str, paginas_ocr)) if paginas_ocr else "",
             "Confiança OCR (%)"             : confianza_ocr_media if confianza_ocr_media is not None else "",
@@ -2545,6 +2666,7 @@ def process_prompts_to_excel(prompts, output_excel):
             "Resultado da penhora": 30, "Página citação": 12, "Página penhora": 12,
             "Extinção detectada": 22,
             "Parcelamento detectado": 28, "Suspensão art.40 LEF": 22,
+            "Pedido de alvará": 20, "Levantamento alvará (extrato)": 26,
             "Páginas via OCR": 14, "Confiança OCR (%)": 12,
             "CPF/CNPJ": 20, "Nome executado": 30, "Nome exequente": 30,
             "Tipo de tributo": 20, "Exercício": 12, "Número CDA": 22,
@@ -2612,7 +2734,7 @@ def exportar_json_agente2(prompts, output_json, total_ignorados=None):
     import json
     from datetime import datetime as _dt
 
-    VERSION_AGENTE1 = "8.0"
+    VERSION_AGENTE1 = "8.1"
 
     def _nulo(val):
         if val is None:
@@ -2637,6 +2759,7 @@ def exportar_json_agente2(prompts, output_json, total_ignorados=None):
         ent = entidades or {}
         tp  = tipo_processo or {}
         sinais = _extrair_sinais_processuais(full_text)
+        alvara = _extrair_alvara(full_text)
 
         ocr_meta  = ocr_metadata or {}
         conf_dict = ocr_meta.get("confianza_ocr", {})
@@ -2669,6 +2792,10 @@ def exportar_json_agente2(prompts, output_json, total_ignorados=None):
                 "extincao"                  : _nulo(sinais["extincao"]),
                 "parcelamento"              : _nulo(sinais["parcelamento"]),
                 "suspensao_art40_lef"       : _nulo(sinais["suspensao_art40"]),
+            },
+            "status_alvara": {
+                "pedido"                    : _nulo(alvara["pedido"]),
+                "levantamento"              : _nulo(alvara["levantamento"]),
             },
             "ocr": {
                 "paginas"                   : ocr_meta.get("paginas_ocr", []),
