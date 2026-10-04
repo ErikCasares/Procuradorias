@@ -1770,6 +1770,40 @@ def _recortar_processo(pr: dict, campos: str) -> dict:
     return recortado
 
 
+def _recorte_etapas_relatorio(agente1: dict | None, campos: str | None) -> dict | None:
+    """
+    Irmã de `_recortar_processo`, mas para a tarjeta de UM processo (GET
+    .../processo, usada pelo widget de teste e pelo painel): ali o registro
+    completo do Agente 1 é exibido com TODAS as suas chaves (lote_id, decisão,
+    OCR, evidências de página etc.), não um dict recortado às pressas — por
+    isso aqui só ZERAMOS as chaves das etapas NÃO pedidas nesta corrida
+    (`campos` do lote), em vez de reconstruir o dict do zero.
+
+    Sem isto, um processo já visto antes mostrava, por ex., 'Resultado
+    penhora' reaproveitado de uma corrida anterior mesmo quando esta corrida
+    só pediu 'citacao' — confuso: pareceria que a penhora foi conferida agora.
+
+    `agente2`/`auditoria` (a priorização e a classificação) não são afetados:
+    `campos` só controla o que o Agente 1 extrai, não a análise do Agente 2.
+    """
+    if not agente1 or not campos:
+        return agente1
+    agente1 = dict(agente1)    # cópia — não mexe no dict devolvido pela busca
+    etapas = set(campos.split(","))
+    evidencias = agente1.get("evidencias")
+    if isinstance(evidencias, dict):
+        evidencias = dict(evidencias)
+        agente1["evidencias"] = evidencias
+    for etapa, chaves in _CHAVES_POR_ETAPA.items():
+        if etapa in etapas:
+            continue
+        for chave in chaves:
+            agente1.pop(chave, None)
+        if evidencias is not None:
+            evidencias.pop(etapa, None)
+    return agente1
+
+
 @app.get(
     "/api/v1/lotes/{lote_id}/dados",
     tags=["Lotes"],
@@ -2131,7 +2165,7 @@ async def _relatorio_processo_do_lote(lote: dict, pasta_busca) -> dict:
         "encontrado_em": [
             fonte for fonte in ("agente1", "agente2", "auditoria") if dados.get(fonte)
         ],
-        "agente1": _sem_internos(dados.get("agente1")),
+        "agente1": _recorte_etapas_relatorio(_sem_internos(dados.get("agente1")), lote.get("campos")),
         "agente2": _sem_internos(dados.get("agente2")),
         "agente2_historico": [_sem_internos(r) for r in dados.get("agente2_historico", [])],
         "auditoria": {
