@@ -393,6 +393,21 @@ def _mostrar_agente1(proc: dict):
     _bp = _evid.get("penhora") or {}
     if _bp.get("encontrado_em_pagina"):
         print(_linha("  ↳ penhora na", f"pág. {_bp['encontrado_em_pagina']}" + (" (OCR)" if _bp.get('via_ocr') else "")))
+    # [v8.1.0] Alvará (pedido / levantamento) — só imprime se houver algo a
+    # mostrar (igual aos sinais processuais: é raro, não vale poluir toda
+    # consulta com "Pedido de alvará: —" quando não se aplica).
+    status_alvara = proc.get("status_alvara") or {}
+    _ba = _evid.get("alvara") or {}
+    if status_alvara.get("pedido"):
+        print(_linha("Pedido de alvará", status_alvara.get("pedido")))
+        _bap = _ba.get("pedido") or {}
+        if _bap.get("encontrado_em_pagina"):
+            print(_linha("  ↳ pedido na", f"pág. {_bap['encontrado_em_pagina']}" + (" (OCR)" if _bap.get('via_ocr') else "")))
+    if status_alvara.get("levantamento"):
+        print(_linha("Levantamento alvará", status_alvara.get("levantamento")))
+        _bal = _ba.get("levantamento") or {}
+        if _bal.get("encontrado_em_pagina"):
+            print(_linha("  ↳ levantamento na", f"pág. {_bal['encontrado_em_pagina']}" + (" (OCR)" if _bal.get('via_ocr') else "")))
     print(_linha("Última movimentação", proc.get("ultima_movimentacao")))
     # OCR: v8.0 aninha em 'ocr'; v7 usava 'confianca_ocr_media' no topo.
     conf = (proc.get("ocr") or {}).get("confianca_media")
