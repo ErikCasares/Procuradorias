@@ -2806,15 +2806,36 @@ function renderizarProcesso(d) {
   // "(pág. N)". Sem isto o procurador não sabe onde conferir no PDF original.
   const evid    = ag1.evidencias || {};
   const evidEnt = evid.entidades || {};
-  const comPagina = (valor, campo) => {
-    if (valor === null || valor === undefined || valor === '') return valor;
-    const b = evidEnt[campo];
-    const pag = b && b.encontrado_em_pagina;
-    return pag == null ? valor : `${valor}  (pág. ${pag}${b.via_ocr ? ' OCR' : ''})`;
+  // [Agente 1 v8.2.0] O dado pode aparecer em várias páginas: 'paginas' traz
+  // todas ("2-9, 16"); JSON antigo só tem 'encontrado_em_pagina' (a 1ª).
+  const fmtPaginas = (lista, maxFaixas = 6) => {
+    const pgs = [...new Set((lista || []).map(Number))].sort((a, b) => a - b);
+    const faixas = [];
+    let i = 0;
+    while (i < pgs.length) {
+      let j = i;
+      while (j + 1 < pgs.length && pgs[j + 1] === pgs[j] + 1) j++;
+      faixas.push(i === j ? `${pgs[i]}` : `${pgs[i]}-${pgs[j]}`);
+      i = j + 1;
+    }
+    // campos que se repetem no PDF todo (nº do processo, nome…): resume; a lista completa fica no JSON
+    return faixas.slice(0, maxFaixas).join(', ')
+         + (faixas.length > maxFaixas ? `, … (+${pgs.length} págs. no total)` : '');
   };
   const paginaDe = (bloco) => {
-    const pag = bloco && bloco.encontrado_em_pagina;
-    return pag == null ? null : `pág. ${pag}${bloco.via_ocr ? ' (OCR)' : ''}`;
+    const b = bloco || {};
+    const pgs = (b.paginas && b.paginas.length) ? b.paginas
+              : (b.encontrado_em_pagina != null ? [b.encontrado_em_pagina] : []);
+    if (!pgs.length) return null;
+    let txt = `${pgs.length > 1 ? 'págs.' : 'pág.'} ${fmtPaginas(pgs)}`;
+    const ocr = b.paginas_via_ocr || (b.via_ocr ? pgs.slice(0, 1) : []);
+    if (ocr.length) txt += ocr.length === pgs.length ? ' (OCR)' : ` (OCR: ${fmtPaginas(ocr)})`;
+    return txt;
+  };
+  const comPagina = (valor, campo) => {
+    if (valor === null || valor === undefined || valor === '') return valor;
+    const t = paginaDe(evidEnt[campo]);
+    return t == null ? valor : `${valor}  (${t})`;
   };
 
   const linha = (label, valor) => (valor === null || valor === undefined || valor === '')

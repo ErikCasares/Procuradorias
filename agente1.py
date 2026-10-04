@@ -1,6 +1,6 @@
 # ===========================================================================
 # AGENTE 1 — Extração determinística de execuções fiscais (PGMS / HERA)
-# Versão 8.1.2
+# Versão 8.2.1
 #
 # MUDANÇAS EM RELAÇÃO A promptV7_1.py:
 #   1. [feedback 4] Removida a camada de juízo APTO / NÃO APTO. O Agente 1
@@ -151,8 +151,26 @@
 #      Testes de regressão (dados fictícios): tests/test_extracao_agente1.py.
 #      NÃO CORRIGIDO (depende de decisão da PGMS): data_tentativa_citacao /
 #      data_citacao_efetiva — ver resposta no chat.
+#
+# MUDANÇAS EM RELAÇÃO A v8.1.2 (Versão 8.2.0):
+#  11. [NOVO — pedido do usuário] Evidência de página com TODAS as páginas onde
+#      o dado aparece, não só a primeira. Cada bloco de 'evidencias' ganha
+#      (ADITIVO — nada foi removido nem renomeado):
+#        "paginas"         : [2, 3, 4, ...]  todas as páginas, em ordem;
+#        "paginas_via_ocr" : [21, 22]        quais delas vieram de OCR.
+#      'encontrado_em_pagina' (a 1ª), 'via_ocr' e 'confianca_ocr' continuam
+#      como estavam. citação/penhora/alvará: páginas em que a MESMA regra do
+#      veredito dispara (não "toda página que cita o assunto"). Entidades:
+#      páginas que contêm o valor; numero_cda = união das páginas de cada CDA;
+#      exercicio e tipo_tributo (valores derivados) = páginas em que o
+#      extrator, aplicado só àquela página, reconhece o mesmo dado.
+#      Planilha: colunas "Página citação/penhora" mostram "1, 18-19, 21-22".
+#  12. [v8.2.1] Cadastro de exequentes em arquivo (exequentes.json): para incluir
+#      outro município basta acrescentar {nome, uf, cnpj} — sem editar o código.
+#      CNPJ inválido é ignorado com aviso. Comportamento padrão inalterado.
 # ===========================================================================
 
+import json
 import os
 import re
 import tempfile
@@ -1356,10 +1374,65 @@ _CTX_REJEITAR = (
 # layouts; o CNPJ do exequente é um dado institucional fixo, então é descartado
 # direto, sem depender do rótulo. Ampliável por env (CNPJS_EXEQUENTE, só
 # dígitos, separados por vírgula) se a PGMS precisar incluir outros exequentes.
-_CNPJS_EXEQUENTE = {"13927801000149"} | {
-    _d for _d in (re.sub(r"\D", "", x) for x in
-                  os.environ.get("CNPJS_EXEQUENTE", "").split(",")) if _d
+# [v8.2.1] Cadastro de EXEQUENTES (municípios) — fácil de ampliar SEM mexer no
+# código. Três fontes, somadas:
+#   1. _EXEQUENTES_PADRAO (abaixo): o Município do Salvador, sempre presente;
+#   2. arquivo JSON `exequentes.json` ao lado do agente1.py (ou o caminho de
+#      EXEQUENTES_JSON): é onde se cadastram os demais municípios;
+#   3. env CNPJS_EXEQUENTE (só CNPJs, separados por vírgula) — mantida por
+#      compatibilidade com a v8.1.2.
+# Formato do arquivo (ver o exequentes.json entregue junto):
+#   {"exequentes": [{"nome": "Município de Exemplo", "uf": "BA",
+#                    "cnpj": "00.000.000/0000-00"}]}
+# CNPJ com ou sem máscara. Entrada inválida (CNPJ com dígito verificador errado,
+# sem CNPJ) é IGNORADA COM AVISO no log — nunca em silêncio — e o resto do
+# cadastro continua valendo. Arquivo ilegível: erro no log + só o padrão.
+_EXEQUENTES_PADRAO = {
+    "13927801000149": {"nome": "Município de Salvador", "uf": "BA"},
 }
+EXEQUENTES_JSON = os.environ.get("EXEQUENTES_JSON") or os.path.join(CURRENT_DIR, "exequentes.json")
+
+
+def _carregar_exequentes(caminho=None, cnpjs_env=None):
+    """
+    Devolve {cnpj_só_dígitos: {"nome": ..., "uf": ...}} = padrão + arquivo + env.
+    `caminho`/`cnpjs_env` existem para teste; None = usa EXEQUENTES_JSON / env.
+    """
+    cadastro = {k: dict(v) for k, v in _EXEQUENTES_PADRAO.items()}
+    caminho = caminho if caminho is not None else EXEQUENTES_JSON
+    if caminho and os.path.exists(caminho):
+        try:
+            with open(caminho, encoding="utf-8") as f:
+                dados = json.load(f)
+            itens = dados.get("exequentes", []) if isinstance(dados, dict) else dados
+            if not isinstance(itens, list):
+                raise ValueError("'exequentes' deve ser uma lista")
+            for n, item in enumerate(itens, start=1):
+                cnpj = re.sub(r"\D", "", str((item or {}).get("cnpj", "")))
+                nome = str((item or {}).get("nome", "")).strip() or "(sem nome)"
+                if not validar_cnpj(cnpj):
+                    logging.warning(f"exequentes.json, item {n} ({nome}): CNPJ inválido "
+                                    f"{(item or {}).get('cnpj')!r} — item IGNORADO")
+                    continue
+                cadastro[cnpj] = {"nome": nome, "uf": str((item or {}).get("uf", "")).strip().upper()}
+        except Exception as e:
+            logging.error(f"Falha ao ler {caminho}: {e} — usando só o exequente padrão "
+                          f"({', '.join(v['nome'] for v in _EXEQUENTES_PADRAO.values())})")
+    elif caminho and caminho != os.path.join(CURRENT_DIR, "exequentes.json"):
+        logging.warning(f"EXEQUENTES_JSON aponta para um arquivo inexistente: {caminho}")
+    bruto = cnpjs_env if cnpjs_env is not None else os.environ.get("CNPJS_EXEQUENTE", "")
+    for x in bruto.split(","):
+        d = re.sub(r"\D", "", x)
+        if d and d not in cadastro:
+            if validar_cnpj(d):
+                cadastro[d] = {"nome": "(via CNPJS_EXEQUENTE)", "uf": ""}
+            else:
+                logging.warning(f"CNPJS_EXEQUENTE: {x.strip()!r} não é um CNPJ válido — IGNORADO")
+    return cadastro
+
+
+EXEQUENTES = _carregar_exequentes()
+_CNPJS_EXEQUENTE = set(EXEQUENTES)    # usado por _extrair_cpf_cnpj
 
 # Token candidato: começa e termina em dígito, só admite . - / no meio
 # (não cruza espaços, para não fundir "CEP 40230731 - 713", telefone, etc.).
@@ -2128,14 +2201,39 @@ _CAMPOS_ENTIDADE_EVIDENCIA = [
 ]
 
 
-def _localizar_pagina_por_extrator(pages_text, extrator, resultado_global, sem_evidencia):
-    """Primeira página (1-based) cujo extrator(pagina) == resultado_global, ou None."""
+def _localizar_paginas_por_extrator(pages_text, extrator, resultado_global, sem_evidencia):
+    """
+    [v8.2.0] TODAS as páginas (1-based, em ordem) cujo extrator(pagina) ==
+    resultado_global. Lista vazia se não há evidência. Só entram páginas em que
+    a MESMA regra do veredito dispara — não "toda página que fala do assunto".
+    """
     if not resultado_global or resultado_global in sem_evidencia:
-        return None
-    for i, txt in enumerate(pages_text, start=1):
-        if txt and extrator(txt) == resultado_global:
-            return i
-    return None
+        return []
+    return [i for i, txt in enumerate(pages_text, start=1)
+            if txt and extrator(txt) == resultado_global]
+
+
+def _localizar_pagina_por_extrator(pages_text, extrator, resultado_global, sem_evidencia):
+    """Primeira página (1-based) cujo extrator(pagina) == resultado_global, ou None.
+    (Mantida por compatibilidade; a evidência agora usa a versão 'paginas'.)"""
+    pgs = _localizar_paginas_por_extrator(pages_text, extrator, resultado_global, sem_evidencia)
+    return pgs[0] if pgs else None
+
+
+def _fmt_paginas(paginas):
+    """[2,3,4,5,9,11,12] -> '2-5, 9, 11-12'. Sequências viram faixa; vazio -> ''."""
+    pgs = sorted({int(p) for p in (paginas or [])})
+    if not pgs:
+        return ""
+    faixas, ini, ant = [], pgs[0], pgs[0]
+    for p in pgs[1:]:
+        if p == ant + 1:
+            ant = p
+            continue
+        faixas.append((ini, ant))
+        ini = ant = p
+    faixas.append((ini, ant))
+    return ", ".join(str(a) if a == b else f"{a}-{b}" for a, b in faixas)
 
 
 def _trecho_na_pagina(texto_pagina, needles_norm, ctx=80):
@@ -2174,6 +2272,79 @@ def _trecho_valor(texto_pagina, valor, digitos):
     return None
 
 
+def _localizar_paginas_por_valor(pages_text, valor, _cache=None):
+    """
+    [v8.2.0] TODAS as páginas que contêm `valor` -> (lista_de_paginas, trecho_da_1a).
+    Mesmo critério de _localizar_pagina_por_valor (identificadores com >=5 dígitos
+    comparam só dígitos; o resto, texto normalizado). `_cache` evita normalizar a
+    mesma página de novo a cada campo (agora a varredura vai até o fim do PDF).
+    """
+    if valor is None:
+        return [], None
+    s = str(valor).strip()
+    if not s:
+        return [], None
+    digitos = re.sub(r"\D", "", s)
+    usar_digitos = len(digitos) >= 5
+    alvo = None if usar_digitos else normalizar(s)
+    if not usar_digitos and len(alvo) < 3:
+        return [], None
+    cache = _cache if _cache is not None else {}
+    lista = cache.setdefault("dig" if usar_digitos else "norm", {})
+    paginas, trecho = [], None
+    for i, txt in enumerate(pages_text, start=1):
+        if not txt:
+            continue
+        if i not in lista:
+            lista[i] = re.sub(r"\D", "", txt) if usar_digitos else normalizar(txt)
+        if (digitos in lista[i]) if usar_digitos else (alvo in lista[i]):
+            paginas.append(i)
+            if trecho is None:
+                trecho = _trecho_valor(txt, s, digitos)
+    return paginas, trecho
+
+
+def _paginas_da_entidade(pages_text, campo, valor, cache):
+    """
+    [v8.2.0] Páginas de uma entidade. Valores comuns: busca pelo próprio valor.
+    Três campos são DERIVADOS (o valor final não aparece escrito no PDF), então
+    a busca literal erraria ou não acharia nada:
+      - numero_cda  ("A; B; C"): união das páginas de cada número;
+      - exercicio   ("2015/2017"): páginas em que o extrator, aplicado só àquela
+                     página, dá anos DENTRO do conjunto (a Ficha com "Exercício
+                     2024" fica de fora);
+      - tipo_tributo: o rótulo ("IPTU — …") não está no texto; vale a página em
+                     que o extrator reconhece algum dos tributos do resultado.
+    """
+    s = str(valor)
+    if campo == "numero_cda" and "; " in s:
+        pgs, trecho = set(), None
+        for item in s.split("; "):
+            p, t = _localizar_paginas_por_valor(pages_text, item, cache)
+            pgs.update(p)
+            trecho = trecho or t
+        return sorted(pgs), trecho
+    if campo == "exercicio":
+        anos = set(re.findall(r"\d{4}", s))
+        if anos:
+            pgs = []
+            for i, txt in enumerate(pages_text, start=1):
+                if not txt:
+                    continue
+                r = _extrair_exercicio(txt)
+                a_pag = set(re.findall(r"\d{4}", str(r))) if r else set()
+                if a_pag and a_pag <= anos:
+                    pgs.append(i)
+            if pgs:
+                return pgs, _trecho_valor(pages_text[pgs[0] - 1], s, re.sub(r"\D", "", s))
+    if campo == "tipo_tributo":
+        rotulos = set(s.split("; "))
+        pgs = [i for i, txt in enumerate(pages_text, start=1)
+               if txt and rotulos & set((_extrair_tipo_tributo(txt) or "").split("; "))]
+        return pgs, None
+    return _localizar_paginas_por_valor(pages_text, valor, cache)
+
+
 def _localizar_pagina_por_valor(pages_text, valor):
     """
     Primeira página que contém `valor`. Identificadores longos (>=5 dígitos:
@@ -2210,17 +2381,26 @@ def construir_evidencias(pages_text, status_citacao, status_penhora, entidades, 
     paginas_ocr = set((ocr_metadata or {}).get("paginas_ocr", []) or [])
     conf_ocr    = (ocr_metadata or {}).get("confianza_ocr", {}) or {}
 
-    def _meta(pag, trecho):
-        if pag is None:
-            return {"encontrado_em_pagina": None, "trecho": None, "via_ocr": None, "confianca_ocr": None}
+    def _meta(paginas, trecho):
+        # [v8.2.0] 'paginas' = TODAS as páginas onde o dado aparece (ordenadas);
+        # 'encontrado_em_pagina' = a primeira — mantida igual para quem já lê só
+        # ela (painel, CLI, planilha). via_ocr/confianca_ocr seguem sendo os da
+        # primeira página; 'paginas_via_ocr' diz QUAIS das páginas vieram de OCR.
+        paginas = sorted(set(paginas or []))
+        if not paginas:
+            return {"encontrado_em_pagina": None, "paginas": [], "paginas_via_ocr": [],
+                    "trecho": None, "via_ocr": None, "confianca_ocr": None}
+        pag = paginas[0]
         via = pag in paginas_ocr
-        return {"encontrado_em_pagina": pag, "trecho": trecho,
+        return {"encontrado_em_pagina": pag, "paginas": paginas,
+                "paginas_via_ocr": [p for p in paginas if p in paginas_ocr],
+                "trecho": trecho,
                 "via_ocr": via, "confianca_ocr": conf_ocr.get(pag) if via else None}
 
     def _bloco_extrator(extrator, status, sem_evid, needles):
-        pag = _localizar_pagina_por_extrator(pages_text, extrator, status, sem_evid)
-        texto = pages_text[pag - 1] if (pag and pag <= len(pages_text)) else None
-        return _meta(pag, _trecho_na_pagina(texto, needles) if pag else None)
+        pgs = _localizar_paginas_por_extrator(pages_text, extrator, status, sem_evid)
+        texto = pages_text[pgs[0] - 1] if (pgs and pgs[0] <= len(pages_text)) else None
+        return _meta(pgs, _trecho_na_pagina(texto, needles) if pgs else None)
 
     needles_cit = [normalizar(k) for k in (KEYWORDS_CITACION_OK
                    if status_citacao == "HOUVE CITAÇÃO" else KEYWORDS_CITACION_NAO_OK)]
@@ -2238,23 +2418,26 @@ def construir_evidencias(pages_text, status_citacao, status_penhora, entidades, 
         }
     ent = entidades or {}
     ent_evid = {}
+    cache_paginas = {}    # normalização de cada página feita 1x, reaproveitada por campo
     for campo in _CAMPOS_ENTIDADE_EVIDENCIA:
         valor = ent.get(campo)
         if valor is None or str(valor).strip() == "":
             continue
-        if campo == "numero_cda" and "; " in str(valor):
-            valor = str(valor).split("; ")[0]   # várias CDAs: página da 1ª
-        pag, trecho = _localizar_pagina_por_valor(pages_text, valor)
-        ent_evid[campo] = _meta(pag, trecho)
+        pgs, trecho = _paginas_da_entidade(pages_text, campo, valor, cache_paginas)
+        ent_evid[campo] = _meta(pgs, trecho)
     if ent_evid:
         evid["entidades"] = ent_evid
     return evid
 
 
 def _pag_evid(ocr_metadata, campo):
-    """Número da página da evidência de citacao/penhora para a planilha, ou ''."""
+    """Páginas da evidência de citacao/penhora para a planilha ('1, 18-19, 21-22'), ou ''.
+    [v8.2.0] Lista todas as páginas; JSON antigo (só 'encontrado_em_pagina') ainda funciona."""
     ev = (ocr_metadata or {}).get("evidencias") or {}
-    p = (ev.get(campo) or {}).get("encontrado_em_pagina")
+    b = ev.get(campo) or {}
+    if b.get("paginas"):
+        return _fmt_paginas(b["paginas"])
+    p = b.get("encontrado_em_pagina")
     return p if p is not None else ""
 
 
@@ -2907,7 +3090,7 @@ def exportar_json_agente2(prompts, output_json, total_ignorados=None):
     import json
     from datetime import datetime as _dt
 
-    VERSION_AGENTE1 = "8.1.2"
+    VERSION_AGENTE1 = "8.2.1"
 
     def _nulo(val):
         if val is None:

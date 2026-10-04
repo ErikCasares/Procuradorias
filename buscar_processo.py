@@ -1,5 +1,5 @@
 """
-BUSCAR PROCESSO v2 — consulta por número CNJ
+BUSCAR PROCESSO v2.1 — consulta por número CNJ
 HERA Tecnologia / PGMS
 
 Lê os arquivos JSON da pasta JSON/ e mostra as informações de um processo
@@ -344,17 +344,53 @@ def _a1_snapshot(rec, campo):
     return ent.get(campo) if ent.get(campo) is not None else a1.get(campo)
 
 
+def _fmt_paginas(paginas, max_faixas=6):
+    """[v2.1] [2,3,4,5,9,11,12] -> '2-5, 9, 11-12'. Acima de max_faixas, resume (a lista completa fica no JSON)."""
+    pgs = sorted({int(x) for x in (paginas or [])})
+    if not pgs:
+        return ""
+    faixas, ini, ant = [], pgs[0], pgs[0]
+    for x in pgs[1:]:
+        if x == ant + 1:
+            ant = x
+            continue
+        faixas.append((ini, ant)); ini = ant = x
+    faixas.append((ini, ant))
+    txt = ", ".join(str(a) if a == b else f"{a}-{b}" for a, b in faixas[:max_faixas])
+    if len(faixas) > max_faixas:     # campos que se repetem no PDF todo (nº do processo, nome…)
+        txt += f", … (+{len(pgs)} págs. no total)"
+    return txt
+
+
+def _txt_paginas(bloco, parenteses=True):
+    """
+    [v2.1] Texto de página(s) de um bloco de evidência, ou None se não há.
+    Lê 'paginas' (todas as páginas, v8.2.0+); JSON antigo cai em
+    'encontrado_em_pagina'. OCR: tudo OCR -> '(OCR)'; só algumas -> '(OCR: 21-22)'.
+    """
+    b = bloco or {}
+    pgs = b.get("paginas") or ([b["encontrado_em_pagina"]] if b.get("encontrado_em_pagina") else [])
+    if not pgs:
+        return None
+    rot = "págs." if len(pgs) > 1 else "pág."
+    txt = f"{rot} {_fmt_paginas(pgs)}"
+    ocr = b.get("paginas_via_ocr")
+    if ocr is None:
+        ocr = pgs[:1] if b.get("via_ocr") else []
+    if ocr:
+        txt += " (OCR)" if len(ocr) == len(pgs) else f" (OCR: {_fmt_paginas(ocr)})"
+    return txt
+
+
 def _mostrar_agente1(proc: dict):
     ent = proc.get("entidades", {})
     # [Fase 1] página de origem por entidade (se disponível no JSON)
     _ent_evid = ((proc.get("evidencias") or {}).get("entidades") or {})
     def _v(valor, campo):
-        b = _ent_evid.get(campo) or {}
-        p = b.get("encontrado_em_pagina")
-        if valor is None or p is None:
+        t = _txt_paginas(_ent_evid.get(campo))
+        if valor is None or t is None:
             return valor
-        via = " OCR" if b.get("via_ocr") else ""
-        return f"{valor}  (pág. {p}{via})"
+        return f"{valor}  ({t})"
     print(_titulo("\n┌─ AGENTE 1 — Triagem e dados extraídos"))
     print(_dim(f"│  fonte: {proc.get('_origem_arquivo','?')}"))
     print("│")
@@ -387,12 +423,12 @@ def _mostrar_agente1(proc: dict):
     print(_linha("Status citação",  proc.get("status_citacao")))
     _evid = proc.get("evidencias") or {}
     _bc = _evid.get("citacao") or {}
-    if _bc.get("encontrado_em_pagina"):
-        print(_linha("  ↳ citação na", f"pág. {_bc['encontrado_em_pagina']}" + (" (OCR)" if _bc.get('via_ocr') else "")))
+    if _txt_paginas(_bc):
+        print(_linha("  ↳ citação na", _txt_paginas(_bc)))
     print(_linha("Resultado penhora",proc.get("resultado_penhora")))
     _bp = _evid.get("penhora") or {}
-    if _bp.get("encontrado_em_pagina"):
-        print(_linha("  ↳ penhora na", f"pág. {_bp['encontrado_em_pagina']}" + (" (OCR)" if _bp.get('via_ocr') else "")))
+    if _txt_paginas(_bp):
+        print(_linha("  ↳ penhora na", _txt_paginas(_bp)))
     # [v8.1.0] Alvará (pedido / levantamento) — só imprime se houver algo a
     # mostrar (igual aos sinais processuais: é raro, não vale poluir toda
     # consulta com "Pedido de alvará: —" quando não se aplica).
@@ -401,13 +437,13 @@ def _mostrar_agente1(proc: dict):
     if status_alvara.get("pedido"):
         print(_linha("Pedido de alvará", status_alvara.get("pedido")))
         _bap = _ba.get("pedido") or {}
-        if _bap.get("encontrado_em_pagina"):
-            print(_linha("  ↳ pedido na", f"pág. {_bap['encontrado_em_pagina']}" + (" (OCR)" if _bap.get('via_ocr') else "")))
+        if _txt_paginas(_bap):
+            print(_linha("  ↳ pedido na", _txt_paginas(_bap)))
     if status_alvara.get("levantamento"):
         print(_linha("Levantamento alvará", status_alvara.get("levantamento")))
         _bal = _ba.get("levantamento") or {}
-        if _bal.get("encontrado_em_pagina"):
-            print(_linha("  ↳ levantamento na", f"pág. {_bal['encontrado_em_pagina']}" + (" (OCR)" if _bal.get('via_ocr') else "")))
+        if _txt_paginas(_bal):
+            print(_linha("  ↳ levantamento na", _txt_paginas(_bal)))
     print(_linha("Última movimentação", proc.get("ultima_movimentacao")))
     # OCR: v8.0 aninha em 'ocr'; v7 usava 'confianca_ocr_media' no topo.
     conf = (proc.get("ocr") or {}).get("confianca_media")

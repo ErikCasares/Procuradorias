@@ -1,0 +1,6 @@
+{
+  "_instrucoes": "Para incluir um município exequente, acrescente um item em 'exequentes' com nome, uf e cnpj (com ou sem máscara). O CNPJ precisa ser válido (dígito verificador); item inválido é ignorado com aviso no log. O Município de Salvador já vem no código e está aqui só como modelo. Após editar, reinicie o agente1/servidor.",
+  "exequentes": [
+    { "nome": "Município de Salvador", "uf": "BA", "cnpj": "13.927.801/0001-49" }
+  ]
+}
