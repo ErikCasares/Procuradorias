@@ -1455,7 +1455,7 @@ def _nome_pdf_seguro(nome: str) -> str:
     return limpo
 
 
-_ETAPAS_VALIDAS = {"citacao", "penhora", "movimentacao", "sinais", "entidades", "tipo"}
+_ETAPAS_VALIDAS = {"citacao", "penhora", "movimentacao", "sinais", "alvara", "entidades", "tipo"}
 
 
 def _normalizar_campos(campos: str) -> str:
@@ -1745,6 +1745,7 @@ _CHAVES_POR_ETAPA = {
     "penhora"     : ["resultado_penhora"],
     "movimentacao": ["ultima_movimentacao", "dias_desde_ultima_movimentacao"],
     "sinais"      : ["sinais_processuais"],
+    "alvara"      : ["status_alvara"],
 }
 
 # Sempre presentes, pedidas ou não: identificam o processo e dizem se a
@@ -2841,6 +2842,14 @@ function renderizarProcesso(d) {
     html += linha('　↳ citação na', paginaDe(evid.citacao));
     html += linha('Resultado penhora', ag1.resultado_penhora);
     html += linha('　↳ penhora na', paginaDe(evid.penhora));
+    // [v8.1.0] Alvará (pedido/levantamento) — raro, por isso linha() já esconde
+    // sozinha quando não há nada (mesmo critério dos sinais processuais).
+    const alvara = ag1.status_alvara || {};
+    const evidAlvara = evid.alvara || {};
+    html += linha('Pedido de alvará', alvara.pedido);
+    html += linha('　↳ pedido na', paginaDe(evidAlvara.pedido));
+    html += linha('Levantamento alvará', alvara.levantamento);
+    html += linha('　↳ levantamento na', paginaDe(evidAlvara.levantamento));
     html += linha('Última movimentação', ag1.ultima_movimentacao);
     html += '</div>';
   }
@@ -2973,6 +2982,7 @@ _ENVIO_DOCS = ("""
       <label><input type="checkbox" class="hera-campo" value="penhora" checked> Penhora</label>
       <label><input type="checkbox" class="hera-campo" value="movimentacao" checked> Movimentação</label>
       <label><input type="checkbox" class="hera-campo" value="sinais" checked> Sinais (extinção/parcelamento/art.40)</label>
+      <label><input type="checkbox" class="hera-campo" value="alvara" checked> Alvará (pedido/levantamento)</label>
     </div>
     <p style="font-size:.85rem;color:#8b98a5;margin-top:.4rem">Entidades (CPF/CNPJ, CDA, valor…) e
       Tipo (é execução fiscal?) vêm sempre junto, mesmo desmarcando tudo aqui — são a
@@ -3226,6 +3236,7 @@ PAINEL = ("""<!doctype html>
         <label><input type="checkbox" class="campo" value="penhora" checked> Penhora</label>
         <label><input type="checkbox" class="campo" value="movimentacao" checked> Movimentação</label>
         <label><input type="checkbox" class="campo" value="sinais" checked> Sinais (extinção/parcelamento/art.40)</label>
+        <label><input type="checkbox" class="campo" value="alvara" checked> Alvará (pedido/levantamento)</label>
         <label><input type="checkbox" class="campo" value="entidades" checked> Entidades (CPF, CDA, valor…)</label>
         <label><input type="checkbox" class="campo" value="tipo" checked> Tipo (execução fiscal?)</label>
       </div>
