@@ -1834,7 +1834,9 @@ def _extrair_numero_cda(text):
     # Um processo costuma ter várias (caso real: 6) — devolve todas, sem
     # repetir, na ordem do PDF. [SUPOSIÇÃO — CONFIRMAR] formato "A; B; C".
     numeros = []
-    for m in re.finditer(r"certid[aã]o de d[eé]bito n[o°º.]?\s*(\d{2}\.\d{4}\.[\d.]+)",
+    # [v8.4.1] Também o formato SEM pontos ("Certidão de Débito nº 12007192406",
+    # 11 dígitos corridos) — antes não casava e o campo saía vazio.
+    for m in re.finditer(r"certid[aã]o de d[eé]bito\s*n[o°º.]?\s*(\d{2}\.\d{4}\.[\d.]+|\d{8,})",
                          text, re.IGNORECASE):
         n = m.group(1).rstrip(".")
         if n not in numeros:
@@ -2234,13 +2236,24 @@ def _ia_norm(texto):
 def _ia_texto_util(texto):
     return len(re.sub(r"\W", "", texto or "")) >= IA_TEXTO_MIN_CHARS
 
+# [v8.4.1] Número de 11 dígitos logo após "Certidão de Débito nº" / "Dívida
+# Ativa nº" / "CDA nº" é o NÚMERO DA CERTIDÃO, não um CPF: não é mascarado
+# (antes a IA recebia "Certidão de Débito nº [CPF]" e não tinha como lê-lo).
+# Qualquer outro número cru de 11 dígitos continua mascarado como CPF.
+_IA_RE_ROTULO_CDA = re.compile(
+    r"(?:certid\S*\s+de\s+d\S+(?:\s+ativa)?|\bcda)\s*n\S{0,2}\s*[:\-]?\s*$", re.IGNORECASE)
+
+
+def _ia_mascarar_11_digitos(m):
+    antes = m.string[max(0, m.start() - 45):m.start()]
+    return m.group(0) if _IA_RE_ROTULO_CDA.search(antes) else "[CPF]"
 
 # --- Minimização (LGPD) ---------------------------------------------------------
 # Nomes e endereços NÃO são mascarados (limitação herdada da ramificação IA).
 _IA_MASCARAS = [
     (re.compile(r"\b\d{2}\.?\d{3}\.?\d{3}/?\d{4}-?\d{2}\b"), "[CNPJ]"),
     (re.compile(r"\b\d{3}\.\d{3}\.\d{3}-\d{2}\b"), "[CPF]"),
-    (re.compile(r"(?<![\d./-])\d{11}(?![\d./-])"), "[CPF]"),
+    (re.compile(r"(?<![\d./-])\d{11}(?![\d./-])"), _ia_mascarar_11_digitos),
     (re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+"), "[EMAIL]"),
     (re.compile(r"\(\d{2}\)\s?\d{4,5}-?\d{4}"), "[TELEFONE]"),
 ]
