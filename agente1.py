@@ -1,6 +1,6 @@
 # ===========================================================================
 # AGENTE 1 — Extração determinística de execuções fiscais (PGMS / HERA)
-# Versão 8.2.1
+# Versão 8.2.2
 #
 # MUDANÇAS EM RELAÇÃO A promptV7_1.py:
 #   1. [feedback 4] Removida a camada de juízo APTO / NÃO APTO. O Agente 1
@@ -208,11 +208,32 @@ def _extraer_fechas_de_texto(text_norm):
     _PATRON_ABREV    = r"(\d{1,2})\s+(jan|fev|mar|abr|mai|jun|jul|ago|set|out|nov|dez)\.?\s+(\d{4})"
     fechas = []
     for dia, mes_txt, anio in re.findall(_PATRON_COMPLETO, text_norm):
-        fechas.append(datetime(int(anio), _MESES_COMPLETOS[mes_txt], int(dia)))
+        f = _data_segura(anio, _MESES_COMPLETOS[mes_txt], dia)
+        if f:
+            fechas.append(f)
     for dia, mes_txt, anio in re.findall(_PATRON_ABREV, text_norm):
         if mes_txt in _MESES_ABREV:
-            fechas.append(datetime(int(anio), _MESES_ABREV[mes_txt], int(dia)))
+            f = _data_segura(anio, _MESES_ABREV[mes_txt], dia)
+            if f:
+                fechas.append(f)
     return fechas
+
+
+# [v8.2.2] Datas impossíveis (típico de
+# OCR: "31 de fevereiro", "00 de maio") são descartadas com aviso — antes
+# derrubavam o PDF inteiro com "day is out of range for month".
+_DATAS_INVALIDAS_AVISADAS = set()
+
+
+def _data_segura(anio, mes, dia):
+    try:
+        return datetime(int(anio), mes, int(dia))
+    except ValueError:
+        chave = (anio, mes, dia)
+        if chave not in _DATAS_INVALIDAS_AVISADAS:   # 1 aviso por data distinta
+            _DATAS_INVALIDAS_AVISADAS.add(chave)
+            logging.warning(f"Data inválida ignorada (provável erro de OCR): {dia}/{mes}/{anio}")
+        return None
 
 
 # Esto silencia los logs internos de la librería que genera esos mensajes
@@ -1804,7 +1825,9 @@ def _extrair_numero_cda(text):
     # Um processo costuma ter várias (caso real: 6) — devolve todas, sem
     # repetir, na ordem do PDF. [SUPOSIÇÃO — CONFIRMAR] formato "A; B; C".
     numeros = []
-    for m in re.finditer(r"certid[aã]o de d[eé]bito n[o°º.]?\s*(\d{2}\.\d{4}\.[\d.]+)",
+    # [v8.2.2] Também o formato SEM pontos ("Certidão de Débito nº 12007192406",
+    # 11 dígitos corridos) — antes não casava e o campo saía vazio.
+    for m in re.finditer(r"certid[aã]o de d[eé]bito\s*n[o°º.]?\s*(\d{2}\.\d{4}\.[\d.]+|\d{8,})",
                          text, re.IGNORECASE):
         n = m.group(1).rstrip(".")
         if n not in numeros:
