@@ -39,7 +39,7 @@ ENV PASTA_CACHE=/app/dados/cache_ocr \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY agente1.py agente2.py webapp.py buscar_processo.py gerar_credencial.py ./
+COPY agente1.py agente2.py webapp.py buscar_processo.py gerar_credencial.py exequentes.json ./
 COPY entrypoint.sh /entrypoint.sh
 
 # Pastas de trabalho — montadas como volumes em produção. Criadas aqui para o

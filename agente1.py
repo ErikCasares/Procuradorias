@@ -148,7 +148,6 @@
 #      f) resultado_penhora: "sisbajud solicitado (resultado desconhecido)" →
 #         "penhora bacenjud/sisbajud" (bloqueio efetivo de R$ 7.490,36). Novas
 #         keywords de CONFIRMADO com a redação real do juízo.
-#      Testes de regressão (dados fictícios): tests/test_extracao_agente1.py.
 #      NÃO CORRIGIDO (depende de decisão da PGMS): data_tentativa_citacao /
 #      data_citacao_efetiva — ver resposta no chat.
 #
@@ -168,6 +167,14 @@
 #  12. [v8.2.1] Cadastro de exequentes em arquivo (exequentes.json): para incluir
 #      outro município basta acrescentar {nome, uf, cnpj} — sem editar o código.
 #      CNPJ inválido é ignorado com aviso. Comportamento padrão inalterado.
+# MUDANÇAS EM RELAÇÃO A v8.2.1 (Versão 8.2.2 — rama main, SEM IA):
+#
+#  13. [FIX] Data impossível vinda do OCR ("31 de fevereiro") derrubava o PDF
+#      inteiro em _extraer_fechas_de_texto() ("day is out of range for month").
+#      Agora é descartada com aviso no log (_data_segura). Mesmo código da rama ia.
+#  14. [FIX] numero_cda no formato SEM pontos ("Certidão de Débito nº
+#      12007192406", 11 dígitos corridos) não era reconhecido e saía vazio.
+#      Mesmo código da rama ia. Os formatos já suportados não mudam.
 # ===========================================================================
 
 import json
